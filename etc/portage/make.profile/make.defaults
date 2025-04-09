@@ -1,0 +1,8 @@
+ARCH=test
+ACCEPT_KEYWORDS=$ARCH
+DISTDIR="$ROOT/var/cache/distfiles"
+PKGDIR="$ROOT/var/cache/binpkgs"
+PORTAGE_TMPDIR="$ROOT/var/tmp"
+EMERGE_LOG_DIR="$ROOT/var/log"
+FEATURES=buildpkg
+EMERGE_DEFAULT_OPTS="--package-moves=n --usepkg --verbose --oneshot --nodeps"
