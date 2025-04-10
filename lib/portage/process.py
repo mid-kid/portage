@@ -421,14 +421,34 @@ class Process(AbstractProcess):
         self.send_signal(signal.SIGKILL)
 
 
+import asyncio as _real_asyncio
+
+_children = {}
+def _sigchld_handler():
+    done = []
+    for event, proc in _children.items():
+        proc.join(0)
+        if proc.exitcode is not None:
+            done.append(event)
+    for event in done:
+        event.set()
+        del _children[event]
+    if not _children:
+        _real_asyncio.get_event_loop().remove_signal_handler(signal.SIGCHLD)
+
+def _sigchld_event(proc):
+    event = _real_asyncio.Event()
+    _children[event] = proc
+    _real_asyncio.get_event_loop().add_signal_handler(signal.SIGCHLD, _sigchld_handler)
+    # Avoid TOCTOU, assume the SIGCHLD has been triggered before it was enabled
+    _sigchld_handler()
+    return event
+
+
 class MultiprocessingProcess(AbstractProcess):
     """
     An object that wraps OS processes created by multiprocessing.Process.
     """
-
-    # Number of seconds between poll attempts for process exit status
-    # (after the sentinel has become ready).
-    _proc_join_interval = 0.1
 
     def __init__(self, proc: multiprocessing.Process):
         self._proc = proc
@@ -482,11 +502,7 @@ class MultiprocessingProcess(AbstractProcess):
 
         # Now that proc.sentinel is ready, poll until process exit
         # status has become available.
-        while True:
-            proc.join(0)
-            if proc.exitcode is not None:
-                break
-            await asyncio.sleep(self._proc_join_interval, loop=loop)
+        await _sigchld_event(proc).wait()
 
     def _proc_join_done(self, future):
         # The join task should never be cancelled, so let it raise
