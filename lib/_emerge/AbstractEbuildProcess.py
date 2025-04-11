@@ -53,7 +53,7 @@ class AbstractEbuildProcess(SpawnProcess):
     # The EbuildIpcDaemon support is well tested, but this variable
     # is left so we can temporarily disable it if any issues arise.
     _enable_ipc_daemon = (
-        installation.TYPE == installation.TYPES.SOURCE or "@IPC@" == "True"
+        "PORTAGE_NOIPC" not in os.environ and installation.TYPE == installation.TYPES.SOURCE or "@IPC@" == "True"
     )
 
     def __init__(self, **kwargs):
