@@ -5,19 +5,6 @@
 # This is a helper which ebuild processes can use
 # to communicate with portage's main python process.
 
-# Short-circuit the very common no-op call "exit".
-# Code is intentionally ugly, it doesn't feel like a correct solution.
-import os
-import sys
-import select
-import pickle
-if len(sys.argv) > 1 and sys.argv[1] == "exit":
-    poll = select.poll()
-    poll.register(os.open(os.path.join(os.environ["PORTAGE_BUILDDIR"], ".ipc", "out"), os.O_RDONLY | os.O_NONBLOCK), select.POLLHUP)
-    os.write(os.open(os.path.join(os.environ["PORTAGE_BUILDDIR"], ".ipc", "in"), os.O_WRONLY), pickle.dumps(sys.argv[1:]))
-    poll.poll()
-    sys.exit(0)
-
 import os
 import signal
 
