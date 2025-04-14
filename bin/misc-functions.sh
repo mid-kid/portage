@@ -695,11 +695,9 @@ if [[ -n "${MISC_FUNCTIONS_ARGS}" ]]; then
 		[[ ! -s ${SANDBOX_LOG} ]]
 		# Signal the EbuildIpcDaemon to exit, without using ebuild-ipc.
 		# This is significantly faster, as it avoids python's startup time.
-		rc=$?
-		cat > /dev/null < "${PORTAGE_BUILDDIR}/.ipc/out" &
-		printf '](V%s\nV%s\ne.' exit $rc \
-			| dd 2> /dev/null > "${PORTAGE_BUILDDIR}/.ipc/in"
-		wait $!
+		dd < "${PORTAGE_BUILDDIR}/.ipc/out" \
+			| printf '](V%s\nV%s\ne.' exit $? \
+			| dd > "${PORTAGE_BUILDDIR}/.ipc/in" 2> /dev/null
 	fi
 fi
 
