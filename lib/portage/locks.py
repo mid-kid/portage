@@ -162,6 +162,7 @@ def _close_fds():
     safely after a fork without exec, unlike the _setup_pipes close_fds
     behavior.
     """
+    portage.process._children = {}
     for fd in list(_open_fds.values()):
         fd.close()
 
