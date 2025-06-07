@@ -249,7 +249,7 @@ __preprocess_ebuild_env() {
 __ebuild_phase() {
 	local __EBEGIN_EEND_COUNT=0
 
-	declare -F "$1" >/dev/null && __qa_call $1
+	declare -F "$1" >/dev/null && { ___EBUILD_UPDATE_ENV=1; __qa_call $1; }
 	if (( __EBEGIN_EEND_COUNT > 0 )); then
 		eqawarn "QA Notice: ebegin called without eend in $1"
 	fi
@@ -1049,6 +1049,7 @@ __ebuild_main() {
 
 	__source_all_bashrcs
 
+	___EBUILD_UPDATE_ENV=0
 	case ${1} in
 	nofetch)
 		__ebuild_phase_with_hooks pkg_nofetch
@@ -1065,7 +1066,7 @@ __ebuild_main() {
 			__ebuild_phase_with_hooks pkg_${1}
 			set +x
 		fi
-		if [[ -n ${PORTAGE_UPDATE_ENV} ]] ; then
+		if [[ ${___EBUILD_UPDATE_ENV} = 1 && -n ${PORTAGE_UPDATE_ENV} ]] ; then
 			# Update environment.bz2 in case installation phases
 			# need to pass some variables to uninstallation phases.
 			# Use safe cwd, avoiding unsafe import for bug #469338.
@@ -1161,7 +1162,7 @@ __ebuild_main() {
 	esac
 
 	# Save the env only for relevant phases.
-	if [[ $1 != @(clean|help|info|nofetch) ]]; then
+	if [[ ${___EBUILD_UPDATE_ENV} = 1 && $1 != @(clean|help|info|nofetch) ]]; then
 		umask 002
 
 		# Use safe cwd, avoiding unsafe import for bug #469338.
