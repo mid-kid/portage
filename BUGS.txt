@@ -1,0 +1,4 @@
+Bugs I've noticed while testing this patchset:
+
+1. [ERROR] Task was destroyed but it is pending!
+When running "./bin/test -j4", this message may appear. It's harmless, but it's probably why the _GCProtector class exists...
