@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2128
 
-# Copyright 1999-2024 Gentoo Authors
+# Copyright 1999-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 #
 # Miscellaneous shell functions that make use of the ebuild env but don't need
@@ -146,7 +146,7 @@ install_qa_check() {
 
 	# If binpkg-docompress is enabled, apply compression before creating
 	# the binary package.
-	if contains_word binpkg-docompress "${FEATURES}"; then
+	if [[ ${PORTAGE_COMPRESS} ]] && contains_word binpkg-docompress "${FEATURES}"; then
 		"${PORTAGE_BIN_PATH}"/ecompress --queue "${PORTAGE_DOCOMPRESS[@]}"
 		"${PORTAGE_BIN_PATH}"/ecompress --ignore "${PORTAGE_DOCOMPRESS_SKIP[@]}"
 		"${PORTAGE_BIN_PATH}"/ecompress --dequeue
@@ -279,7 +279,7 @@ __dyn_instprep() {
 
 	# If binpkg-docompress is disabled, we need to apply compression
 	# before installing.
-	if ! contains_word binpkg-docompress "${FEATURES}"; then
+	if [[ ${PORTAGE_COMPRESS} ]] && ! contains_word binpkg-docompress "${FEATURES}"; then
 		"${PORTAGE_BIN_PATH}"/ecompress --queue "${PORTAGE_DOCOMPRESS[@]}"
 		"${PORTAGE_BIN_PATH}"/ecompress --ignore "${PORTAGE_DOCOMPRESS_SKIP[@]}"
 		"${PORTAGE_BIN_PATH}"/ecompress --dequeue
@@ -502,6 +502,39 @@ preinst_selinux_labels() {
 	fi
 }
 
+# Generate a separate tarball with debug information (and sources) for
+# use with debuginfod.
+__generate_packdebug() {
+	local debugpath="${T}"/.tarball
+	if ! [[ -d "${ED}"/usr/src/debug || -d "${ED}"/usr/lib/debug ]]; then
+		return
+	fi
+
+	install -d "${debugpath}"/"${CATEGORY}"{,/"${PN}"} \
+		|| die "Failed to generate target debug directory"
+
+	# xz is hardcoded here as it's the only format that supports random
+	# access.
+	(
+		unset IFS
+		local tarfile="${debugpath}/${CATEGORY}/${PN}/${PF}-${BUILD_ID}-debug.tar.xz"
+		cd "${ED}" || die
+		tar -cJf - > "${tarfile}" \
+			$([[ -d ./usr/src/debug ]] && echo ./usr/src/debug) \
+			$([[ -d ./usr/lib/debug ]] && echo ./usr/lib/debug) \
+		|| die "Failed to pack up debug info for FEATURES=packdebug"
+	)
+
+	# The package may not have any splitdebug info available, but still
+	# have sources.
+	mkdir -p "${PORTAGE_TMPDIR}"/portage/${CATEGORY}/${PF}/image/${EPREFIX}/usr/lib/debug || die
+	# We don't use ${D} here because __generate_packdebug is called from
+	# __dyn_package where ${D} points to a pretend ${D}. We want these files
+	# in the real image but not in the binpkg. Unfortunately, we can't
+	# easily leverage PKG_INSTALL_MASK because of when it runs.
+	mv "${debugpath}" "${PORTAGE_BUILDDIR}/image/${EPREFIX}/usr/lib/debug/". || die
+}
+
 __dyn_package() {
 	if ! ___eapi_has_prefix_variables; then
 		local EPREFIX=
@@ -524,6 +557,24 @@ __dyn_package() {
 
 	if [[ ! -z "${BUILD_ID}" ]]; then
 		echo -n "${BUILD_ID}" > "${PORTAGE_BUILDDIR}"/build-info/BUILD_ID
+
+		# We generate the packdebug tarball at this point as we need
+		# the BUILD_ID, but it's not installed as part of the binpkg
+		# by design. We install it later when merging.
+		if contains_word packdebug "${FEATURES}" ; then
+			__generate_packdebug
+
+			# The injected PKG_INSTALL_MASK combined with us
+			# having splitdebug/installsources on may mean we
+			# have an empty /usr/src or /usr/lib left. Prune those.
+			#
+			# XXX: We use ${D}/${EPREFIX} here because we don't set
+			# ${ED} to the fake ${D}.
+			(cd "${D}/${EPREFIX}"/usr && find \
+				./lib \
+				./src \
+				-type d -empty -exec rmdir -p {} 2>/dev/null)
+		fi
 	fi
 
 	if [[ "${BINPKG_FORMAT}" == "xpak" ]]; then
@@ -531,16 +582,17 @@ __dyn_package() {
 
 		[[ ${PORTAGE_VERBOSE} = 1 ]] && tar_options+=" -v"
 		if contains_word xattr "${FEATURES}" \
-			&& tar --help 2>/dev/null | grep -q -- --xattrs
+			&& gtar --help 2>/dev/null | grep -q -- --xattrs
 		then
 			tar_options+=" --xattrs"
 		fi
 
 		[[ -z "${PORTAGE_COMPRESSION_COMMAND}" ]] && die "PORTAGE_COMPRESSION_COMMAND is unset"
 
-		tar ${tar_options} -cf - ${PORTAGE_BINPKG_TAR_OPTS} -C "${D}" . | \
+		gtar ${tar_options} -cf - ${PORTAGE_BINPKG_TAR_OPTS} -C "${D}" . | \
 			${PORTAGE_COMPRESSION_COMMAND} > "${PORTAGE_BINPKG_TMPFILE}"
-		assert "failed to pack binary package: '${PORTAGE_BINPKG_TMPFILE}'"
+		__pipestatus \
+			|| die "failed to pack binary package: '${PORTAGE_BINPKG_TMPFILE}'"
 
 		PYTHONPATH=${PORTAGE_PYTHONPATH:-${PORTAGE_PYM_PATH}} \
 			"${PORTAGE_PYTHON:-/usr/bin/python}" "${PORTAGE_BIN_PATH}"/xpak-helper.py recompose \
@@ -584,7 +636,7 @@ __dyn_spec() {
 	mkdir -p "${sources_dir}"
 	declare -a tar_args=("${EBUILD}")
 	[[ -d ${FILESDIR} ]] && tar_args=("${EBUILD}" "${FILESDIR}")
-	tar czf "${sources_dir}/${PF}.tar.gz" \
+	gtar czf "${sources_dir}/${PF}.tar.gz" \
 		"${tar_args[@]}" || \
 		die "Failed to create base rpm tarball."
 

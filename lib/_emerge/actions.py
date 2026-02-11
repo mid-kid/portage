@@ -1,8 +1,9 @@
-# Copyright 1999-2024 Gentoo Authors
+# Copyright 1999-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 import collections
 import logging
+import multiprocessing
 import operator
 import platform
 import re
@@ -17,20 +18,6 @@ import warnings
 from itertools import chain
 
 import portage
-
-portage.proxy.lazyimport.lazyimport(
-    globals(),
-    "portage.dbapi._similar_name_search:similar_name_search",
-    "portage.debug",
-    "portage.news:count_unread_news,display_news_notifications",
-    "portage.util._get_vm_info:get_vm_info",
-    "portage.util.locale:check_locale",
-    "portage.emaint.modules.sync.sync:SyncRepos",
-    "_emerge.chk_updated_cfg_files:chk_updated_cfg_files",
-    "_emerge.help:emerge_help",
-    "_emerge.post_emerge:display_news_notification,post_emerge",
-    "_emerge.stdout_spinner:stdout_spinner",
-)
 
 from portage import os
 from portage import shutil
@@ -116,6 +103,8 @@ def action_build(
     myfiles=DeprecationWarning,
     spinner=None,
 ):
+    from _emerge.chk_updated_cfg_files import chk_updated_cfg_files
+
     if not isinstance(emerge_config, _emerge_config):
         warnings.warn(
             "_emerge.actions.action_build() now expects "
@@ -156,24 +145,21 @@ def action_build(
         and emerge_config.opts.get("--quickpkg-direct", "n") == "y"
         and emerge_config.target_config.settings["ROOT"] != quickpkg_root
     )
-    if "--getbinpkg" in emerge_config.opts or quickpkg_direct:
+    if quickpkg_direct:
         kwargs = {}
-        if quickpkg_direct:
-            if quickpkg_root == emerge_config.running_config.settings["ROOT"]:
-                quickpkg_vardb = emerge_config.running_config.trees["vartree"].dbapi
-            else:
-                quickpkg_settings = portage.config(
-                    config_root=emerge_config.target_config.settings[
-                        "PORTAGE_CONFIGROOT"
-                    ],
-                    target_root=quickpkg_root,
-                    env=emerge_config.target_config.settings.backupenv.copy(),
-                    sysroot=emerge_config.target_config.settings["SYSROOT"],
-                    eprefix=emerge_config.target_config.settings["EPREFIX"],
-                )
-                quickpkg_vardb = portage.vartree(settings=quickpkg_settings).dbapi
-            kwargs["add_repos"] = (quickpkg_vardb,)
+        if quickpkg_root == emerge_config.running_config.settings["ROOT"]:
+            quickpkg_vardb = emerge_config.running_config.trees["vartree"].dbapi
+        else:
+            quickpkg_settings = portage.config(
+                config_root=emerge_config.target_config.settings["PORTAGE_CONFIGROOT"],
+                target_root=quickpkg_root,
+                env=emerge_config.target_config.settings.backupenv.copy(),
+                sysroot=emerge_config.target_config.settings["SYSROOT"],
+                eprefix=emerge_config.target_config.settings["EPREFIX"],
+            )
+            quickpkg_vardb = portage.vartree(settings=quickpkg_settings).dbapi
 
+        kwargs["add_repos"] = (quickpkg_vardb,)
         try:
             kwargs["pretend"] = "--pretend" in emerge_config.opts
             emerge_config.target_config.trees["bintree"].populate(
@@ -616,7 +602,7 @@ def action_build(
                     )
                     return 1
 
-                # unlock GPG if needed
+                # Unlock GnuPG if needed
                 if (
                     need_write_bindb
                     and (eroot in ebuild_eroots)
@@ -641,7 +627,7 @@ def action_build(
                             )
                             return 1
 
-                    portage.writemsg_stdout(">>> Unlocking GPG... ")
+                    portage.writemsg_stdout(">>> Unlocking GnuPG... ")
                     sys.stdout.flush()
                     gpg = GPG(trees[eroot]["root_config"].settings)
                     try:
@@ -1849,6 +1835,9 @@ class _info_pkgs_ver:
 
 
 def action_info(settings, trees, myopts, myfiles):
+    from portage.dbapi._similar_name_search import similar_name_search
+    from portage.util._get_vm_info import get_vm_info
+
     # See if we can find any packages installed matching the strings
     # passed on the command line
     mypkgs = []
@@ -2429,6 +2418,8 @@ def action_sync(
     opts=DeprecationWarning,
     action=DeprecationWarning,
 ):
+    from portage.emaint.modules.sync.sync import SyncRepos
+
     if not isinstance(emerge_config, _emerge_config):
         warnings.warn(
             "_emerge.actions.action_sync() now expects "
@@ -3035,6 +3026,8 @@ _emerge_features_warn = frozenset(["keeptemp", "keepwork"])
 
 
 def validate_ebuild_environment(trees):
+    from portage.util.locale import check_locale
+
     features_warn = set()
     for myroot in trees:
         settings = trees[myroot]["vartree"].settings
@@ -3079,48 +3072,101 @@ def config_protect_check(trees):
 
 
 def apply_priorities(settings):
-    ionice(settings)
-    nice(settings)
-    set_scheduling_policy(settings)
+    config_vars = []
+    if "PORTAGE_NICENESS" in settings:
+        config_vars.append("PORTAGE_NICENESS")
+    if "PORTAGE_IONICE_COMMAND" in settings:
+        config_vars.append("PORTAGE_IONICE_COMMAND")
+    if "PORTAGE_SCHEDULING_POLICY" in settings:
+        config_vars.append("PORTAGE_SCHEDULING_POLICY")
+
+    if not config_vars:
+        return
+
+    pids = [("main", portage.getpid())]
+    if multiprocessing.get_start_method() == "forkserver":
+
+        def _get_forkserver_pid():
+            try:
+                return multiprocessing.forkserver._forkserver._forkserver_pid
+            except AttributeError:
+                return None
+
+        forkserver_pid = _get_forkserver_pid()
+        if not isinstance(forkserver_pid, int):
+            # force forkserver launch
+            portage.process.spawn(["true"])
+            forkserver_pid = _get_forkserver_pid()
+
+        if not isinstance(forkserver_pid, int):
+            out = portage.output.EOutput()
+            out.eerror("Could not find forkserver pid")
+            out.eerror(
+                f"Configuration variable(s) will not be applied: {' '.join(config_vars)}"
+            )
+        else:
+            pids.append(("forkserver", forkserver_pid))
+
+    ionice(settings, pids)
+    nice(settings, pids)
+    set_scheduling_policy(settings, pids)
 
 
-def nice(settings):
-    try:
-        os.nice(int(settings.get("PORTAGE_NICENESS", "0")))
-    except (OSError, ValueError) as e:
-        out = portage.output.EOutput()
-        out.eerror(
-            f"Failed to change nice value to '{settings.get('PORTAGE_NICENESS', '0')}'"
-        )
-        out.eerror(f"{str(e)}\n")
+def nice(settings, pids):
+
+    for name, pid in pids:
+        cmd = f"renice -n {settings.get('PORTAGE_NICENESS', '0')} {pid}".split()
+        try:
+            with open(os.devnull, "wb", 0) as dev_null:
+                rval = portage.process.spawn(
+                    cmd, env=os.environ, fd_pipes={1: dev_null.fileno()}
+                )
+        except portage.exception.CommandNotFound:
+            if "PORTAGE_NICENESS" in settings:
+                out = portage.output.EOutput()
+                out.eerror(
+                    f"PORTAGE_NICENESS not applied because the renice command was not found"
+                )
+            return
+        if rval != os.EX_OK:
+            out = portage.output.EOutput()
+            out.eerror(f"renice command returned {rval} for {name} pid {pid}")
 
 
-def ionice(settings):
+def ionice(settings, pids):
     ionice_cmd = settings.get("PORTAGE_IONICE_COMMAND")
     if ionice_cmd:
         ionice_cmd = shlex.split(ionice_cmd)
     if not ionice_cmd:
         return
 
-    variables = {"PID": str(portage.getpid())}
-    cmd = [varexpand(x, mydict=variables) for x in ionice_cmd]
+    errors = []
+    for name, pid in pids:
+        variables = {"PID": str(pid)}
+        cmd = [varexpand(x, mydict=variables) for x in ionice_cmd]
 
-    try:
-        rval = portage.process.spawn(cmd, env=os.environ)
-    except portage.exception.CommandNotFound:
-        # The OS kernel probably doesn't support ionice,
-        # so return silently.
-        return
+        try:
+            rval = portage.process.spawn(cmd, env=os.environ)
+        except portage.exception.CommandNotFound:
+            # The OS kernel probably doesn't support ionice,
+            # so return silently.
+            return
 
-    if rval != os.EX_OK:
+        if rval != os.EX_OK:
+            errors.append(
+                f"PORTAGE_IONICE_COMMAND returned {rval} for {name} pid {pid}"
+            )
+
+    if errors:
         out = portage.output.EOutput()
-        out.eerror(f"PORTAGE_IONICE_COMMAND returned {rval}")
+        for line in errors:
+            out.eerror(line)
         out.eerror(
             "See the make.conf(5) man page for PORTAGE_IONICE_COMMAND usage instructions."
         )
 
 
-def set_scheduling_policy(settings):
+def set_scheduling_policy(settings, pids):
     scheduling_policy = settings.get("PORTAGE_SCHEDULING_POLICY")
     scheduling_priority = settings.get("PORTAGE_SCHEDULING_PRIORITY")
 
@@ -3161,9 +3207,18 @@ def set_scheduling_policy(settings):
             )
             return os.EX_USAGE
 
-    os.sched_setscheduler(portage.getpid(), policy, os.sched_param(scheduling_priority))
+    returncode = os.EX_OK
 
-    return os.EX_OK
+    for name, pid in pids:
+        try:
+            os.sched_setscheduler(pid, policy, os.sched_param(scheduling_priority))
+        except OSError as e:
+            out.eerror(
+                f"Unable to apply PORTAGE_SCHEDULING_POLICY to {name} pid {pid}: {e}"
+            )
+            returncode |= os.EX_UNAVAILABLE
+
+    return returncode
 
 
 def setconfig_fallback(root_config):
@@ -3440,6 +3495,11 @@ def repo_name_duplicate_check(trees):
 
 def run_action(emerge_config):
     # skip global updates prior to sync, since it's called after sync
+    from _emerge.help import emerge_help
+    from _emerge.post_emerge import display_news_notification, post_emerge
+    from _emerge.stdout_spinner import stdout_spinner
+    from portage.news import count_unread_news, display_news_notifications
+
     configs = [emerge_config.target_config]
     if emerge_config.target_config.root != emerge_config.running_config.root:
         configs.append(emerge_config.running_config)
@@ -3518,6 +3578,7 @@ def run_action(emerge_config):
                 mytrees["bintree"].populate(
                     getbinpkgs="--getbinpkg" in emerge_config.opts,
                     getbinpkg_refresh=True,
+                    verbose="--verbose" in emerge_config.opts,
                     **kwargs,
                 )
             except ParseError as e:

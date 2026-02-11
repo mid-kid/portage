@@ -1,4 +1,4 @@
-# Copyright 2004-2024 Gentoo Authors
+# Copyright 2004-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 from portage.cache.mappings import UserDict
@@ -8,7 +8,7 @@ from portage.exception import (
     InvalidAtom,
     PortageException,
     FileNotFound,
-    IsADirectory,
+    InvalidLocation,
     OperationNotPermitted,
     ParseError,
     PermissionDenied,
@@ -77,14 +77,6 @@ from typing import Optional, TextIO
 
 import portage
 
-portage.proxy.lazyimport.lazyimport(
-    globals(),
-    "pickle",
-    "portage.dep:Atom",
-    "subprocess",
-)
-
-
 noiselimit = 0
 
 
@@ -112,7 +104,7 @@ def writemsg(mystr: str, noiselevel: int = 0, fd: Optional[TextIO] = None) -> No
         fd = sys.stderr
     if noiselevel <= noiselimit:
         # avoid potential UnicodeEncodeError
-        if isinstance(fd, io.StringIO):
+        if isinstance(fd, io.TextIOBase):
             mystr = _unicode_decode(
                 mystr, encoding=_encodings["content"], errors="replace"
             )
@@ -519,6 +511,7 @@ def grabdict_package(
 ):
     """Does the same thing as grabdict except it validates keys
     with isvalidatom()"""
+    from portage.dep import Atom
 
     if recursive:
         file_list = _recursive_file_list(myfilename)
@@ -582,6 +575,8 @@ def grabfile_package(
     eapi=None,
     eapi_default="0",
 ):
+    from portage.dep import Atom
+
     pkgs = grabfile(
         myfilename, compatlevel, recursive=recursive, remember_source_file=True
     )
@@ -1050,6 +1045,8 @@ pickle_write = None
 
 
 def pickle_read(filename, default=None, debug=0):
+    import pickle
+
     if not os.access(filename, os.R_OK):
         writemsg(_("pickle_read(): File not readable. '") + filename + "'\n", 1)
         return default
@@ -1382,7 +1379,7 @@ def apply_recursive_permissions(
                 # Ignore InvalidLocation exceptions such as FileNotFound
                 # and DirectoryNotFound since sometimes things disappear,
                 # like when adjusting permissions on DISTCC_DIR.
-                if not isinstance(e, portage.exception.InvalidLocation):
+                if not isinstance(e, InvalidLocation):
                     all_applied = False
                     onerror(e)
     return all_applied
@@ -1523,7 +1520,10 @@ class atomic_ofstream(AbstractContextManager, ObjectProxy):
                         try:
                             st = os.stat(real_name)
                         except FileNotFoundError:
-                            umask_test_file = f"{tmp_name}_umask_test"
+                            if isinstance(tmp_name, bytes):
+                                umask_test_file = tmp_name + b"_umask_test"
+                            else:
+                                umask_test_file = f"{tmp_name}_umask_test"
                             with open(umask_test_file, "w") as f:
                                 st = os.fstat(f.fileno())
                                 os.unlink(umask_test_file)
@@ -1947,6 +1947,7 @@ def find_updated_config_files(target_root, config_protect):
             [protected_file, None]
     If no configuration files needs to be updated, None is returned
     """
+    import subprocess
 
     encoding = _encodings["fs"]
 

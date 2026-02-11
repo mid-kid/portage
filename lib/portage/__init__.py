@@ -416,7 +416,8 @@ class _ForkWatcher:
         _ForkWatcher.current_pid = None
         # Force instantiation of a new event loop policy as a workaround
         # for https://bugs.python.org/issue22087.
-        asyncio.set_event_loop_policy(None)
+        if sys.version_info < (3, 12):
+            asyncio.set_event_loop_policy(None)
 
 
 _ForkWatcher.hook(_ForkWatcher)
@@ -497,7 +498,7 @@ def abssymlink(symlink, target=None):
 
 _doebuild_manifest_exempt_depend = 0
 
-_testing_eapis = frozenset([])
+_testing_eapis = frozenset(["9-pre1"])
 _deprecated_eapis = frozenset(
     [
         "3_pre1",

@@ -1,4 +1,4 @@
-# Copyright 2010-2021 Gentoo Authors
+# Copyright 2010-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 import collections
@@ -16,6 +16,7 @@ from portage.checksum import get_valid_checksum_keys
 from portage.const import PORTAGE_BASE_PATH, REPO_NAME_LOC, USER_CONFIG_PATH
 from portage.eapi import (
     eapi_allows_directories_on_profile_level_and_repository_level,
+    eapi_has_profile_eapi_default,
     eapi_has_repo_deps,
 )
 from portage.env.loaders import KeyValuePairFileLoader
@@ -63,6 +64,7 @@ _valid_profile_formats = frozenset(
         "profile-default-eapi",
         "build-id",
         "profile-repo-deps",
+        "profile-license",
     ]
 )
 
@@ -269,9 +271,27 @@ class RepoConfig:
 
         self.sync_openpgp_key_path = repo_opts.get("sync-openpgp-key-path", None)
 
-        self.sync_openpgp_key_refresh = repo_opts.get(
+        sync_openpgp_key_refresh = repo_opts.get(
             "sync-openpgp-key-refresh", "true"
-        ).lower() in ("true", "yes")
+        ).lower()
+        if sync_openpgp_key_refresh == "yes":
+            sync_openpgp_key_refresh = "true"
+        elif sync_openpgp_key_refresh == "no":
+            sync_openpgp_key_refresh = "false"
+        elif sync_openpgp_key_refresh not in (
+            "true",
+            "false",
+            "wkd",
+            "keyserver",
+            "false-nowarn",
+        ):
+            writemsg(
+                f"!!! Invalid sync-openpgpg-key-refresh setting for repo {name}: {sync_openpgp_key_refresh}\n",
+                noiselevel=-1,
+            )
+            sync_openpgp_key_refresh = "true"
+
+        self.sync_openpgp_key_refresh = sync_openpgp_key_refresh
 
         for k in (
             "sync_openpgp_key_refresh_retry_count",
@@ -433,14 +453,33 @@ class RepoConfig:
             ):
                 setattr(self, value.lower().replace("-", "_"), layout_data[value])
 
-            # If profile-formats specifies a default EAPI, then set
-            # self.eapi to that, otherwise set it to "0" as specified
-            # by PMS.
-            self.eapi = layout_data.get("profile_eapi_when_unspecified", "0")
-
             eapi = read_corresponding_eapi_file(
-                os.path.join(self.location, REPO_NAME_LOC), default=self.eapi
+                os.path.join(self.location, REPO_NAME_LOC), default=None
             )
+            if eapi is not None and eapi_has_profile_eapi_default(eapi):
+                self.eapi = eapi
+                if eapi != layout_data.get("profile_eapi_when_unspecified", eapi):
+                    warnings.warn(
+                        (
+                            _(
+                                "Repository named '%(repo_name)s' specifies "
+                                "'profile_eapi_when_unspecified' setting that will "
+                                "be ignored because it conflicts with the default "
+                                "from the top-level profiles directory"
+                            )
+                            % {
+                                "repo_name": self.name,
+                            }
+                        ),
+                        SyntaxWarning,
+                    )
+            else:
+                # If profile-formats specifies a default EAPI, then set self.eapi
+                # to that, otherwise set it to "0" as specified by PMS.
+                self.eapi = layout_data.get("profile_eapi_when_unspecified", "0")
+
+            if eapi is None:
+                eapi = self.eapi
 
             self.portage1_profiles = (
                 eapi_allows_directories_on_profile_level_and_repository_level(eapi)
@@ -596,8 +635,10 @@ class RepoConfig:
             repo_msg.append(indent + "location: " + self.location)
         if not self.strict_misc_digests:
             repo_msg.append(indent + "strict-misc-digests: false")
-        if not self.sync_openpgp_key_refresh:
-            repo_msg.append(indent + "sync-openpgp-key-refresh: no")
+        if self.sync_openpgp_key_refresh != "true":
+            repo_msg.append(
+                indent + "sync-openpgp-key-refresh: " + self.sync_openpgp_key_refresh
+            )
         if self.sync_type:
             repo_msg.append(indent + "sync-type: " + self.sync_type)
         if self.sync_umask:

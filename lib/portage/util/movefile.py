@@ -1,4 +1,4 @@
-# Copyright 2010-2020 Gentoo Authors
+# Copyright 2010-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = ["movefile"]
@@ -8,6 +8,7 @@ import fnmatch
 import os as _os
 import stat
 import textwrap
+import tempfile
 
 import portage
 from portage import (
@@ -21,6 +22,7 @@ from portage import (
     _unicode_module_wrapper,
 )
 from portage.const import MOVE_BINARY
+from portage.eapi import eapi_rewrites_symlinks
 from portage.exception import OperationNotSupported
 from portage.localization import _
 from portage.process import spawn
@@ -209,7 +211,13 @@ def movefile(
     if stat.S_ISLNK(sstat[stat.ST_MODE]):
         try:
             target = os.readlink(src)
-            if mysettings and "D" in mysettings and target.startswith(mysettings["D"]):
+            if (
+                mysettings
+                and "EAPI" in mysettings
+                and eapi_rewrites_symlinks(mysettings["EAPI"])
+                and "D" in mysettings
+                and target.startswith(mysettings["D"])
+            ):
                 writemsg(
                     f"!!! {_('Absolute symlink points to image directory.')}\n",
                     noiselevel=-1,
@@ -275,7 +283,10 @@ def movefile(
     # and them use os.rename() to replace the destination.
     if hardlink_candidates:
         head, tail = os.path.split(dest)
-        hardlink_tmp = os.path.join(head, f".{tail}._portage_merge_.{portage.getpid()}")
+        with tempfile.NamedTemporaryFile(
+            dir=head, prefix=f".{tail}._portage_merge_.{portage.getpid()}"
+        ) as hardlink_tmp_file:
+            hardlink_tmp = hardlink_tmp_file.name
         try:
             os.unlink(hardlink_tmp)
         except OSError as e:

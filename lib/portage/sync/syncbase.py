@@ -1,4 +1,4 @@
-# Copyright 2014-2023 Gentoo Authors
+# Copyright 2014-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 """
@@ -272,7 +272,9 @@ class SyncBase:
             quiet=("--quiet" in self.options["emerge_config"].opts)
         )
 
-        if not self.repo.sync_openpgp_key_refresh:
+        if self.repo.sync_openpgp_key_refresh == "false-nowarn":
+            return
+        elif self.repo.sync_openpgp_key_refresh == "false":
             out.ewarn(
                 "Key refresh is disabled via a repos.conf sync-openpgp-key-refresh"
             )
@@ -282,11 +284,12 @@ class SyncBase:
             out.ewarn("detection of revoked keys!")
             return
 
-        out.ebegin("Refreshing keys via WKD")
-        if openpgp_env.refresh_keys_wkd():
-            out.eend(0)
-            return
-        out.eend(1)
+        if self.repo.sync_openpgp_key_refresh in ("true", "wkd"):
+            out.ebegin("Refreshing keys via WKD")
+            if openpgp_env.refresh_keys_wkd():
+                out.eend(0)
+                return
+            out.eend(1)
 
         out.ebegin(
             "Refreshing keys from keyserver{}".format(
@@ -302,18 +305,9 @@ class SyncBase:
             )
         else:
 
-            def noisy_refresh_keys():
-                """
-                Since retry does not help for some types of
-                errors, display errors as soon as they occur.
-                """
-                try:
-                    openpgp_env.refresh_keys_keyserver(
-                        keyserver=self.repo.sync_openpgp_keyserver
-                    )
-                except Exception as e:
-                    writemsg_level(f"{e}\n", level=logging.ERROR, noiselevel=-1)
-                    raise  # retry
+            noisy_refresh_keys = functools.partial(
+                self._noisy_refresh_keys, openpgp_env, self.repo.sync_openpgp_keyserver
+            )
 
             # The ThreadPoolExecutor that asyncio uses by default
             # does not support cancellation of tasks, therefore
@@ -327,6 +321,17 @@ class SyncBase:
                 decorated_func = retry_decorator(func_coroutine, loop=loop)
                 loop.run_until_complete(decorated_func())
         out.eend(0)
+
+    @staticmethod
+    def _noisy_refresh_keys(openpgp_env, keyserver):
+        """
+        Since retry does not help for some types of errors, display errors as soon as they occur.
+        """
+        try:
+            openpgp_env.refresh_keys_keyserver(keyserver=keyserver)
+        except Exception as e:
+            writemsg_level(f"{e}\n", level=logging.ERROR, noiselevel=-1)
+            raise  # retry
 
     def _get_openpgp_env(self, openpgp_key_path=None, debug=False):
         if gemato is not None:

@@ -3,29 +3,29 @@
 
 """Provides an easy-to-use python interface to Gentoo's metadata.xml file.
 
-	Example usage:
-		>>> from portage.xml.metadata import MetaDataXML
-		>>> pkg_md = MetaDataXML('/var/db/repos/gentoo/app-misc/gourmet/metadata.xml')
-		>>> pkg_md
-		<MetaDataXML '/var/db/repos/gentoo/app-misc/gourmet/metadata.xml'>
-		>>> pkg_md.herds()
-		['no-herd']
-		>>> for maint in pkg_md.maintainers():
-		...     print "{0} ({1})".format(maint.email, maint.name)
-		...
-		nixphoeni@gentoo.org (Joe Sapp)
-		>>> for flag in pkg_md.use():
-		...     print flag.name, "->", flag.description
-		...
-		rtf -> Enable export to RTF
-		gnome-print -> Enable printing support using gnome-print
-		>>> upstream = pkg_md.upstream()
-		>>> upstream
-		[<_Upstream {'docs': [], 'remoteid': [], 'maintainer':
-		 [<_Maintainer 'Thomas_Hinkle@alumni.brown.edu'>], 'bugtracker': [],
-		 'changelog': []}>]
-		>>> upstream[0].maintainer[0].name
-		'Thomas Mills Hinkle'
+Example usage:
+        >>> from portage.xml.metadata import MetaDataXML
+        >>> pkg_md = MetaDataXML('/var/db/repos/gentoo/app-misc/gourmet/metadata.xml')
+        >>> pkg_md
+        <MetaDataXML '/var/db/repos/gentoo/app-misc/gourmet/metadata.xml'>
+        >>> pkg_md.herds()
+        ['no-herd']
+        >>> for maint in pkg_md.maintainers():
+        ...     print "{0} ({1})".format(maint.email, maint.name)
+        ...
+        nixphoeni@gentoo.org (Joe Sapp)
+        >>> for flag in pkg_md.use():
+        ...     print flag.name, "->", flag.description
+        ...
+        rtf -> Enable export to RTF
+        gnome-print -> Enable printing support using gnome-print
+        >>> upstream = pkg_md.upstream()
+        >>> upstream
+        [<_Upstream {'docs': [], 'remoteid': [], 'maintainer':
+         [<_Maintainer 'Thomas_Hinkle@alumni.brown.edu'>], 'bugtracker': [],
+         'changelog': []}>]
+        >>> upstream[0].maintainer[0].name
+        'Thomas Mills Hinkle'
 """
 
 __all__ = ("MetaDataXML", "parse_metadata_use")
@@ -246,11 +246,7 @@ class MetaDataXML:
         if herd in ("no-herd", "maintainer-wanted", "maintainer-needed"):
             return None
 
-        try:
-            # Python 2.7 or >=3.2
-            iterate = self._herdstree.iter
-        except AttributeError:
-            iterate = self._herdstree.getiterator
+        iterate = self._herdstree.iter
 
         for node in iterate("herd"):
             if node.findtext("name") == herd:
@@ -329,11 +325,7 @@ class MetaDataXML:
             if self._xml_tree is None:
                 self._useflags = tuple()
             else:
-                try:
-                    # Python 2.7 or >=3.2
-                    iterate = self._xml_tree.iter
-                except AttributeError:
-                    iterate = self._xml_tree.getiterator
+                iterate = self._xml_tree.iter
                 self._useflags = tuple(_Useflag(node) for node in iterate("flag"))
 
         return self._useflags

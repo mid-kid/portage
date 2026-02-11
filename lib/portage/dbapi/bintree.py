@@ -1,28 +1,9 @@
-# Copyright 1998-2024 Gentoo Authors
+# Copyright 1998-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = ["bindbapi", "binarytree"]
 
 import portage
-
-portage.proxy.lazyimport.lazyimport(
-    globals(),
-    "_emerge.BinpkgExtractorAsync:BinpkgExtractorAsync",
-    "portage.checksum:get_valid_checksum_keys,perform_multiple_checksums,"
-    + "verify_all,_apply_hash_filter,_hash_filter",
-    "portage.dbapi.dep_expand:dep_expand",
-    "portage.dep:dep_getkey,isjustname,isvalidatom,match_from_list",
-    "portage.output:EOutput,colorize",
-    "portage.locks:lockfile,unlockfile",
-    "portage.package.ebuild.fetch:_check_distfile,_hide_url_passwd",
-    "portage.update:update_dbentries",
-    "portage.util:atomic_ofstream,ensure_dirs,normalize_path,"
-    + "writemsg,writemsg_stdout",
-    "portage.util.path:first_existing",
-    "portage.util._async.SchedulerInterface:SchedulerInterface",
-    "portage.util._urlopen:urlopen@_urlopen,have_pep_476@_have_pep_476",
-    "portage.versions:best,catpkgsplit,catsplit,_pkg_str",
-)
 
 from portage.binrepo.config import BinRepoConfigLoader
 from portage.cache.mappings import slot_dict_class
@@ -64,7 +45,6 @@ import codecs
 import errno
 import io
 import json
-import re
 import shlex
 import stat
 import subprocess
@@ -72,6 +52,7 @@ import tempfile
 import textwrap
 import time
 import traceback
+import urllib
 import warnings
 from gzip import GzipFile
 from itertools import chain
@@ -82,7 +63,9 @@ from urllib.parse import urlparse
 class UseCachedCopyOfRemoteIndex(Exception):
     # If the local copy is recent enough
     # then fetching the remote index can be skipped.
-    pass
+    def __init__(self, desc: str, extra_info: str = ""):
+        self.desc = desc
+        self.extra_info = extra_info
 
 
 class bindbapi(fakedbapi):
@@ -176,6 +159,8 @@ class bindbapi(fakedbapi):
         @return: True if PKGDIR is writable or can be created,
                 False otherwise
         """
+        from portage.util.path import first_existing
+
         return os.access(first_existing(self.bintree.pkgdir), os.W_OK)
 
     def match(self, *pargs, **kwargs):
@@ -275,6 +260,8 @@ class bindbapi(fakedbapi):
         return [mydata.get(x, "") for x in wants]
 
     def aux_update(self, cpv, values):
+        from portage.util import writemsg
+
         if not self.bintree.populated:
             self.bintree.populate()
         try:
@@ -361,6 +348,8 @@ class bindbapi(fakedbapi):
         @param dest_dir: destination directory
         @type dest_dir: str
         """
+        from portage.versions import _pkg_str
+
         loop = asyncio._wrap_loop(loop)
         if isinstance(pkg, _pkg_str):
             cpv = pkg
@@ -380,9 +369,19 @@ class bindbapi(fakedbapi):
                     dest_dir,
                 )
             elif binpkg_format == "gpkg":
+                gpkg_args = {}
+                repoconfig = self.bintree.get_local_repo(cpv)
+                if repoconfig:
+                    # This may be missing if it's not a remote binpkg, or
+                    # remote binpkgs are mingled in with local binpkgs
+                    # (no separate `location` in binrepos.conf)
+                    gpkg_args["verify_signature"] = repoconfig.verify_signature
+
                 await loop.run_in_executor(
                     ForkExecutor(loop=loop),
-                    portage.gpkg.gpkg(self.settings, cpv, binpkg_file).unpack_metadata,
+                    portage.gpkg.gpkg(
+                        self.settings, cpv, binpkg_file, **gpkg_args
+                    ).unpack_metadata,
                     dest_dir,
                 )
             else:
@@ -399,6 +398,10 @@ class bindbapi(fakedbapi):
         @param dest_dir: destination directory
         @type dest_dir: str
         """
+        from _emerge.BinpkgExtractorAsync import BinpkgExtractorAsync
+        from portage.util._async.SchedulerInterface import SchedulerInterface
+        from portage.versions import _pkg_str
+
         loop = asyncio._wrap_loop(loop)
         if isinstance(pkg, _pkg_str):
             settings = self.settings
@@ -425,11 +428,21 @@ class bindbapi(fakedbapi):
                 extractor.start()
                 await extractor.async_wait()
                 if extractor.returncode != os.EX_OK:
-                    raise PortageException(f"Error Extracting '{pkg_path}'")
+                    raise PortageException(f"Error extracting '{pkg_path}'")
             elif binpkg_format == "gpkg":
+                gpkg_args = {}
+                repoconfig = self.bintree.get_local_repo(cpv)
+                if repoconfig:
+                    # This may be missing if it's not a remote binpkg, or
+                    # remote binpkgs are mingled in with local binpkgs
+                    # (no separate `location` in binrepos.conf)
+                    gpkg_args["verify_signature"] = repoconfig.verify_signature
+
                 await loop.run_in_executor(
                     ForkExecutor(loop=loop),
-                    portage.gpkg.gpkg(self.settings, cpv, pkg_path).decompress,
+                    portage.gpkg.gpkg(
+                        self.settings, cpv, pkg_path, **gpkg_args
+                    ).decompress,
                     dest_dir,
                 )
             else:
@@ -494,6 +507,8 @@ class binarytree:
         virtual=DeprecationWarning,
         settings=None,
     ):
+        from portage.util import normalize_path
+
         if pkgdir is None:
             raise TypeError("pkgdir parameter is required")
 
@@ -662,6 +677,12 @@ class binarytree:
         return self.settings["ROOT"]
 
     def move_ent(self, mylist, repo_match=None):
+        from portage.dep import isjustname, isvalidatom
+        from portage.locks import lockfile, unlockfile
+        from portage.update import update_dbentries
+        from portage.util import writemsg
+        from portage.versions import _pkg_str, catsplit
+
         if not self.populated:
             self.populate()
         origcp = mylist[1]
@@ -883,6 +904,7 @@ class binarytree:
         self,
         getbinpkgs=False,
         getbinpkg_refresh=False,
+        verbose=False,
         add_repos=(),
         force_reindex=False,
         invalid_errors=True,
@@ -899,6 +921,8 @@ class binarytree:
         @param add_repos: additional binary package repositories
         @type add_repos: sequence
         """
+        from portage.locks import lockfile, unlockfile
+        from portage.util import writemsg
 
         # TODO: Should we return here if we're --pretend? On the one hand,
         # people might not want --pretend to affect state. On the other hand,
@@ -959,7 +983,9 @@ class binarytree:
                     )
                 else:
                     self._populate_remote(
-                        getbinpkg_refresh=getbinpkg_refresh, pretend=pretend
+                        getbinpkg_refresh=getbinpkg_refresh,
+                        pretend=pretend,
+                        verbose=verbose,
                     )
 
         finally:
@@ -968,6 +994,9 @@ class binarytree:
         self.populated = True
 
     def _populate_local(self, reindex=True, invalid_errors=True):
+        from portage.util import writemsg
+        from portage.versions import _pkg_str, catpkgsplit, catsplit
+
         """
         Populates the binarytree with local package metadata.
 
@@ -1336,6 +1365,8 @@ class binarytree:
         return pkgindex if update_pkgindex else None
 
     def _run_trust_helper(self):
+        from portage.util import writemsg
+
         portage_trust_helper = self.settings.get("PORTAGE_TRUST_HELPER", "")
         if portage_trust_helper == "":
             return
@@ -1352,7 +1383,7 @@ class binarytree:
             return
         ret.check_returncode()
 
-    def _populate_remote(self, getbinpkg_refresh=True, pretend=False):
+    def _populate_remote(self, getbinpkg_refresh=True, pretend=False, verbose=False):
         self._remote_has_index = False
         self._remotepkgs = {}
 
@@ -1361,7 +1392,7 @@ class binarytree:
             # when binpackages are involved, not only when we refuse unsigned
             # ones. (If the keys have expired we end up refusing signed but
             # technically invalid packages...)
-            if not pretend and self.dbapi.writable:
+            if not pretend and self.dbapi.writable and portage.data.secpass >= 2:
                 self._run_trust_helper()
             gpkg_only = True
         else:
@@ -1369,70 +1400,96 @@ class binarytree:
 
         # Order by descending priority.
         for repo in reversed(list(self._binrepos_conf.values())):
-            base_url = repo.sync_uri
-            parsed_url = urlparse(base_url)
-            host = parsed_url.hostname or ""
-            port = parsed_url.port
-            user = parsed_url.username
-            passwd = parsed_url.password
-            user_passwd = user + "@" if user else ""
-            gpkg_only_warned = False
-
-            pkgindex_file = os.path.join(
-                self.settings["EROOT"],
-                CACHE_PATH,
-                "binhost",
-                host,
-                parsed_url.path.lstrip("/"),
-                "Packages",
+            self._populate_remote_repo(
+                repo, getbinpkg_refresh, pretend, verbose, gpkg_only
             )
-            pkgindex = self._new_pkgindex()
+
+    def _populate_remote_repo(
+        self,
+        repo,
+        getbinpkg_refresh: bool,
+        pretend: bool,
+        verbose: bool,
+        gpkg_only: bool,
+    ):
+        from portage.package.ebuild.fetch import _hide_url_passwd
+        from portage.util import atomic_ofstream, writemsg
+        from portage.util.time import unix_to_iso_time
+        from portage.util._urlopen import (
+            urlopen as _urlopen,
+            have_pep_476 as _have_pep_476,
+            http_to_timestamp,
+        )
+        from portage.versions import _pkg_str
+
+        binrepo_name = repo.name or repo.name_fallback
+        base_url = repo.sync_uri
+        pkgindex_uri = base_url.rstrip("/") + "/Packages"
+        parsed_url = urlparse(base_url)
+        host = parsed_url.hostname or ""
+        port = parsed_url.port
+        user = parsed_url.username
+        user_passwd = user + "@" if user else ""
+        gpkg_only_warned = False
+
+        pkgindex_file = os.path.join(
+            self.settings["EROOT"],
+            CACHE_PATH,
+            "binhost",
+            host,
+            parsed_url.path.lstrip("/"),
+            "Packages",
+        )
+        pkgindex = self._new_pkgindex()
+        try:
+            f = open(
+                _unicode_encode(
+                    pkgindex_file, encoding=_encodings["fs"], errors="strict"
+                ),
+                encoding=_encodings["repo.content"],
+                errors="replace",
+            )
             try:
-                f = open(
-                    _unicode_encode(
-                        pkgindex_file, encoding=_encodings["fs"], errors="strict"
-                    ),
-                    encoding=_encodings["repo.content"],
-                    errors="replace",
-                )
-                try:
-                    pkgindex.read(f)
-                finally:
-                    f.close()
-            except OSError as e:
-                if e.errno != errno.ENOENT:
-                    raise
-            changed = True
-            local_timestamp = pkgindex.header.get("TIMESTAMP", None)
+                pkgindex.read(f)
+            finally:
+                f.close()
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                raise
+        changed = True
+        local_timestamp = pkgindex.header.get("TIMESTAMP", None)
+        try:
+            download_timestamp = float(pkgindex.header.get("DOWNLOAD_TIMESTAMP", 0))
+        except ValueError:
+            download_timestamp = 0
+        remote_timestamp = None
+        rmt_idx = self._new_pkgindex()
+        proc = None
+        tmp_filename = None
+        try:
+            if local_timestamp and (repo.frozen or not getbinpkg_refresh):
+                if repo.frozen:
+                    raise UseCachedCopyOfRemoteIndex("frozen")
+                raise UseCachedCopyOfRemoteIndex("")
+
             try:
-                download_timestamp = float(pkgindex.header.get("DOWNLOAD_TIMESTAMP", 0))
+                ttl = float(pkgindex.header.get("TTL", 0))
             except ValueError:
-                download_timestamp = 0
-            remote_timestamp = None
-            rmt_idx = self._new_pkgindex()
-            proc = None
-            tmp_filename = None
-            try:
+                pass
+            else:
+                if (
+                    download_timestamp
+                    and ttl
+                    and download_timestamp + ttl > time.time()
+                ):
+                    raise UseCachedCopyOfRemoteIndex("within TTL")
+
+            for remote_pkgindex_file in ("Packages.gz", "Packages"):
                 # urlparse.urljoin() only works correctly with recognized
                 # protocols and requires the base url to have a trailing
                 # slash, so join manually...
-                url = base_url.rstrip("/") + "/Packages"
+                url = base_url.rstrip("/") + "/" + remote_pkgindex_file
                 f = None
-
-                if local_timestamp and (repo.frozen or not getbinpkg_refresh):
-                    raise UseCachedCopyOfRemoteIndex()
-
-                try:
-                    ttl = float(pkgindex.header.get("TTL", 0))
-                except ValueError:
-                    pass
-                else:
-                    if (
-                        download_timestamp
-                        and ttl
-                        and download_timestamp + ttl > time.time()
-                    ):
-                        raise UseCachedCopyOfRemoteIndex()
 
                 # Set proxy settings for _urlopen -> urllib_request
                 proxies = {}
@@ -1444,22 +1501,76 @@ class binarytree:
                 # Don't use urlopen for https, unless
                 # PEP 476 is supported (bug #469888).
                 if (
-                    repo.fetchcommand is None or parsed_url.scheme in ("", "file")
-                ) and (parsed_url.scheme not in ("https",) or _have_pep_476()):
+                    (repo.fetchcommand is None or parsed_url.scheme in ("", "file"))
+                    and (parsed_url.scheme not in ("https",) or _have_pep_476())
+                    and (parsed_url.scheme not in ("ssh",))
+                ):
                     try:
                         if parsed_url.scheme in ("", "file"):
-                            f = open(f"{parsed_url.path.rstrip('/')}/Packages", "rb")
+                            f = open(
+                                f"{parsed_url.path.rstrip('/')}/{remote_pkgindex_file}",
+                                "rb",
+                            )
                         else:
                             f = _urlopen(
-                                url, if_modified_since=local_timestamp, proxies=proxies
+                                url,
+                                if_modified_since=local_timestamp,
+                                proxies=proxies,
                             )
-                            if hasattr(f, "headers") and f.headers.get("timestamp", ""):
-                                remote_timestamp = f.headers.get("timestamp")
+                            if hasattr(f, "headers"):
+                                if f.headers.get("Last-Modified", ""):
+                                    last_modified = f.headers.get("Last-Modified")
+                                    remote_timestamp = http_to_timestamp(last_modified)
+                                elif f.headers.get("timestamp", ""):
+                                    remote_timestamp = f.headers.get("timestamp")
+                            if (
+                                remote_timestamp
+                                and local_timestamp
+                                and int(remote_timestamp) < int(local_timestamp)
+                            ):
+                                msg = (
+                                    f"[{binrepo_name}] WARNING: Service {host} did not respect If-Modified-Since."
+                                    f" Consider asking the service operator to enable support for"
+                                    f" If-Modified-Since or using another service"
+                                )
+                                extra_info = ""
+                                if verbose:
+                                    local_iso_time = unix_to_iso_time(local_timestamp)
+                                    remote_iso_time = unix_to_iso_time(remote_timestamp)
+                                    extra_info = f" (local: {local_iso_time}, remote: {remote_iso_time})"
+                                writemsg(
+                                    colorize(
+                                        "WARN",
+                                        f"{msg}{extra_info}.\n",
+                                    ),
+                                    noiselevel=-1,
+                                )
                     except OSError as err:
                         if (
                             hasattr(err, "code") and err.code == 304
                         ):  # not modified (since local_timestamp)
-                            raise UseCachedCopyOfRemoteIndex()
+                            extra_info = ""
+                            if hasattr(err, "headers") and err.headers.get(
+                                "Last-Modified", ""
+                            ):
+                                last_modified = err.headers.get("Last-Modified")
+                                remote_timestamp = http_to_timestamp(last_modified)
+                                local_iso_time = unix_to_iso_time(local_timestamp)
+                                remote_iso_time = unix_to_iso_time(remote_timestamp)
+                                extra_info = f" (local: {local_iso_time}, remote: {remote_iso_time})"
+
+                            raise UseCachedCopyOfRemoteIndex("up-to-date", extra_info)
+                        if (
+                            remote_pkgindex_file == "Packages.gz"
+                            and isinstance(err, FileNotFoundError)
+                            or (
+                                isinstance(err, urllib.error.HTTPError)
+                                and err.code == 404
+                            )
+                        ):
+                            # Ignore 404s for Packages.gz, as the file is
+                            # not guaranteed to exist.
+                            continue
 
                         if parsed_url.scheme in ("ftp", "http", "https"):
                             # This protocol is supposedly supported by urlopen,
@@ -1468,6 +1579,8 @@ class binarytree:
                             if self.settings.get("PORTAGE_DEBUG", "0") != "0":
                                 traceback.print_exc()
 
+                            # Re-raise the OSError. It will be caught again in this function,
+                            # just above the remote_pkgindex_file loop.
                             raise
                     except ValueError:
                         raise ParseError(
@@ -1475,9 +1588,15 @@ class binarytree:
                         )
 
                 if f is None:
-                    path = parsed_url.path.rstrip("/") + "/Packages"
+                    path = parsed_url.path.rstrip("/") + "/" + remote_pkgindex_file
 
                     if repo.fetchcommand is None and parsed_url.scheme == "ssh":
+                        if remote_pkgindex_file == "Packages.gz":
+                            # TODO: Check first if Packages.gz exist before
+                            # cat'ing it. Until this is done, never try to retrieve
+                            # Packages.gz as it is not guaranteed to exist.
+                            continue
+
                         # Use a pipe so that we can terminate the download
                         # early if we detect that the TIMESTAMP header
                         # matches that of the cached Packages file.
@@ -1525,8 +1644,15 @@ class binarytree:
                             fcmd=fcmd, fcmd_vars=fcmd_vars
                         )
                         if not success:
+                            if remote_pkgindex_file == "Packages.gz":
+                                # Ignore failures for Packages.gz, as the file is
+                                # not guaranteed to exist.
+                                continue
                             raise OSError(f"{setting} failed")
                         f = open(tmp_filename, "rb")
+
+                if remote_pkgindex_file == "Packages.gz":
+                    f = GzipFile(fileobj=f, mode="rb")
 
                 f_dec = codecs.iterdecode(
                     f, _encodings["repo.content"], errors="replace"
@@ -1542,19 +1668,20 @@ class binarytree:
                         pkgindex = None
                         writemsg(
                             _(
-                                "\n\n!!! Binhost package index "
+                                "\n\n!!! [%s] Binhost package index "
                                 " has no TIMESTAMP field.\n"
-                            ),
+                            )
+                            % binrepo_name,
                             noiselevel=-1,
                         )
                     else:
                         if not self._pkgindex_version_supported(rmt_idx):
                             writemsg(
                                 _(
-                                    "\n\n!!! Binhost package index version"
+                                    "\n\n!!! [%s] Binhost package index version"
                                     " is not supported: '%s'\n"
                                 )
-                                % rmt_idx.header.get("VERSION"),
+                                % (binrepo_name, rmt_idx.header.get("VERSION")),
                                 noiselevel=-1,
                             )
                             pkgindex = None
@@ -1574,126 +1701,124 @@ class binarytree:
                             AlarmSignal.unregister()
                     except AlarmSignal:
                         writemsg(
-                            "\n\n!!! %s\n"
-                            % _("Timed out while closing connection to binhost"),
+                            "\n\n!!! [%s] %s\n"
+                            % (
+                                binrepo_name,
+                                _("Timed out while closing connection to binhost"),
+                            ),
                             noiselevel=-1,
                         )
-            except UseCachedCopyOfRemoteIndex:
-                changed = False
-                desc = "frozen" if repo.frozen else "up-to-date"
-                writemsg_stdout("\n")
-                writemsg_stdout(
-                    colorize(
-                        "GOOD",
-                        _("Local copy of remote index is %s and will be used.") % desc,
-                    )
-                    + "\n"
-                )
-                rmt_idx = pkgindex
-            except OSError as e:
-                # This includes URLError which is raised for SSL
-                # certificate errors when PEP 476 is supported.
-                writemsg(
-                    _("\n\n!!! Error fetching binhost package" " info from '%s'\n")
-                    % _hide_url_passwd(base_url)
-                )
-                # With Python 2, the EnvironmentError message may
-                # contain bytes or unicode, so use str to ensure
-                # safety with all locales (bug #532784).
-                try:
-                    error_msg = str(e)
-                except UnicodeDecodeError as uerror:
-                    error_msg = str(uerror.object, encoding="utf_8", errors="replace")
-                writemsg(f"!!! {error_msg}\n\n")
-                del e
-                pkgindex = None
-            if proc is not None:
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
-                proc = None
-            if tmp_filename is not None:
-                try:
-                    os.unlink(tmp_filename)
-                except OSError:
-                    pass
-            if pkgindex is rmt_idx and changed:
-                pkgindex.modified = False  # don't update the header
-                pkgindex.header["DOWNLOAD_TIMESTAMP"] = "%d" % time.time()
-                try:
-                    ensure_dirs(os.path.dirname(pkgindex_file))
-                    f = atomic_ofstream(pkgindex_file)
-                    pkgindex.write(f)
-                    f.close()
-                except (OSError, PortageException):
-                    if os.access(os.path.dirname(pkgindex_file), os.W_OK):
-                        raise
-                    # The current user doesn't have permission to cache the
-                    # file, but that's alright.
-            if pkgindex:
-                remote_base_uri = pkgindex.header.get("URI", base_url)
-                for d in pkgindex.packages:
-                    cpv = _pkg_str(
-                        d["CPV"],
-                        metadata=d,
-                        settings=self.settings,
-                        db=self.dbapi,
-                        repoconfig=repo,
-                    )
-                    # Local package instances override remote instances
-                    # with the same instance_key.
-                    if self.dbapi.cpv_exists(cpv):
-                        continue
-
-                    if gpkg_only:
+                    if proc is not None:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.wait()
+                        proc = None
+                    if tmp_filename is not None:
                         try:
-                            binpkg_format = get_binpkg_format(
-                                d.get("PATH"), remote=True
-                            )
-                        except InvalidBinaryPackageFormat as e:
+                            os.unlink(tmp_filename)
+                        except OSError:
+                            pass
+                # We successfully fetched the remote index, break
+                # out of the ("Packages.gz", "Packages") loop.
+                break
+        except UseCachedCopyOfRemoteIndex as exc:
+            changed = False
+            rmt_idx = pkgindex
+            if getbinpkg_refresh or repo.frozen:
+                extra_info = exc.extra_info if verbose else ""
+                writemsg(
+                    _("[%s] Local copy of remote index is %s and will be used%s.\n")
+                    % (binrepo_name, exc.desc, extra_info),
+                )
+        except OSError as err:
+            # This includes URLError which is raised for SSL
+            # certificate errors when PEP 476 is supported.
+            writemsg(
+                _("\n\n!!! [%s] Error fetching binhost package" " info from '%s'\n")
+                % (binrepo_name, _hide_url_passwd(base_url))
+            )
+            error_msg = str(err)
+            writemsg(f"!!! [{binrepo_name}] {error_msg}\n\n")
+            del err
+            pkgindex = None
+
+        if pkgindex is rmt_idx and changed:
+            pkgindex.modified = False  # don't update the header
+            pkgindex.header["DOWNLOAD_TIMESTAMP"] = "%d" % time.time()
+            try:
+                ensure_dirs(os.path.dirname(pkgindex_file))
+                f = atomic_ofstream(pkgindex_file)
+                pkgindex.write(f)
+                f.close()
+            except (OSError, PortageException):
+                if os.access(os.path.dirname(pkgindex_file), os.W_OK):
+                    raise
+                # The current user doesn't have permission to cache the
+                # file, but that's alright.
+        if pkgindex:
+            remote_base_uri = pkgindex.header.get("URI", base_url)
+            for d in pkgindex.packages:
+                cpv = _pkg_str(
+                    d["CPV"],
+                    metadata=d,
+                    settings=self.settings,
+                    db=self.dbapi,
+                    repoconfig=repo,
+                )
+                # Local package instances override remote instances
+                # with the same instance_key.
+                if self.dbapi.cpv_exists(cpv):
+                    continue
+
+                if gpkg_only:
+                    try:
+                        binpkg_format = get_binpkg_format(d.get("PATH"), remote=True)
+                    except InvalidBinaryPackageFormat as e:
+                        writemsg(
+                            colorize(
+                                "WARN",
+                                f"{e}\n",
+                            ),
+                            noiselevel=-1,
+                        )
+                        continue
+                    if binpkg_format != "gpkg":
+                        if not gpkg_only_warned:
                             writemsg(
                                 colorize(
                                     "WARN",
-                                    f"{e}\n",
+                                    f"[{binrepo_name} Remote XPAK packages in '{remote_base_uri}' are ignored due to 'binpkg-request-signature'.\n",
                                 ),
                                 noiselevel=-1,
                             )
-                            continue
-                        if binpkg_format != "gpkg":
-                            if not gpkg_only_warned:
-                                writemsg(
-                                    colorize(
-                                        "WARN",
-                                        f"Remote XPAK packages in '{remote_base_uri}' are ignored due to 'binpkg-request-signature'.\n",
-                                    ),
-                                    noiselevel=-1,
-                                )
-                                gpkg_only_warned = True
-                            continue
+                            gpkg_only_warned = True
+                        continue
 
-                    d["CPV"] = cpv
-                    d["BASE_URI"] = remote_base_uri
-                    d["PKGINDEX_URI"] = url
-                    # FETCHCOMMAND and RESUMECOMMAND may be specified
-                    # by binrepos.conf, and otherwise ensure that they
-                    # do not propagate from the Packages index since
-                    # it may be unsafe to execute remotely specified
-                    # commands.
-                    if repo.fetchcommand is None:
-                        d.pop("FETCHCOMMAND", None)
-                    else:
-                        d["FETCHCOMMAND"] = repo.fetchcommand
-                    if repo.resumecommand is None:
-                        d.pop("RESUMECOMMAND", None)
-                    else:
-                        d["RESUMECOMMAND"] = repo.resumecommand
-                    self._remotepkgs[self.dbapi._instance_key(cpv)] = d
-                    self.dbapi.cpv_inject(cpv)
+                d["CPV"] = cpv
+                d["BASE_URI"] = remote_base_uri
+                d["PKGINDEX_URI"] = pkgindex_uri
+                # FETCHCOMMAND and RESUMECOMMAND may be specified
+                # by binrepos.conf, and otherwise ensure that they
+                # do not propagate from the Packages index since
+                # it may be unsafe to execute remotely specified
+                # commands.
+                if repo.fetchcommand is None:
+                    d.pop("FETCHCOMMAND", None)
+                else:
+                    d["FETCHCOMMAND"] = repo.fetchcommand
+                if repo.resumecommand is None:
+                    d.pop("RESUMECOMMAND", None)
+                else:
+                    d["RESUMECOMMAND"] = repo.resumecommand
+                self._remotepkgs[self.dbapi._instance_key(cpv)] = d
+                self.dbapi.cpv_inject(cpv)
 
-                self._remote_has_index = True
-                self._merge_pkgindex_header(pkgindex.header, self._pkgindex_header)
+            self._remote_has_index = True
+            self._merge_pkgindex_header(pkgindex.header, self._pkgindex_header)
 
     def _populate_additional(self, repos):
+        from portage.versions import _pkg_str
+
         for repo in repos:
             aux_keys = list(set(chain(repo._aux_cache_keys, repo._pkg_str_aux_keys)))
             for cpv in repo.cpv_all():
@@ -1704,6 +1829,10 @@ class binarytree:
                 self.dbapi.cpv_inject(pkg)
 
     def inject(self, cpv, current_pkg_path=None, allocated_pkg_path=None):
+        from portage.locks import lockfile, unlockfile
+        from portage.util import writemsg
+        from portage.versions import _pkg_str, catsplit
+
         """Add a freshly built package to the database.  This updates
         $PKGDIR/Packages with the new package metadata (including MD5).
         @param cpv: The cpv of the new package to inject
@@ -1842,6 +1971,9 @@ class binarytree:
         @return: None
         @raise KeyError: If cpv does not exist in the internal state
         """
+        from portage.locks import lockfile, unlockfile
+        from portage.util import writemsg
+
         if not self.populated:
             self.populate()
         os.makedirs(self.pkgdir, exist_ok=True)
@@ -2038,6 +2170,8 @@ class binarytree:
         return d
 
     def _pkgindex_write(self, pkgindex):
+        from portage.util import atomic_ofstream
+
         contents = codecs.getwriter(_encodings["repo.content"])(io.BytesIO())
         pkgindex.write(contents)
         contents = contents.getvalue()
@@ -2056,6 +2190,12 @@ class binarytree:
                     fileobj,
                 )
             )
+        else:
+            try:
+                os.unlink(self._pkgindex_file + ".gz")
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    raise
 
         for f, fname, f_close in output_files:
             f.write(contents)
@@ -2067,6 +2207,8 @@ class binarytree:
             os.utime(fname, (atime, mtime))
 
     def _pkgindex_entry(self, cpv):
+        from portage.checksum import perform_multiple_checksums
+
         """
         Performs checksums, and gets size and mtime via lstat.
         Raises InvalidDependString if necessary.
@@ -2160,6 +2302,8 @@ class binarytree:
         maintain a cache of implicit IUSE settings for use with binary
         packages.
         """
+        from portage.util import normalize_path
+
         if not (self.settings.profile_path and "IUSE_IMPLICIT" in self.settings):
             header.setdefault("VERSION", str(self._pkgindex_version))
             return
@@ -2177,6 +2321,11 @@ class binarytree:
             header["URI"] = base_uri
         else:
             header.pop("URI", None)
+        ttl = self.settings.get("PORTAGE_BINHOST_TTL")
+        if ttl:
+            header["TTL"] = ttl
+        else:
+            header.pop("TTL", None)
         for k in (
             list(self._pkgindex_header_keys)
             + self.settings.get("USE_EXPAND_IMPLICIT", "").split()
@@ -2209,6 +2358,8 @@ class binarytree:
         return False
 
     def _eval_use_flags(self, cpv, metadata):
+        from portage.util import writemsg
+
         use = frozenset(metadata.get("USE", "").split())
         for k in self._pkgindex_use_evaluated_keys:
             if k.endswith("DEPEND"):
@@ -2228,6 +2379,8 @@ class binarytree:
             metadata[k] = deps
 
     def exists_specific(self, cpv):
+        from portage.dbapi.dep_expand import dep_expand
+
         if not self.populated:
             self.populate()
         return self.dbapi.match(
@@ -2235,6 +2388,11 @@ class binarytree:
         )
 
     def dep_bestmatch(self, mydep):
+        from portage.dbapi.dep_expand import dep_expand
+        from portage.dep import dep_getkey, match_from_list
+        from portage.util import writemsg
+        from portage.versions import best
+
         "compatibility method -- all matches, not just visible ones"
         if not self.populated:
             self.populate()
@@ -2263,6 +2421,8 @@ class binarytree:
         a new path, behavior depends on the binpkg-multi-instance
         FEATURES setting.
         """
+        from portage.versions import _pkg_str, catsplit
+
         if not self.populated:
             self.populate()
 
@@ -2366,6 +2526,8 @@ class binarytree:
             raise InvalidBinaryPackageFormat(binpkg_format)
 
     def _allocate_filename_multi(self, cpv, remote_binpkg_format=None):
+        from portage.versions import catsplit
+
         if remote_binpkg_format is None:
             try:
                 binpkg_format = get_binpkg_format(cpv._metadata["PATH"])
@@ -2429,6 +2591,8 @@ class binarytree:
 
     @staticmethod
     def _parse_build_id(filename):
+        from portage.versions import _pkgsplit
+
         build_id = -1
         if filename.endswith(SUPPORTED_XPAK_EXTENSIONS):
             suffixlen = len(".xpak")
@@ -2438,8 +2602,17 @@ class binarytree:
             raise InvalidBinaryPackageFormat(filename)
 
         filename = filename[:-suffixlen]
-        if re.match(r".*-[\w.]*\d+[\w.]*-\d+$", filename):
-            build_id = int(filename.split("-")[-1])
+        filename = os.path.basename(filename)
+        filename_split = filename.rsplit("-", 1)
+        if len(filename_split) == 2:
+            pf, build_id_str = filename_split
+            # Use _pkgsplit to ensure that a version is not confused with a build_id.
+            pf_split = _pkgsplit(pf)
+            if pf_split is not None:
+                try:
+                    build_id = int(build_id_str)
+                except ValueError:
+                    pass
 
         return build_id
 
@@ -2486,9 +2659,8 @@ class binarytree:
             or int(remote_metadata["_mtime_"]) != st[stat.ST_MTIME]
         )
 
-    def get_local_repo_location(self, pkgname):
-        """Returns local repo location associated with pkgname or None
-        if a location is not associated."""
+    def get_local_repo(self, pkgname):
+        """Returns local repo associated with pkgname"""
         # Since pkgname._repoconfig is not guaranteed to be present
         # here, retrieve it from the remote metadata.
         if not self._remotepkgs:
@@ -2496,10 +2668,16 @@ class binarytree:
         instance_key = self.dbapi._instance_key(pkgname)
         remote_metadata = self._remotepkgs.get(instance_key)
         if remote_metadata is None:
-            return False
-        repoconfig = remote_metadata["CPV"]._repoconfig
-        if repoconfig is None:
             return None
+        repoconfig = remote_metadata["CPV"]._repoconfig
+        return repoconfig
+
+    def get_local_repo_location(self, pkgname):
+        """Returns local repo location associated with pkgname or None
+        if a location is not associated."""
+        from portage.util import normalize_path
+
+        repoconfig = self.get_local_repo(pkgname)
         if repoconfig.location:
             location = normalize_path(repoconfig.location)
             if location == self.pkgdir:
@@ -2521,6 +2699,8 @@ class binarytree:
     def gettbz2(self, pkgname):
         """Fetches the package from a remote site, if necessary.  Attempts to
         resume if the file appears to be partially downloaded."""
+        from portage.util import writemsg
+
         instance_key = self.dbapi._instance_key(pkgname)
         tbz2_path = self.getname(pkgname)
         tbz2name = os.path.basename(tbz2_path)
@@ -2584,6 +2764,10 @@ class binarytree:
         return pkgindex
 
     def _get_digests(self, pkg):
+        from portage.checksum import get_valid_checksum_keys
+        from portage.util import writemsg
+        from portage.versions import _pkg_str
+
         try:
             cpv = pkg.cpv
         except AttributeError:
@@ -2624,6 +2808,14 @@ class binarytree:
         return digests
 
     def digestCheck(self, pkg):
+        from portage.checksum import (
+            _hash_filter,
+            _apply_hash_filter,
+            _check_distfile,
+            verify_all,
+        )
+        from portage.output import EOutput
+
         """
         Verify digests for the given package and raise DigestException
         if verification fails.

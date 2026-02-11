@@ -1,4 +1,4 @@
-# Copyright 2010-2023 Gentoo Authors
+# Copyright 2010-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = [
@@ -23,14 +23,6 @@ import warnings
 from _emerge.Package import Package
 import portage
 
-portage.proxy.lazyimport.lazyimport(
-    globals(),
-    "portage.data:portage_gid",
-    "portage.dep.soname.SonameAtom:SonameAtom",
-    "portage.dbapi.vartree:vartree",
-    "portage.package.ebuild.doebuild:_phase_func_map",
-    "portage.util.compression_probe:_compressors",
-)
 from portage import bsd_chflags, load_mod, os, selinux, _unicode_decode
 from portage.const import (
     CACHE_PATH,
@@ -104,24 +96,6 @@ from portage.package.ebuild._config.helper import (
     ordered_by_atom_specificity,
     prune_incremental,
 )
-
-
-_feature_flags_cache = {}
-
-
-def _get_feature_flags(eapi_attrs):
-    cache_key = (eapi_attrs.feature_flag_test,)
-    flags = _feature_flags_cache.get(cache_key)
-    if flags is not None:
-        return flags
-
-    flags = []
-    if eapi_attrs.feature_flag_test:
-        flags.append("test")
-
-    flags = frozenset(flags)
-    _feature_flags_cache[cache_key] = flags
-    return flags
 
 
 def autouse(myvartree, use_cache=1, mysettings=None):
@@ -873,8 +847,7 @@ class config:
 
             # Read license_groups and optionally license_groups and package.license from user config
             self._license_manager = LicenseManager(
-                locations_manager.profile_locations,
-                abs_user_config,
+                locations_manager,
                 user_config=local_config,
             )
             # Extract '*/*' entries from package.license
@@ -1221,8 +1194,8 @@ class config:
             "PKG_CONFIG_.*",
         )
 
-        broot_only_variables_re = re.compile(r"^(%s)$" % "|".join(broot_only_variables))
-        eroot_only_variables_re = re.compile(r"^(%s)$" % "|".join(eroot_only_variables))
+        broot_only_variables_re = re.compile(rf"^({'|'.join(broot_only_variables)})$")
+        eroot_only_variables_re = re.compile(rf"^({'|'.join(eroot_only_variables)})$")
 
         broot_env_d_path = os.path.join(broot or "/", "etc", "profile.env")
         eroot_env_d_path = os.path.join(eroot or "/", "etc", "profile.env")
@@ -1316,6 +1289,8 @@ class config:
         """
         Create a few directories that are critical to portage operation
         """
+        from portage.data import portage_gid
+
         if not os.access(self["EROOT"], os.W_OK):
             return
 
@@ -1391,6 +1366,8 @@ class config:
 
     @property
     def soname_provided(self):
+        from portage.dep.soname.SonameAtom import SonameAtom
+
         if self._soname_provided is None:
             d = stack_dictlist(
                 (
@@ -1415,6 +1392,7 @@ class config:
     def validate(self):
         """Validate miscellaneous settings and display warnings if necessary.
         (This code was previously in the global scope of portage.py)"""
+        from portage.util.compression_probe import _compressors
 
         groups = self.get("ACCEPT_KEYWORDS", "").split()
         archlist = self.archlist()
@@ -1698,7 +1676,7 @@ class config:
                 use = frozenset(settings["PORTAGE_USE"].split())
 
             values["ACCEPT_LICENSE"] = (
-                settings._license_manager.get_prunned_accept_license(
+                settings._license_manager.get_pruned_accept_license(
                     settings.mycpv,
                     use,
                     settings.get("LICENSE", ""),
@@ -1916,6 +1894,7 @@ class config:
                     pkginternaluse_list.append(x)
             pkginternaluse = " ".join(pkginternaluse_list)
 
+        stable = self._isStable(cpv_slot) if hasattr(cpv_slot, "_metadata") else None
         eapi_attrs = _get_eapi_attrs(eapi)
 
         if pkginternaluse != self.configdict["pkginternal"].get("USE", ""):
@@ -1940,12 +1919,30 @@ class config:
                     # make a copy, since we might modify it with
                     # package.use settings
                     d = d.copy()
+
+                # package.use.stable > package.use > use.stable
+                if stable:
+                    x = self._use_manager._repo_use_stable_dict.get(repo, ())
+                    if x:
+                        d["USE"] = d.get("USE", "") + " " + " ".join(x)
+
                 cpdict = self._use_manager._repo_puse_dict.get(repo, {}).get(cp)
                 if cpdict:
                     repo_puse = ordered_by_atom_specificity(cpdict, cpv_slot)
                     if repo_puse:
                         for x in repo_puse:
                             d["USE"] = d.get("USE", "") + " " + " ".join(x)
+
+                if stable:
+                    cpdict = self._use_manager._repo_puse_stable_dict.get(repo, {}).get(
+                        cp
+                    )
+                    if cpdict:
+                        repo_puse = ordered_by_atom_specificity(cpdict, cpv_slot)
+                        if repo_puse:
+                            for x in repo_puse:
+                                d["USE"] = d.get("USE", "") + " " + " ".join(x)
+
                 if d:
                     repo_env.append(d)
 
@@ -1960,11 +1957,24 @@ class config:
         for i, pkgprofileuse_dict in enumerate(self._use_manager._pkgprofileuse):
             if self.make_defaults_use[i]:
                 defaults.append(self.make_defaults_use[i])
+
+            # package.use.stable > package.use > use.stable
+            if stable and self._use_manager._use_stable_list[i]:
+                defaults.append(" ".join(self._use_manager._use_stable_list[i]))
+
             cpdict = pkgprofileuse_dict.get(cp)
             if cpdict:
                 pkg_defaults = ordered_by_atom_specificity(cpdict, cpv_slot)
                 if pkg_defaults:
                     defaults.extend(pkg_defaults)
+
+            if stable:
+                cpdict = self._use_manager._puse_stable_list[i].get(cp)
+                if cpdict:
+                    pkg_defaults = ordered_by_atom_specificity(cpdict, cpv_slot)
+                    if pkg_defaults:
+                        defaults.extend(pkg_defaults)
+
         defaults = " ".join(defaults)
         if defaults != self.configdict["defaults"].get("USE", ""):
             self.configdict["defaults"]["USE"] = defaults
@@ -2204,20 +2214,6 @@ class config:
             self.configdict["env"][
                 "BASH_FUNC____in_portage_iuse%%"
             ] = "() { [[ $1 =~ ${PORTAGE_IUSE} ]]; }"
-
-        ebuild_force_test = not restrict_test and self.get("EBUILD_FORCE_TEST") == "1"
-
-        if "test" in explicit_iuse or iuse_implicit_match("test"):
-            if "test" in self.features:
-                if ebuild_force_test and "test" in self.usemask:
-                    self.usemask = frozenset(x for x in self.usemask if x != "test")
-            if restrict_test or ("test" in self.usemask and not ebuild_force_test):
-                # "test" is in IUSE and USE=test is masked, so execution
-                # of src_test() probably is not reliable. Therefore,
-                # temporarily disable FEATURES=test just for this package.
-                self["FEATURES"] = " ".join(
-                    x for x in sorted(self.features) if x != "test"
-                )
 
         # Allow _* flags from USE_EXPAND wildcards to pass through here.
         use.difference_update(
@@ -2676,7 +2672,7 @@ class config:
                 self._accept_chost_re = re.compile(".*")
             elif len(accept_chost) == 1:
                 try:
-                    self._accept_chost_re = re.compile(r"^%s$" % accept_chost[0])
+                    self._accept_chost_re = re.compile(rf"^{accept_chost[0]}$")
                 except re.error as e:
                     writemsg(
                         _("!!! Invalid ACCEPT_CHOSTS value: '%s': %s\n")
@@ -2686,9 +2682,7 @@ class config:
                     self._accept_chost_re = re.compile("^$")
             else:
                 try:
-                    self._accept_chost_re = re.compile(
-                        r"^(%s)$" % "|".join(accept_chost)
-                    )
+                    self._accept_chost_re = re.compile(rf"^({'|'.join(accept_chost)})$")
                 except re.error as e:
                     writemsg(
                         _("!!! Invalid ACCEPT_CHOSTS value: '%s': %s\n")
@@ -3101,6 +3095,8 @@ class config:
         return self._virtuals_manager.get_virts_p()
 
     def getvirtuals(self):
+        from portage.dbapi.vartree import vartree
+
         if self._virtuals_manager._treeVirtuals is None:
             # Hack around the fact that VirtualsManager needs a vartree
             # and vartree needs a config instance.
@@ -3162,6 +3158,8 @@ class config:
                 return ""
 
     def _getitem(self, mykey):
+        from portage.data import portage_gid
+
         if mykey in self._constant_keys:
             # These two point to temporary values when
             # portage plans to update itself.
@@ -3273,6 +3271,8 @@ class config:
 
     def environ(self):
         "return our locally-maintained environment"
+        from portage.package.ebuild.doebuild import _phase_func_map
+
         mydict = {}
         environ_filter = self._environ_filter
 

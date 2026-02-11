@@ -1,4 +1,4 @@
-.TH "MAKE.CONF" "5" "Aug 2024" "Portage @VERSION@" "Portage"
+.TH "MAKE.CONF" "5" "Nov 2025" "Portage @VERSION@" "Portage"
 .SH "NAME"
 make.conf \- custom settings for Portage
 .SH "SYNOPSIS"
@@ -51,9 +51,9 @@ Defaults to the value of $CHOST.
 .TP
 \fBACCEPT_KEYWORDS\fR = \fI[space delimited list of KEYWORDS]\fR
 Enable testing of ebuilds that have not yet been deemed 'stable'.  Users
-of the 'x86' architecture would set this to '\(tix86' while ppc users would
-set this to '\(tippc'.  This is an incremental variable.  Only define a
-\(tiarch.
+of the 'x86' architecture would set this to '\[ti]x86' while ppc users would
+set this to '\[ti]ppc'.  This is an incremental variable.  Only define a
+\[ti]arch.
 .br
 Defaults to the value of $ARCH.
 .TP
@@ -157,7 +157,7 @@ This variable is used to add additional arguments only for the specified \
 BINPKG_COMPRESS_FLAGS_ZSTD="-9"
 .fi
 .TP
-\fBBINPKG_GPG_SIGNING_BASE_COMMAND\fR = \fI"GPG command and arguments \
+\fBBINPKG_GPG_SIGNING_BASE_COMMAND\fR = \fI"GnuPG command and arguments \
 [PORTAGE_CONFIG]"\fR
 The base command will be used for all signing operations.
 Portage will replace \fB[PORTAGE_CONFIG]\fR under different operations.
@@ -167,20 +167,20 @@ Defaults to "/usr/bin/flock /run/lock/portage-binpkg-gpg.lock /usr/bin/gpg \
 --sign --armor [PORTAGE_CONFIG]".
 .br
 .TP
-\fBBINPKG_GPG_SIGNING_DIGEST=\fR = \fI"GPG supported digest"\fR
+\fBBINPKG_GPG_SIGNING_DIGEST=\fR = \fI"GnuPG supported digest"\fR
 The digest that will be used for signature.
 .br
 Defaults to "SHA512"
 .br
 .TP
 \fBBINPKG_GPG_SIGNING_GPG_HOME\fR = \fI[path]\fR
-The GPG home where the signing private key located.
+The GnuPG home where the signing private key located.
 .br
 Defaults to "/root/.gnupg"
 .br
 .TP
-\fBBINPKG_GPG_SIGNING_KEY\fR = \fI"GPG key ID"\fR
-GPG key ID used to sign binary packages, must exists in \
+\fBBINPKG_GPG_SIGNING_KEY\fR = \fI"GnuPG key ID"\fR
+GnuPG key ID used to sign binary packages, must exists in \
 \fBBINPKG_GPG_SIGNING_GPG_HOME\fR.
 .br
 Defaults to ""
@@ -188,7 +188,7 @@ Defaults to ""
 Example: "0x40DCF18E97150795!"
 .br
 .TP
-\fBBINPKG_GPG_VERIFY_BASE_COMMAND=\fR = \fI"GPG command and arguments"\fR
+\fBBINPKG_GPG_VERIFY_BASE_COMMAND=\fR = \fI"GnuPG command and arguments"\fR
 The base command will be used for all verify operations.
 Portage will replace \fB[PORTAGE_CONFIG]\fR and \fB[SIGNATURE]\fR under \
 different operations.
@@ -199,7 +199,7 @@ Defaults to "/usr/bin/gpg --verify --batch --no-tty --no-auto-check-trustdb \
 .br
 .TP
 \fBBINPKG_GPG_VERIFY_GPG_HOME\fR = \fI[path]\fR
-The GPG home where the trusted keys located. Please make sure the target \
+The GnuPG home where the trusted keys located. Please make sure the target \
 directory is globally readable, as the user will be dropped to \fBnobody\fR \
 during verification.
 .br
@@ -358,9 +358,9 @@ strips (or splits) them before installing.
 \fBbinpkg\-dostrip\fR must be enabled for \fBinstallsources\fR to work.
 .TP
 .B binpkg-ignore-signature
-This will disable GPG signature check for all binary packages. Enable this
+This will disable GnuPG signature checks for all binary packages. Enabling this
 could be dangerous if you get binary packages from remote site or use third
-party packages.
+party packages.  If enabled, takes precedence over \fBbinrepos.conf\fR.
 .TP
 .B binpkg\-logs
 Keep logs from successful binary package merges. This is relevant only when
@@ -395,13 +395,13 @@ It is also possible to remove packages manually, and then run
 This feature is enabled by default.
 .TP
 .B binpkg-request-signature
-Binary packages are requested to be signed by trusted GPG signature.
-Portage will reject to process any binary package without a valid GPG
-signature. The verify command is defined in
-\fBBINPKG_GPG_VERIFY_COMMAND\fR variable.
+Binary packages are requested to be signed by a trusted GnuPG signature.
+Portage will reject to process any binary package without a valid GnuPG
+signature. The verify command is defined in \fBBINPKG_GPG_VERIFY_COMMAND\fR
+variable.  If enabled, takes precedence over \fBbinrepos.conf\fR.
 .TP
 .B binpkg-signing
-Binary packages will be signed by given GPG command. The signing command
+Binary packages will be signed by given GnuPG command. The signing command
 is defined in \fBBINPKG_GPG_SIGNING_COMMAND\fR variable.
 .TP
 .B buildpkg
@@ -462,6 +462,7 @@ This feature is intended for Gentoo binhosts using certain webservers
 (such as, but not limited to, Nginx with gzip_static module) to avoid
 redundant on\-the\-fly compression.  The resulting file will be called
 \[aq]Packages.gz' and its modification time will match that of 'Packages'.
+Enabled by default.
 .TP
 .B compressdebug
 Compress the debug sections in the split debug files with zlib to save
@@ -530,12 +531,13 @@ Only fetch files from configured mirrors, ignoring \fBSRC_URI\fR,
 except when \fImirror\fR is in the \fBebuild\fR(5) \fBRESTRICT\fR variable.
 .TP
 .B getbinpkg
-Force emerges to always try to fetch files from the \fIPORTAGE_BINHOST\fR.  See
-\fBmake.conf\fR(5) for more information.
+Force emerges to always try to fetch files from the remote binhosts configured
+in \fBbinrepos.conf\fR or \fIPORTAGE_BINHOST\fR. (deprecated).
+See \fBmake.conf\fR(5) for more information.
 .TP
 .B gpg-keepalive
-Run GPG unlock command every 5 mins to avoid the passphrase expired.
-If your GPG is auto unlocked on login, you do not need this.
+Run GnuPG unlock command every 5 mins to avoid passphrase expiry.
+If your GnuPG keyring is auto unlocked on login, you do not need this.
 .TP
 .B home\-dir\-template\-copy
 As part of the ebuild environment setup, copy the PORTAGE_USERNAME (default
@@ -567,6 +569,10 @@ and \fBbinpkg-dostrip\fR is enabled.
 Isolate the ebuild phase functions from host IPC namespace. Supported
 only on Linux. Requires IPC namespace support in kernel.
 .TP
+.B jobserver\-token
+Acquire a job token for every build from the jobserver if one is found running.
+This feature is experimental and its semantics may change.
+.TP
 .B keeptemp
 Do not delete the ${T} directory after the merge process.
 .TP
@@ -591,11 +597,13 @@ This feature is enabled by default.
 .TP
 .B merge\-wait
 Wait for all builds to complete before merging new packages, which only
-matters when using the \fBemerge\fR(1) \fB\-\-jobs\fR option. This
-feature is always effectively enabled and it cannot be disabled for
-packages that satisfy direct or indirect dependencies of the system
-set. For other packages, it can be disabled in order to trade the
-possibility of random build failures for greater parallelism.
+matters when using the \fBemerge\fR(1) \fB\-\-jobs\fR option. Unless the
+\fBemerge\fR(1) \fB\-\-implicit\-system\-deps=n\fR option is used,
+\fImerge\-wait\fR is always effectively enabled for packages that satisfy
+direct or indirect dependencies of the system set. The \fImerge\-wait\fR
+feature can be disabled in order to trade the possibility of random build
+failures for greater parallelism.
+The queue can be flushed by sending the SIGUSR2 signal to \fBemerge\fR(1).
 This feature is enabled by default.
 .TP
 .B metadata\-transfer
@@ -663,6 +671,34 @@ Prevents the stripping of binaries that are merged to the live filesystem.
 .B notitles
 Disables xterm titlebar updates (which contains status info).
 .TP
+.B packdebug
+Create a tarball of debug information and source files for use with
+debuginfod.  Debug tarballs are placed at
+\fI/usr/lib/debug/.tarball/${CATEGORY}/${PF}-${BUILD_ID}.tar.xz\fR.
+The debug tarball is installed but is not included in binary packages.
+
+\fIUNINSTALL_IGNORE\fR is automatically modified to leave old debug
+tarballs around to allow debuginfod to serve them after upgrades. See
+\fBsplitdebug\fR for general split debug information (upon which this
+feature depends). Similarly, \fICOLLISION_IGNORE\fR is automatically
+modified to ignore collisions on these files.
+
+Setting \fBpackdebug\fR temporarily on the command-line or per\-package is
+discouraged because the new (unset) value will take effect when the package
+is removed, meaning the automatic adjustments made to accommodate
+\fBpackdebug\fR cannot apply.
+
+Users may wish to avoid double storage of both the live debug information
+in \fI/usr/lib/debug\fR and \fI/usr/src/debug\fR as well as inside of
+the \fIpackdebug\fR tarballs at \fI/usr/lib/debug/.tarball\fR. This can
+be done by setting \fIINSTALL_MASK\fR:
+
+.nf
+# Debug information is inside of packdebug tarballs already, don't install
+# twice.
+INSTALL_MASK="${INSTALL_MASK} /usr/lib/debug/ /usr/src/debug/ -/usr/lib/debug/.tarball"
+.fi
+.TP
 .B parallel\-fetch
 Fetch in the background while compiling. Run
 `tail \-f /var/log/emerge\-fetch.log` in a
@@ -675,7 +711,10 @@ Also disable \fImerge\-wait\fR for additional parallelism if desired,
 but that increases the possibility of random build failures. When
 \fIparallel\-install\fR is used together with \fImerge\-wait\fR,
 parallel installation occurs in batches when there are no builds
-running.
+running. Unless the \fBemerge\fR(1) \fB\-\-implicit\-system\-deps=n\fR
+option is used, \fIparallel\-install\fR is always effectively disabled
+for packages that satisfy direct or indirect dependencies of the system
+set.
 .TP
 .B pid\-sandbox
 Isolate the process space for the ebuild processes. This makes it
@@ -690,7 +729,8 @@ have been manually added or removed since the last call to
 \fBemaint \-\-fix binhost\fR. This feature eliminates overhead involved
 with detection of packages that have been manually added or removed,
 which significantly improves performance in some cases, such as when
-\fBPKGDIR\fR resides on a high\-latency network file system.
+\fBPKGDIR\fR resides on a high\-latency network file system.  Enabled by
+default.
 .TP
 .B prelink\-checksums
 If \fBprelink\fR(8) is installed then use it to undo any prelinks on files
@@ -754,7 +794,7 @@ See also \fIsuidctl\fR below.
 .TP
 .B sign
 When committing work to cvs with \fBrepoman\fR(1), sign the Manifest with
-a GPG key.  Read about the \fIPORTAGE_GPG_KEY\fR variable in
+a GnuPG key.  Read about the \fIPORTAGE_GPG_KEY\fR variable in
 \fBmake.conf\fR(5).
 .TP
 .B skiprocheck
@@ -804,10 +844,7 @@ bits from any file that is not listed in \fI/etc/portage/suidctl.conf\fR.
 Run package\-specific tests during each merge to help make sure
 the package compiled properly.  See \fItest\fR in \fBebuild\fR(1)
 and \fIsrc_test()\fR in \fBebuild\fR(5). This feature implies the "test"
-\fBUSE\fR flag if it is a member of \fBIUSE\fR, either explicitly or
-implicitly (see \fBebuild\fR(5) for more information about \fBIUSE\fR).
-The "test" \fBUSE\fR flag is also automatically disabled when the
-"test" feature is disabled.
+\fBUSE\fR flag.
 .TP
 .B test\-fail\-continue
 If "test" is enabled \fBFEATURES\fR and the test phase of an ebuild fails,
@@ -859,7 +896,7 @@ operation.
 Warn if portage is about to execute a child process with a large environment.
 .TP
 .B webrsync-gpg
-Enable GPG verification when using \fIemerge\-webrsync\fR. This feature is
+Enable GnuPG verification when using \fIemerge\-webrsync\fR. This feature is
 deprecated and has been replaced by the \fBrepos.conf\fR
 \fIsync\-webrsync\-verify\-signature\fR setting, see \fBportage\fR(5).
 .TP
@@ -935,6 +972,9 @@ The \fBINSTALL_MASK\fR is processed just before a package is merged.
 Also supported is a \fBPKG_INSTALL_MASK\fR variable that behaves
 exactly like \fBINSTALL_MASK\fR except that it is processed just
 before creation of a binary package.
+
+Exclusions are supported via \fI[-pattern]\fR.  For exclusions, the last
+matching pattern determines whether the file is removed (masked) or kept.
 
 \fB***warning***\fR
 .br
@@ -1040,6 +1080,14 @@ use the URI header field as a base URI for fetching binary packages. If the URI
 header field is not defined then the client will use its ${PORTAGE_BINHOST}
 setting as the base URI.
 .TP
+\fBPORTAGE_BINHOST_TTL\fR = \
+\fI"3600"\fR
+If this is set, its value will be used to define the TTL header in package
+index.  The TTL header indicates to portage the duration in seconds after
+which the local package index should be considered potentially outdated.  It is
+recommended to set this value to the minimal duration between binary package
+builds to avoid unnecessary network requests on the package index.
+.TP
 .B PORTAGE_BINPKG_FORMAT
 This variable sets default format used for binary packages. Possible values
 are tar and rpm or both. It is very uncommon to set this and is likely
@@ -1077,8 +1125,9 @@ PORTAGE_CHECKSUM_FILTER="\-* sha256"
 .fi
 .TP
 \fBPORTAGE_COMPRESS\fR = \fI"bzip2"\fR
-This variable contains the command used to compress documentation during the
-install phase.
+This variable contains the name of the command used to compress documentation
+during the install phase. If set as an empty string, the documentation shall
+not be compressed.
 .TP
 \fBPORTAGE_COMPRESS_EXCLUDE_SUFFIXES\fR = \fI"gif htm[l]? jp[e]?g pdf png"\fR
 This variable contains a space delimited list of file suffixes for which

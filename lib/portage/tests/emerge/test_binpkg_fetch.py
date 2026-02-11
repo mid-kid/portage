@@ -5,15 +5,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 
 import portage
-from portage import _unicode_decode, os
+from portage import os
 from portage.const import (
     PORTAGE_PYM_PATH,
     USER_CONFIG_PATH,
 )
 from portage.process import find_binary
-from portage.tests import TestCase
+from portage.tests import TestCase, CommandStep, FunctionStep
 from portage.tests.resolver.ResolverPlayground import ResolverPlayground
 from portage.util import ensure_dirs
 
@@ -55,53 +56,45 @@ class BinpkgFetchtestCase(TestCase):
 
         test_commands = (
             # Create a trivial binpkg first.
-            emerge_cmd
-            + (
-                "--oneshot",
-                "--verbose",
-                "--buildpkg",
-                "dev-libs/A",
+            CommandStep(
+                returncode=os.EX_OK,
+                command=emerge_cmd
+                + ("--oneshot", "--verbose", "--buildpkg", "dev-libs/A"),
             ),
-            # Copy to a new PKGDIR which we'll use as PORTAGE_BINHOST then delete the old PKGDIR.
-            (
-                (
-                    lambda: shutil.copytree(bindb.bintree.pkgdir, tmppkgdir_suffix)
-                    or True,
+            # Copy to a new PKGDIR which we'll use as PORTAGE_BINHOST
+            # then delete the old PKGDIR.
+            FunctionStep(
+                function=lambda _: shutil.copytree(
+                    bindb.bintree.pkgdir, tmppkgdir_suffix
                 )
+                or True,
             ),
-            (
-                (
-                    lambda: os.unlink(
-                        os.path.join(
-                            bindb.bintree.pkgdir, "dev-libs", "A", "A-1-1.gpkg.tar"
-                        )
-                    )
-                    or True,
-                )
-            ),
-        )
-        test_commands_nonfatal = (
-            # This should succeed if we've correctly saved it as A-1-1.gpkg.tar, not
-            # A-1-2.gpkg.tar, and then also try to unpack the right filename, but
-            # we defer checking the exit code to get a better error if the binpkg
-            # was downloaded with the wrong filename.
-            emerge_cmd
-            + (
-                "--oneshot",
-                "--verbose",
-                "--getbinpkgonly",
-                "dev-libs/A",
-            ),
-        )
-        test_commands_final = (
-            # Check whether the downloaded binpkg in PKGDIR has the correct
-            # filename (-1) or an unnecessarily-incremented one (-2).
-            (
-                lambda: os.path.exists(
+            FunctionStep(
+                function=lambda _: os.unlink(
                     os.path.join(
                         bindb.bintree.pkgdir, "dev-libs", "A", "A-1-1.gpkg.tar"
                     )
-                ),
+                )
+                or True,
+            ),
+            # This should succeed if we've correctly saved it as A-1-1.gpkg.tar, not
+            # A-1-2.gpkg.tar, and then also try to unpack the right filename.
+            CommandStep(
+                returncode=os.EX_OK,
+                command=emerge_cmd
+                + ("--oneshot", "--verbose", "--getbinpkgonly", "dev-libs/A"),
+            ),
+            # Check whether the downloaded binpkg in PKGDIR has the correct
+            # filename (-1) or an unnecessarily-incremented one (-2).
+            FunctionStep(
+                function=lambda i: self.assertTrue(
+                    os.path.exists(
+                        os.path.join(
+                            bindb.bintree.pkgdir, "dev-libs", "A", "A-1-1.gpkg.tar"
+                        )
+                    ),
+                    f"step {i}",
+                )
             ),
         )
 
@@ -155,24 +148,43 @@ class BinpkgFetchtestCase(TestCase):
             "true": (find_binary("true"), True),
         }
 
-        def run_commands(test_commands, require_success=True):
-            all_successful = True
+        try:
+            for d in dirs:
+                ensure_dirs(d)
+            for x in true_symlinks:
+                os.symlink(needed_binaries["true"][0], os.path.join(fake_bin, x))
 
-            for i, args in enumerate(test_commands):
-                if hasattr(args[0], "__call__"):
-                    if require_success:
-                        self.assertTrue(args[0](), f"callable at index {i} failed")
+            with open(os.path.join(var_cache_edb, "counter"), "wb") as f:
+                f.write(b"100")
+
+            if debug:
+                # The subprocess inherits both stdout and stderr, for
+                # debugging purposes.
+                stdout = None
+            else:
+                # The subprocess inherits stderr so that any warnings
+                # triggered by python -Wd will be visible.
+                stdout = subprocess.PIPE
+
+            for i, step in enumerate(test_commands):
+                if isinstance(step, FunctionStep):
+                    try:
+                        step.function(i)
+                    except Exception as e:
+                        if isinstance(e, AssertionError) and f"step {i}" in str(e):
+                            raise
+                        raise AssertionError(
+                            f"step {i} raised {e.__class__.__name__}"
+                        ) from e
                     continue
 
-                if isinstance(args[0], dict):
-                    local_env = env.copy()
-                    local_env.update(args[0])
-                    args = args[1:]
-                else:
-                    local_env = env
-
-                local_env["PORTAGE_BINHOST"] = f"file:///{tmppkgdir_suffix}"
-                proc = subprocess.Popen(args, env=local_env, stdout=stdout)
+                env["PORTAGE_BINHOST"] = f"file:///{tmppkgdir_suffix}"
+                proc = subprocess.Popen(
+                    step.command,
+                    env=dict(env.items(), **(step.env or {})),
+                    cwd=step.cwd,
+                    stdout=stdout,
+                )
 
                 if debug:
                     proc.wait()
@@ -180,19 +192,164 @@ class BinpkgFetchtestCase(TestCase):
                     output = proc.stdout.readlines()
                     proc.wait()
                     proc.stdout.close()
-                    if proc.returncode != os.EX_OK:
+                    if proc.returncode != step.returncode:
                         for line in output:
-                            sys.stderr.write(_unicode_decode(line))
+                            sys.stderr.write(portage._unicode_decode(line))
 
-                if all_successful and proc.returncode != os.EX_OK:
-                    all_successful = False
+                self.assertEqual(
+                    step.returncode,
+                    proc.returncode,
+                    f"{step.command} (step {i}) failed with exit code {proc.returncode}",
+                )
+        finally:
+            playground.debug = False
+            playground.cleanup()
+            tmppkgdir.cleanup()
 
-                if require_success:
-                    self.assertEqual(
-                        os.EX_OK, proc.returncode, f"emerge failed with args {args}"
+    def testFetchBinpkgWithPkgPretend(self):
+        """
+        Make sure error handling for pkg_pretend w/ --getbinpkg works
+        correctly (fixed by a3f0843a3256ffe3f1248b903702d5b58c7ac892).
+        """
+        debug = False
+
+        pkg_pretend = textwrap.dedent(
+            """
+        S="${WORKDIR}"
+
+        pkg_pretend() {
+            einfo "Hello world!"
+        }
+        """
+        )
+
+        ebuilds = {
+            "dev-libs/A-1::local": {
+                "EAPI": "7",
+                "SLOT": "0",
+                "MISC_CONTENT": pkg_pretend,
+            },
+            "dev-libs/B-1::local": {
+                "EAPI": "7",
+                "SLOT": "0",
+                "MISC_CONTENT": pkg_pretend,
+            },
+        }
+
+        playground = ResolverPlayground(ebuilds=ebuilds, debug=debug)
+        settings = playground.settings
+        eprefix = settings["EPREFIX"]
+        eroot = settings["EROOT"]
+        trees = playground.trees
+        bindb = trees[eroot]["bintree"].dbapi
+        var_cache_edb = os.path.join(eprefix, "var", "cache", "edb")
+        user_config_dir = os.path.join(eprefix, USER_CONFIG_PATH)
+
+        portage_python = portage._python_interpreter
+        emerge_cmd = (
+            portage_python,
+            "-b",
+            "-Wd",
+            os.path.join(str(self.bindir), "emerge"),
+        )
+
+        tmppkgdir = tempfile.TemporaryDirectory()
+        tmppkgdir_suffix = os.path.join(tmppkgdir.name, "binpkg")
+
+        test_commands = (
+            # Create two trivial binpkgs first.
+            CommandStep(
+                returncode=os.EX_OK,
+                command=emerge_cmd
+                + ("--oneshot", "--verbose", "--buildpkg", "dev-libs/A", "dev-libs/B"),
+            ),
+            # Copy to a new PKGDIR which we'll use as PORTAGE_BINHOST
+            # then delete the old PKGDIR.
+            FunctionStep(
+                function=lambda _: shutil.copytree(
+                    bindb.bintree.pkgdir, tmppkgdir_suffix
+                )
+                or True,
+            ),
+            FunctionStep(
+                function=lambda _: os.unlink(
+                    os.path.join(
+                        bindb.bintree.pkgdir, "dev-libs", "A", "A-1-1.gpkg.tar"
                     )
+                )
+            ),
+            FunctionStep(
+                function=lambda _: os.unlink(
+                    os.path.join(
+                        bindb.bintree.pkgdir, "dev-libs", "B", "B-1-1.gpkg.tar"
+                    )
+                )
+            ),
+            # Both dev-libs/A and dev-libs/B have a (passing) pkg_pretend to force
+            # taking the path that was broken before.
+            CommandStep(
+                returncode=os.EX_OK,
+                command=emerge_cmd
+                + (
+                    "--oneshot",
+                    "--verbose",
+                    "--jobs=2",
+                    "--getbinpkgonly",
+                    "dev-libs/A",
+                    "dev-libs/B",
+                ),
+            ),
+        )
 
-            return all_successful
+        fake_bin = os.path.join(eprefix, "bin")
+        portage_tmpdir = os.path.join(eprefix, "var", "tmp", "portage")
+
+        path = settings.get("PATH")
+        if path is not None and not path.strip():
+            path = None
+        if path is None:
+            path = ""
+        else:
+            path = ":" + path
+        path = fake_bin + path
+
+        pythonpath = os.environ.get("PYTHONPATH")
+        if pythonpath is not None and not pythonpath.strip():
+            pythonpath = None
+        if pythonpath is not None and pythonpath.split(":")[0] == PORTAGE_PYM_PATH:
+            pass
+        else:
+            if pythonpath is None:
+                pythonpath = ""
+            else:
+                pythonpath = ":" + pythonpath
+            pythonpath = PORTAGE_PYM_PATH + pythonpath
+
+        env = {
+            "PORTAGE_OVERRIDE_EPREFIX": eprefix,
+            "PATH": path,
+            "PORTAGE_PYTHON": portage_python,
+            "PORTAGE_REPOSITORIES": settings.repositories.config_string(),
+            "PYTHONDONTWRITEBYTECODE": os.environ.get("PYTHONDONTWRITEBYTECODE", ""),
+            "PYTHONPATH": pythonpath,
+            "PORTAGE_INST_GID": str(os.getgid()),
+            "PORTAGE_INST_UID": str(os.getuid()),
+            "FEATURES": "-parallel-fetch -pkgdir-index-trusted",
+        }
+
+        dirs = [
+            playground.distdir,
+            fake_bin,
+            portage_tmpdir,
+            user_config_dir,
+            var_cache_edb,
+        ]
+
+        true_symlinks = ["chown", "chgrp"]
+
+        needed_binaries = {
+            "true": (find_binary("true"), True),
+        }
 
         try:
             for d in dirs:
@@ -212,14 +369,41 @@ class BinpkgFetchtestCase(TestCase):
                 # triggered by python -Wd will be visible.
                 stdout = subprocess.PIPE
 
-            run_commands(test_commands)
-            deferred_success = run_commands(test_commands_nonfatal, False)
-            run_commands(test_commands_final)
+            for i, step in enumerate(test_commands):
+                if isinstance(step, FunctionStep):
+                    try:
+                        step.function(i)
+                    except Exception as e:
+                        if isinstance(e, AssertionError) and f"step {i}" in str(e):
+                            raise
+                        raise AssertionError(
+                            f"step {i} raised {e.__class__.__name__}"
+                        ) from e
+                    continue
 
-            # Check the return value of test_commands_nonfatal later on so
-            # we can get a better error message from test_commands_final
-            # if possible.
-            self.assertTrue(deferred_success, f"{test_commands_nonfatal} failed")
+                env["PORTAGE_BINHOST"] = f"file:///{tmppkgdir_suffix}"
+                proc = subprocess.Popen(
+                    step.command,
+                    env=dict(env.items(), **(step.env or {})),
+                    cwd=step.cwd,
+                    stdout=stdout,
+                )
+
+                if debug:
+                    proc.wait()
+                else:
+                    output = proc.stdout.readlines()
+                    proc.wait()
+                    proc.stdout.close()
+                    if proc.returncode != step.returncode:
+                        for line in output:
+                            sys.stderr.write(portage._unicode_decode(line))
+
+                self.assertEqual(
+                    step.returncode,
+                    proc.returncode,
+                    f"{step.command} (step {i}) failed with exit code {proc.returncode}",
+                )
         finally:
             playground.debug = False
             playground.cleanup()

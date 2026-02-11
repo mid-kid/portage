@@ -1,4 +1,4 @@
-# Copyright 1999-2024 Gentoo Authors
+# Copyright 1999-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 import errno
@@ -50,7 +50,6 @@ from portage.exception import (
 from portage.output import colorize, create_color_func, darkgreen, green
 
 bad = create_color_func("BAD")
-from portage.package.ebuild.config import _get_feature_flags
 from portage.package.ebuild.getmaskingstatus import _getmaskingstatus, _MaskReason
 from portage._sets import SETPREFIX
 from portage._sets.base import InternalPackageSet
@@ -62,6 +61,7 @@ from portage.util import writemsg_level, write_atomic
 from portage.util.digraph import digraph
 from portage.util.futures import asyncio
 from portage.util._async.TaskScheduler import TaskScheduler
+from portage.util.portage_lru_cache import show_lru_cache_info
 from portage.versions import _pkg_str, catpkgsplit
 from portage.binpkg import get_binpkg_format
 
@@ -693,6 +693,9 @@ class depgraph:
         self._slot_operator_check_reverse_dependencies = functools.lru_cache(
             maxsize=1000
         )(self._slot_operator_check_reverse_dependencies)
+
+        self._virt_deps_visible_recursion = set()
+        self._virtual_cycle = None
 
     def _index_binpkgs(self):
         for root in self._frozen_config.trees:
@@ -1935,15 +1938,8 @@ class depgraph:
             # conflicts (or by blind luck).
             raise self._unknown_internal_error()
 
-        # Both _process_slot_conflict and _slot_operator_trigger_reinstalls
-        # can call _slot_operator_update_probe, which requires that
-        # self._dynamic_config._blocked_pkgs has been initialized by a
-        # call to the _validate_blockers method.
         for conflict in self._dynamic_config._package_tracker.slot_conflicts():
             self._process_slot_conflict(conflict)
-
-        if self._dynamic_config._allow_backtracking:
-            self._slot_operator_trigger_reinstalls()
 
     def _process_slot_conflict(self, conflict):
         """
@@ -2900,50 +2896,50 @@ class depgraph:
 
         return None
 
-    def _slot_operator_trigger_reinstalls(self):
+    def _slot_operator_trigger_backtracking(self, dep: Dependency) -> bool:
         """
-        Search for packages with slot-operator deps on older slots, and schedule
-        rebuilds if they can link to a newer slot that's in the graph.
+        Trigger backtracking for slot operator issues if needed.
+        Return True if this triggers backtracking, and False otherwise.
         """
+        if not self._dynamic_config._allow_backtracking:
+            return False
+
+        atom = dep.atom
+
+        if not (atom.soname or atom.slot_operator_built):
+            new_child_slot = self._slot_change_probe(dep)
+            if new_child_slot is not None:
+                self._slot_change_backtrack(dep, new_child_slot)
+                return True
+
+        if not (dep.parent and isinstance(dep.parent, Package) and dep.parent.built):
+            return False
 
         rebuild_if_new_slot = (
             self._dynamic_config.myparams.get("rebuild_if_new_slot", "y") == "y"
         )
 
-        for slot_key, slot_info in self._dynamic_config._slot_operator_deps.items():
-            for dep in slot_info:
-                atom = dep.atom
+        # If the parent is not installed, check if it needs to be
+        # rebuilt against an installed instance, since otherwise
+        # it could trigger downgrade of an installed instance as
+        # in bug #652938.
+        want_update_probe = dep.want_update or not dep.parent.installed
 
-                if not (atom.soname or atom.slot_operator_built):
-                    new_child_slot = self._slot_change_probe(dep)
-                    if new_child_slot is not None:
-                        self._slot_change_backtrack(dep, new_child_slot)
-                    continue
+        # Check for slot update first, since we don't want to
+        # trigger reinstall of the child package when a newer
+        # slot will be used instead.
+        if rebuild_if_new_slot and want_update_probe:
+            new_dep = self._slot_operator_update_probe(dep, new_child_slot=True)
+            if new_dep is not None:
+                self._slot_operator_update_backtrack(dep, new_child_slot=new_dep.child)
+                return True
 
-                if not (
-                    dep.parent and isinstance(dep.parent, Package) and dep.parent.built
-                ):
-                    continue
+        if want_update_probe:
+            if self._slot_operator_update_probe(dep):
+                self._slot_operator_update_backtrack(dep)
+                return True
 
-                # If the parent is not installed, check if it needs to be
-                # rebuilt against an installed instance, since otherwise
-                # it could trigger downgrade of an installed instance as
-                # in bug #652938.
-                want_update_probe = dep.want_update or not dep.parent.installed
-
-                # Check for slot update first, since we don't want to
-                # trigger reinstall of the child package when a newer
-                # slot will be used instead.
-                if rebuild_if_new_slot and want_update_probe:
-                    new_dep = self._slot_operator_update_probe(dep, new_child_slot=True)
-                    if new_dep is not None:
-                        self._slot_operator_update_backtrack(
-                            dep, new_child_slot=new_dep.child
-                        )
-
-                if want_update_probe:
-                    if self._slot_operator_update_probe(dep):
-                        self._slot_operator_update_backtrack(dep)
+        return False
 
     def _reinstall_for_flags(
         self, pkg, forced_flags, orig_use, orig_iuse, cur_use, cur_iuse
@@ -2958,21 +2954,18 @@ class depgraph:
         ) in ("y", "auto")
         newuse = "--newuse" in self._frozen_config.myopts
         changed_use = "changed-use" == self._frozen_config.myopts.get("--reinstall")
-        feature_flags = _get_feature_flags(_get_eapi_attrs(pkg.eapi))
 
         if newuse or (binpkg_respect_use and not changed_use):
             flags = set(orig_iuse)
             flags ^= cur_iuse
             flags -= forced_flags
             flags |= orig_iuse.intersection(orig_use) ^ cur_iuse.intersection(cur_use)
-            flags -= feature_flags
             if flags:
                 return flags
         elif changed_use or binpkg_respect_use:
             flags = set(orig_iuse)
             flags.intersection_update(orig_use)
             flags ^= cur_iuse.intersection(cur_use)
-            flags -= feature_flags
             if flags:
                 return flags
         return None
@@ -3437,44 +3430,6 @@ class depgraph:
                     raise
                 del e
 
-        # NOTE: REQUIRED_USE checks are delayed until after
-        # package selection, since we want to prompt the user
-        # for USE adjustment rather than have REQUIRED_USE
-        # affect package selection and || dep choices.
-        if (
-            not pkg.built
-            and pkg._metadata.get("REQUIRED_USE")
-            and eapi_has_required_use(pkg.eapi)
-        ):
-            required_use_is_sat = check_required_use(
-                pkg._metadata["REQUIRED_USE"],
-                self._pkg_use_enabled(pkg),
-                pkg.iuse.is_valid_flag,
-                eapi=pkg.eapi,
-            )
-            if not required_use_is_sat:
-                if dep.atom is not None and dep.parent is not None:
-                    self._add_parent_atom(pkg, (dep.parent, dep.atom))
-
-                if arg_atoms:
-                    for parent_atom in arg_atoms:
-                        parent, atom = parent_atom
-                        self._add_parent_atom(pkg, parent_atom)
-
-                atom = dep.atom
-                if atom is None:
-                    atom = Atom("=" + pkg.cpv)
-                self._dynamic_config._unsatisfied_deps_for_display.append(
-                    ((pkg.root, atom), {"myparent": dep.parent, "show_req_use": pkg})
-                )
-                self._dynamic_config._required_use_unsatisfied = True
-                self._dynamic_config._skip_restart = True
-                # Add pkg to digraph in order to enable autounmask messages
-                # for this package, which is useful when autounmask USE
-                # changes have violated REQUIRED_USE.
-                self._dynamic_config.digraph.add(pkg, dep.parent, priority=priority)
-                return 0
-
         if not pkg.onlydeps:
             existing_node, existing_node_matches = self._check_slot_conflict(
                 pkg, dep.atom
@@ -3633,6 +3588,43 @@ class depgraph:
             and (dep.atom.soname or dep.atom.slot_operator == "=")
         ):
             self._add_slot_operator_dep(dep)
+            if self._slot_operator_trigger_backtracking(dep):
+                # Drop slot operator deps that trigger backtracking, since
+                # they may be irrelevant and therefore we don't want to
+                # enforce the REQUIRED_USE check that comes below (bug 964705).
+                # Since backtracking has been triggered, the _need_restart flag
+                # is set and this depgraph is only useful for collecting
+                # backtracking parameters at this point, so it is acceptable to
+                # drop dependencies as needed. It would not be acceptable to
+                # abort depgraph creation here, since that would not scale well
+                # for large numbers of slot operator rebuilds.
+                return 1
+
+        # NOTE: REQUIRED_USE checks are delayed until after
+        # package selection, since we want to prompt the user
+        # for USE adjustment rather than have REQUIRED_USE
+        # affect package selection and || dep choices.
+        if (
+            not pkg.built
+            and pkg._metadata.get("REQUIRED_USE")
+            and eapi_has_required_use(pkg.eapi)
+        ):
+            required_use_is_sat = check_required_use(
+                pkg._metadata["REQUIRED_USE"],
+                self._pkg_use_enabled(pkg),
+                pkg.iuse.is_valid_flag,
+                eapi=pkg.eapi,
+            )
+            if not required_use_is_sat:
+                atom = dep.atom
+                if atom is None:
+                    atom = Atom("=" + pkg.cpv)
+                self._dynamic_config._unsatisfied_deps_for_display.append(
+                    ((pkg.root, atom), {"myparent": dep.parent, "show_req_use": pkg})
+                )
+                self._dynamic_config._required_use_unsatisfied = True
+                self._dynamic_config._skip_restart = True
+                return 0
 
         recurse = deep is True or not self._too_deep(self._depth_increment(depth, n=1))
         dep_stack = self._dynamic_config._dep_stack
@@ -3992,6 +3984,7 @@ class depgraph:
             and pkg.depth == 0
             and "test" not in use_enabled
             and pkg.iuse.is_valid_flag("test")
+            and "test" not in pkg.use.mask
             and self._is_argument(pkg)
         )
 
@@ -4831,6 +4824,18 @@ class depgraph:
             if spinner is not None and spinner.update is not spinner.update_quiet:
                 spinner_cb.handle = self._event_loop.call_soon(spinner_cb)
             return self._select_files(args)
+        except self._virtual_cycle_error as e:
+            self._virtual_cycle = e.value
+
+            msg = ["\n\n!!! virtual cycle detected:\n\n"]
+            for pkg in sorted(self._virtual_cycle):
+                msg.append(f"  {pkg.cpv}::{pkg.repo}\n")
+            msg.append("\n")
+
+            for chunk in msg:
+                writemsg(chunk, noiselevel=-1)
+            self._dynamic_config._skip_restart = True
+            return 0, []
         finally:
             if spinner_cb.handle is not None:
                 spinner_cb.handle.cancel()
@@ -6001,6 +6006,17 @@ class depgraph:
         useful for checking if it will be necessary to expand virtual slots,
         for cases like bug #382557.
         """
+        if pkg in self._virt_deps_visible_recursion:
+            raise self._virtual_cycle_error(list(self._virt_deps_visible_recursion))
+
+        self._virt_deps_visible_recursion.add(pkg)
+        try:
+            return self._virt_deps_visible_imp(pkg, ignore_use)
+        finally:
+            self._virt_deps_visible_recursion.remove(pkg)
+
+    def _virt_deps_visible_imp(self, pkg, ignore_use):
+
         try:
             rdepend = self._select_atoms(
                 pkg.root,
@@ -11337,6 +11353,12 @@ class depgraph:
         been disqualified due to autounmask changes.
         """
 
+    class _virtual_cycle_error(_internal_exception):
+        """
+        This is raised by _virt_deps_visible when a virtual cycle is
+        detected.
+        """
+
     def need_restart(self):
         return (
             self._dynamic_config._need_restart
@@ -11800,6 +11822,7 @@ def _spinner_stop(spinner, backtracked: int = -1, max_retries: int = -1):
     portage.writemsg_stdout(
         f"Dependency resolution took {darkgreen(time_fmt)} s{backtrack_info}.\n\n"
     )
+    show_lru_cache_info()
 
 
 def backtrack_depgraph(

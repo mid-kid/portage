@@ -107,6 +107,7 @@ PRELINK_BINARY = f"{BINARY_PREFIX}/usr/sbin/prelink"
 
 INVALID_ENV_FILE = "/etc/spork/is/not/valid/profile.env"
 MERGING_IDENTIFIER = "-MERGING-"
+PACKDEBUG_PATH = "/usr/lib/debug/.tarball"
 REPO_NAME_FILE = "repo_name"
 REPO_NAME_LOC = f"profiles/{REPO_NAME_FILE}"
 
@@ -183,7 +184,6 @@ SUPPORTED_FEATURES = frozenset(
         "distlocks",
         "downgrade-backup",
         "ebuild-locks",
-        "export-pms-vars",
         "fail-clean",
         "fakeroot",
         "fixlafiles",
@@ -194,6 +194,7 @@ SUPPORTED_FEATURES = frozenset(
         "icecream",
         "installsources",
         "ipc-sandbox",
+        "jobserver-token",
         "keeptemp",
         "keepwork",
         "lmirror",
@@ -213,6 +214,7 @@ SUPPORTED_FEATURES = frozenset(
         "noman",
         "nostrip",
         "notitles",
+        "packdebug",
         "parallel-fetch",
         "parallel-install",
         "pid-sandbox",
@@ -253,7 +255,7 @@ SUPPORTED_FEATURES = frozenset(
     )
 )
 
-EAPI = 8
+EAPI = 9
 
 HASHING_BLOCKSIZE = 32768
 

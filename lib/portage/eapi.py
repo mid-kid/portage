@@ -112,6 +112,10 @@ def eapi_has_repo_deps(eapi: str) -> bool:
     return _get_eapi_attrs(eapi).repo_deps
 
 
+def eapi_supports_use_stable(eapi: str) -> bool:
+    return _get_eapi_attrs(eapi).use_stable
+
+
 def eapi_supports_stable_use_forcing_and_masking(eapi: str) -> bool:
     return _get_eapi_attrs(eapi).stablemask
 
@@ -148,6 +152,14 @@ def eapi_has_sysroot(eapi: str) -> bool:
     return _get_eapi_attrs(eapi).sysroot
 
 
+def eapi_rewrites_symlinks(eapi: str) -> bool:
+    return _get_eapi_attrs(eapi).symlink_rewrite
+
+
+def eapi_has_profile_eapi_default(eapi: str) -> bool:
+    return _get_eapi_attrs(eapi).profile_eapi_default
+
+
 _eapi_attrs = collections.namedtuple(
     "_eapi_attrs",
     (
@@ -164,7 +176,6 @@ _eapi_attrs = collections.namedtuple(
         "exports_pms_vars",
         "exports_PORTDIR",
         "exports_replace_vars",
-        "feature_flag_test",
         "idepend",
         "iuse_defaults",
         "iuse_effective",
@@ -173,6 +184,7 @@ _eapi_attrs = collections.namedtuple(
         "pkg_pretend",
         "prefix",
         "profile_file_dirs",
+        "profile_eapi_default",
         "rdepend_depend",
         "repo_deps",
         "required_use",
@@ -183,7 +195,9 @@ _eapi_attrs = collections.namedtuple(
         "src_prepare_src_configure",
         "src_uri_arrows",
         "stablemask",
+        "use_stable",
         "strong_blocks",
+        "symlink_rewrite",
         "sysroot",
         "use_deps",
         "use_dep_defaults",
@@ -208,10 +222,11 @@ class Eapi:
     _eapi_val: int = -1
 
     def __init__(self, eapi_string: str):
-        if not eapi_string in self.ALL_EAPIS:
+        eapi_key = eapi_string.partition("-")[0]
+        if not eapi_key in self.ALL_EAPIS:
             raise ValueError(f"'{eapi_string}' not recognized as a valid EAPI")
 
-        self._eapi_val = int(eapi_string.partition("-")[0])
+        self._eapi_val = int(eapi_key)
 
     def __ge__(self, other: "Eapi") -> bool:
         return self._eapi_val >= other._eapi_val
@@ -244,7 +259,6 @@ def _get_eapi_attrs(eapi_str: Optional[str]) -> _eapi_attrs:
             exports_pms_vars=True,
             exports_PORTDIR=True,
             exports_replace_vars=True,
-            feature_flag_test=False,
             idepend=False,
             iuse_defaults=True,
             iuse_effective=False,
@@ -253,6 +267,7 @@ def _get_eapi_attrs(eapi_str: Optional[str]) -> _eapi_attrs:
             posixish_locale=False,
             prefix=True,
             profile_file_dirs=False,
+            profile_eapi_default=False,
             rdepend_depend=False,
             repo_deps=True,
             required_use=True,
@@ -263,7 +278,9 @@ def _get_eapi_attrs(eapi_str: Optional[str]) -> _eapi_attrs:
             src_prepare_src_configure=True,
             src_uri_arrows=True,
             stablemask=True,
+            use_stable=True,
             strong_blocks=True,
+            symlink_rewrite=False,
             sysroot=True,
             use_deps=True,
             use_dep_defaults=True,
@@ -284,7 +301,6 @@ def _get_eapi_attrs(eapi_str: Optional[str]) -> _eapi_attrs:
             exports_pms_vars=eapi <= Eapi("8"),
             exports_PORTDIR=eapi <= Eapi("6"),
             exports_replace_vars=eapi >= Eapi("4"),
-            feature_flag_test=False,
             idepend=eapi >= Eapi("8"),
             iuse_defaults=eapi >= Eapi("1"),
             iuse_effective=eapi >= Eapi("5"),
@@ -293,6 +309,7 @@ def _get_eapi_attrs(eapi_str: Optional[str]) -> _eapi_attrs:
             posixish_locale=eapi >= Eapi("6"),
             prefix=eapi >= Eapi("3"),
             profile_file_dirs=eapi >= Eapi("7"),
+            profile_eapi_default=eapi >= Eapi("9"),
             rdepend_depend=eapi <= Eapi("3"),
             repo_deps=False,
             required_use=eapi >= Eapi("4"),
@@ -303,7 +320,9 @@ def _get_eapi_attrs(eapi_str: Optional[str]) -> _eapi_attrs:
             src_prepare_src_configure=eapi >= Eapi("2"),
             src_uri_arrows=eapi >= Eapi("2"),
             stablemask=eapi >= Eapi("5"),
+            use_stable=eapi >= Eapi("9"),
             strong_blocks=eapi >= Eapi("2"),
+            symlink_rewrite=eapi <= Eapi("8"),
             sysroot=eapi >= Eapi("7"),
             use_deps=eapi >= Eapi("2"),
             use_dep_defaults=eapi >= Eapi("4"),

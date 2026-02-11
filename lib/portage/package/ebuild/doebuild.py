@@ -1,4 +1,4 @@
-# Copyright 2010-2024 Gentoo Authors
+# Copyright 2010-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = ["doebuild", "doebuild_environment", "spawn", "spawnebuild"]
@@ -9,6 +9,7 @@ import errno
 import fnmatch
 from itertools import chain
 import logging
+import multiprocessing
 import os as _os
 import platform
 import pwd
@@ -26,27 +27,6 @@ import warnings
 import zlib
 
 import portage
-
-portage.proxy.lazyimport.lazyimport(
-    globals(),
-    "portage.package.ebuild.config:check_config_instance",
-    "portage.package.ebuild.digestcheck:digestcheck",
-    "portage.package.ebuild.digestgen:digestgen",
-    "portage.package.ebuild.fetch:_drop_privs_userfetch,_want_userfetch,fetch",
-    "portage.package.ebuild.prepare_build_dirs:_prepare_fake_distdir",
-    "portage.package.ebuild._ipc.QueryCommand:QueryCommand",
-    "portage.dep._slot_operator:evaluate_slot_operator_equal_deps",
-    "portage.package.ebuild._spawn_nofetch:spawn_nofetch",
-    "portage.util.elf.header:ELFHeader",
-    "portage.dep.soname.multilib_category:compute_multilib_category",
-    "portage.util._desktop_entry:validate_desktop_entry",
-    "portage.util._dyn_libs.NeededEntry:NeededEntry",
-    "portage.util._dyn_libs.soname_deps:SonameDepsProcessor",
-    "portage.util._async.SchedulerInterface:SchedulerInterface",
-    "portage.util._eventloop.global_event_loop:global_event_loop",
-    "portage.util.ExtractKernelVersion:ExtractKernelVersion",
-    "_emerge.EbuildPhase:_setup_locale",
-)
 
 from portage import (
     bsd_chflags,
@@ -91,7 +71,7 @@ from portage.eapi import (
     eapi_has_pkg_pretend,
     _get_eapi_attrs,
 )
-from portage.elog import elog_process, _preload_elog_modules
+from portage.elog import elog_process
 from portage.elog.messages import eerror, eqawarn
 from portage.exception import (
     DigestException,
@@ -190,7 +170,7 @@ _vdb_use_conditional_keys = Package._dep_keys + (
     "RESTRICT",
 )
 
-# The following is a set of PMS § 11.1 and § 7.4 without
+# The following is a set of PMS § 11.1, § 7.4, and § 5.3.2 without
 # - TMPDIR
 # - HOME
 # because these variables are often assumed to be exported and
@@ -237,6 +217,17 @@ _unexported_pms_vars = frozenset(
         "ECLASS",
         "INHERITED",
         "DEFINED_PHASES",
+        # PMS § 5.3.2
+#        "ARCH",          # Not exported by Portage
+        "CONFIG_PROTECT",
+        "CONFIG_PROTECT_MASK",
+        "USE",            # N.B. this is not IUSE
+        "USE_EXPAND",
+        "USE_EXPAND_UNPREFIXED",
+        "USE_EXPAND_HIDDEN",
+        "USE_EXPAND_IMPLICIT",
+        "IUSE_IMPLICIT",
+        "ENV_UNSET",
     ]
     # fmt: on
 )
@@ -312,6 +303,8 @@ def _spawn_phase(
     logfile=None,
     **kwargs,
 ):
+    from portage.util._async.SchedulerInterface import SchedulerInterface
+
     if returnproc or returnpid:
         return _doebuild_spawn(
             phase,
@@ -402,6 +395,7 @@ def doebuild_environment(
     EAPI metadata.
     The myroot and use_cache parameters are unused.
     """
+    from portage.util.ExtractKernelVersion import ExtractKernelVersion
 
     if settings is None:
         raise TypeError("settings argument is required")
@@ -471,11 +465,6 @@ def doebuild_environment(
 
     # Set requested Python interpreter for Portage helpers.
     mysettings["PORTAGE_PYTHON"] = portage._python_interpreter
-
-    # This is used by assert_sigpipe_ok() that's used by the ebuild
-    # unpack() helper. SIGPIPE is typically 13, but its better not
-    # to assume that.
-    mysettings["PORTAGE_SIGPIPE_STATUS"] = str(128 + signal.SIGPIPE)
 
     # We are disabling user-specific bashrc files.
     mysettings["BASH_ENV"] = INVALID_ENV_FILE
@@ -637,7 +626,10 @@ def doebuild_environment(
 
             for feature, m in masquerades:
                 for l in possible_libexecdirs:
-                    p = os.path.join(os.sep, eprefix_lstrip, "usr", l, m, "bin")
+                    masqdir = os.path.join(os.sep, eprefix_lstrip, "usr", l, m)
+                    p = os.path.join(masqdir, "bin")
+                    if not os.path.isdir(p):
+                        p = masqdir
                     if os.path.isdir(p):
                         mysettings["PATH"] = p + ":" + mysettings["PATH"]
                         break
@@ -850,6 +842,11 @@ def doebuild(
     Other variables may not be strictly required, many have defaults that are set inside of doebuild.
 
     """
+    from _emerge.EbuildPhase import _setup_locale
+    from portage.package.ebuild.digestcheck import digestcheck
+    from portage.package.ebuild.digestgen import digestgen
+    from portage.package.ebuild.prepare_build_dirs import _prepare_fake_distdir
+    from portage.package.ebuild._spawn_nofetch import spawn_nofetch
 
     if settings is None:
         raise TypeError("settings parameter is required")
@@ -1500,6 +1497,7 @@ def doebuild(
                         dir=binpkg_tmpfile_dir,
                         delete=False,
                     ) as binpkg_tmpfile:
+                        os.fchmod(binpkg_tmpfile.fileno(), 0o644)
                         mysettings["PORTAGE_BINPKG_TMPFILE"] = binpkg_tmpfile.name
                 else:
                     parent_dir = os.path.join(
@@ -1657,6 +1655,19 @@ def doebuild(
 
 
 def _fetch_subprocess(fetchme, mysettings, listonly, dist_digests, fetchonly):
+    from portage.package.ebuild.fetch import (
+        _drop_privs_userfetch,
+        _want_userfetch,
+        fetch,
+    )
+
+    if sys.version_info >= (3, 14):
+        # Since we typically drop privileges for userfetch here,
+        # a forkserver shared with the parent would open privilege
+        # escalation issues that are better to avoid, therefore
+        # force the multiprocessing start method to spawn.
+        multiprocessing.set_start_method("spawn", force=True)
+
     # For userfetch, drop privileges for the entire fetch call, in
     # order to handle DISTDIR on NFS with root_squash for bug 601252.
     if _want_userfetch(mysettings):
@@ -1993,9 +2004,9 @@ def spawn(
 ):
     """
     Spawn a subprocess with extra portage-specific options.
-    Optiosn include:
+    Options include:
 
-    Sandbox: Sandbox means the spawned process will be limited in its ability t
+    Sandbox: Sandbox means the spawned process will be limited in its ability to
     read and write files (normally this means it is restricted to ${D}/)
     SElinux Sandbox: Enables sandboxing on SElinux
     Reduced Privileges: Drops privileges such that the process runs as portage:portage
@@ -2034,6 +2045,8 @@ def spawn(
     @return:
     1. The return code of the spawned process.
     """
+    from portage.package.ebuild.config import check_config_instance
+    from portage.util._async.SchedulerInterface import SchedulerInterface
 
     check_config_instance(mysettings)
 
@@ -2190,12 +2203,14 @@ def spawn(
     eapi = mysettings["EAPI"]
 
     unexported_env_vars = None
-    if "export-pms-vars" not in mysettings.features or not eapi_exports_pms_vars(eapi):
+    if not eapi_exports_pms_vars(eapi) or os.environ.get(
+        "PORTAGE_DO_NOT_EXPORT_PMS_VARS"
+    ):
         unexported_env_vars = _unexported_pms_vars
 
     if unexported_env_vars:
-        # Starting with EAPI 9 (or if FEATURES="-export-pms-vars"),
-        # PMS variables should not longer be exported.
+        # Starting with EAPI 9 (or if the PORTAGE_DO_NOT_EXPORT_PMS_VARS env
+        # variable is set) PMS variables should not longer be exported.
 
         phase = mysettings.get("EBUILD_PHASE")
         is_pms_ebuild_phase = phase in _phase_func_map.keys()
@@ -2233,7 +2248,7 @@ def spawn(
                     prefix=f"portage-tmpdir-{portage.getpid()}-"
                 )
                 os.chmod(_emerge_tmpdir, 0o1775)
-                os.chown(_emerge_tmpdir, -1, int(portage_gid))
+                os.chown(_emerge_tmpdir, -1, int(portage_build_gid))
                 portage.process.atexit_register(shutil.rmtree, _emerge_tmpdir)
             ebuild_extra_source_fd, ebuild_extra_source_path = tempfile.mkstemp(
                 prefix=f"portage-ebuild-extra-source-{phase}-",
@@ -2250,13 +2265,26 @@ def spawn(
                 mysettings["PORTAGE_EBUILD_EXTRA_SOURCE"] = ebuild_extra_source_path
 
         with open(ebuild_extra_source_path, mode="w") as f:
-            for var_name in unexported_env_vars:
-                var_value = mysettings.environ().get(var_name)
+
+            def unexport_var(var_name: str):
+                var_value = env.get(var_name)
                 if var_value is None:
-                    continue
+                    return
                 quoted_var_value = shlex.quote(var_value)
                 f.write(f"{var_name}={quoted_var_value}\n")
                 del env[var_name]
+
+            for var_name in unexported_env_vars:
+                unexport_var(var_name)
+
+            # All variables named in USE_EXPAND and USE_EXPAND_UNPREFIXED
+            for use_expand in ("USE_EXPAND", "USE_EXPAND_UNPREFIXED"):
+                for v in mysettings.get(use_expand, "").split():
+                    unexport_var(v)
+
+            # USE_EXPAND_VALUES_${v}, where ${v} is a value in USE_EXPAND_IMPLICIT
+            for v in mysettings.get("USE_EXPAND_IMPLICIT", "").split():
+                unexport_var(f"USE_EXPAND_VALUES_{v}")
 
         env["PORTAGE_EBUILD_EXTRA_SOURCE"] = str(ebuild_extra_source_path)
     else:
@@ -2656,6 +2684,8 @@ def _post_src_install_write_metadata(settings):
     setting. Also, revert IUSE in case it's corrupted
     due to local environment settings like in bug #386829.
     """
+    from portage.dep._slot_operator import evaluate_slot_operator_equal_deps
+    from portage.package.ebuild._ipc.QueryCommand import QueryCommand
 
     eapi_attrs = _get_eapi_attrs(settings.configdict["pkg"]["EAPI"])
     build_info_dir = os.path.join(settings["PORTAGE_BUILDDIR"], "build-info")
@@ -2785,6 +2815,7 @@ def _post_src_install_uid_fix(mysettings, out):
     S_ISUID and S_ISGID bits, so those bits are restored if
     necessary.
     """
+    from portage.util._desktop_entry import validate_desktop_entry
 
     os = _os_merge
 
@@ -3026,7 +3057,8 @@ def _reapply_bsdflags_to_image(mysettings):
 
 
 def _inject_libc_dep(build_info_dir, mysettings):
-    #
+    from portage.package.ebuild._ipc.QueryCommand import QueryCommand
+
     # We could skip this for non-binpkgs but there doesn't seem to be much
     # value in that, as users shouldn't downgrade libc anyway.
     injected_libc_depstring = []
@@ -3074,6 +3106,10 @@ def _post_src_install_soname_symlinks(mysettings, out):
     This requires $PORTAGE_BUILDDIR/build-info/NEEDED.ELF.2 for
     operation.
     """
+    from portage.dep.soname.multilib_category import compute_multilib_category
+    from portage.util._dyn_libs.NeededEntry import NeededEntry
+    from portage.util._dyn_libs.soname_deps import SonameDepsProcessor
+    from portage.util.elf.header import ELFHeader
 
     image_dir = mysettings["D"]
     build_info_dir = os.path.join(mysettings["PORTAGE_BUILDDIR"], "build-info")
@@ -3383,11 +3419,6 @@ def _prepare_self_update(settings):
     if portage._bin_path != portage.const.PORTAGE_BIN_PATH:
         return
 
-    # Load lazily referenced portage submodules into memory,
-    # so imports won't fail during portage upgrade/downgrade.
-    _preload_elog_modules(settings)
-    portage.proxy.lazyimport._preload_portage_submodules()
-
     # Make the temp directory inside $PORTAGE_TMPDIR/portage, since
     # it's common for /tmp and /var/tmp to be mounted with the
     # "noexec" option (see bug #346899).
@@ -3412,6 +3443,38 @@ def _prepare_self_update(settings):
 
     for dir_path in (base_path_tmp, portage._bin_path, portage._pym_path):
         os.chmod(dir_path, 0o755)
+
+    # Update sys.path used to unpickle child process arguments for
+    # multiprocessing forkserver and spawn start methods (bug 965976).
+    sys.path.insert(0, portage._pym_path)
+
+    if multiprocessing.get_start_method() == "forkserver":
+
+        def _get_forkserver_pid():
+            try:
+                return multiprocessing.forkserver._forkserver._forkserver_pid
+            except AttributeError:
+                return None
+
+        forkserver_pid = _get_forkserver_pid()
+        if not isinstance(forkserver_pid, int):
+            # force forkserver launch
+            portage.process.spawn(["true"])
+            forkserver_pid = _get_forkserver_pid()
+
+            if not isinstance(forkserver_pid, int):
+                writemsg(
+                    "!!! Failed to locate forkserver pid for sys.path update\n",
+                    noiselevel=-1,
+                )
+
+            # If a forkserver was successfully launched then it
+            # inherited our sys.path update and there is no need
+            # to kill it.
+        else:
+            # Kill forkserver in order to force a sys.path update,
+            # and a new forkserver will launch on demand.
+            os.kill(forkserver_pid, signal.SIGTERM)
 
 
 def _handle_self_update(settings, vardb):

@@ -2,6 +2,7 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import argparse
+import logging
 import locale
 import platform
 import shlex
@@ -9,18 +10,6 @@ import sys
 
 import portage
 
-portage.proxy.lazyimport.lazyimport(
-    globals(),
-    "logging",
-    "portage.dep:Atom",
-    "portage.output:xtermTitleReset",
-    "portage.util:writemsg_level",
-    "textwrap",
-    "_emerge.actions:load_emerge_config,run_action," + "validate_ebuild_environment",
-    "_emerge.emergelog:emergelog",
-    "_emerge.help:emerge_help",
-    "_emerge.is_valid_package_atom:insert_category_into_atom",
-)
 from portage import os
 from portage.sync import _SUBMODULE_PATH_MAP
 
@@ -165,6 +154,7 @@ def insert_optional_args(args):
         "--getbinpkgonly": y_or_n,
         "--ignore-world": y_or_n,
         "--jobs": valid_integers,
+        "--jobs-tmpdir-require-free-gb": valid_integers,
         "--keep-going": y_or_n,
         "--load-average": valid_floats,
         "--onlydeps-with-ideps": y_or_n,
@@ -297,6 +287,9 @@ def _find_bad_atoms(atoms, less_strict=False):
     It accepts atoms with wildcards.
     In less_strict mode it accepts operators and repo specs.
     """
+    from _emerge.is_valid_package_atom import insert_category_into_atom
+    from portage.dep import Atom
+
     bad_atoms = []
     for x in " ".join(atoms).split():
         atom = x
@@ -520,6 +513,10 @@ def parse_opts(tmpcmdline, silent=False):
         "--jobs": {
             "shortopt": "-j",
             "help": "Specifies the number of packages to build " + "simultaneously.",
+            "action": "store",
+        },
+        "--jobs-tmpdir-require-free-gb": {
+            "help": "Specifies the required remaining capacity (in GiB) of PORTAGE_TMPDIR before a new emerge job is started. Set to 0 to disable this check",
             "action": "store",
         },
         "--keep-going": {
@@ -1023,14 +1020,28 @@ def parse_opts(tmpcmdline, silent=False):
             try:
                 jobs = int(myoptions.jobs)
             except ValueError:
-                jobs = -1
+                jobs = None
 
-        if jobs is not True and jobs < 1:
-            jobs = None
-            if not silent:
-                parser.error(f"Invalid --jobs parameter: '{myoptions.jobs}'\n")
+        if jobs is None and not silent:
+            parser.error(f"Invalid --jobs parameter: '{myoptions.jobs}'\n")
+        elif jobs == 0:
+            from portage.util.cpuinfo import get_cpu_count
+
+            jobs = get_cpu_count()
 
         myoptions.jobs = jobs
+
+    if myoptions.jobs_tmpdir_require_free_gb:
+        try:
+            jobs_tmpdir_require_free_gb = int(myoptions.jobs_tmpdir_require_free_gb)
+        except ValueError:
+            jobs_tmpdir_require_free_gb = 0
+            if not silent:
+                parser.error(
+                    f"Invalid --jobs-tmpdir-require-free-gb parameter: '{myoptions.jobs_tmpdir_require_free_gb}'\n"
+                )
+
+        myoptions.jobs_tmpdir_require_free_gb = jobs_tmpdir_require_free_gb
 
     if myoptions.load_average == "True":
         myoptions.load_average = None
@@ -1139,6 +1150,10 @@ def parse_opts(tmpcmdline, silent=False):
 
 
 def profile_check(trees, myaction):
+    import textwrap
+    from _emerge.actions import validate_ebuild_environment
+    from portage.util import writemsg_level
+
     if myaction in ("help", "info", "search", "sync", "version"):
         return os.EX_OK
     for root_trees in trees.values():
@@ -1171,6 +1186,12 @@ def emerge_main(args: Optional[list[str]] = None):
     Processes command line arguments (default: sys.argv[1:]) and decides
     what the current run of emerge should by creating `emerge_config`
     """
+    from _emerge.actions import load_emerge_config, run_action
+    from _emerge.emergelog import emergelog
+    from _emerge.help import emerge_help
+    from portage.output import xtermTitleReset
+    from portage.util import writemsg_level
+
     if args is None:
         args = sys.argv[1:]
 
@@ -1185,6 +1206,12 @@ def emerge_main(args: Optional[list[str]] = None):
     # Disable color until we're sure that it should be enabled (after
     # EMERGE_DEFAULT_OPTS has been parsed).
     portage.output.havecolor = 0
+
+    if os.environ.get("PORTAGE_SHOW_HTTP_TRACE"):
+        import http.client
+
+        http.client.HTTPConnection.debuglevel = 1
+        http.client.HTTPSConnection.debuglevel = 1
 
     # This first pass is just for options that need to be known as early as
     # possible, such as --config-root.  They will be parsed again later,

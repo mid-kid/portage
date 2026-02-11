@@ -26,6 +26,7 @@ packages.build
 package.accept_keywords
 package.bashrc
 package.keywords
+package.license
 package.mask
 package.provided
 package.unmask
@@ -608,7 +609,7 @@ Files in this directory, including make.conf, repos.conf, sets.conf,
 and any file with a name that begins with "package." can also be directories.
 
 If it is a directory, then all the files in that directory, excluding files
-that begin with '.' or end with '\(ti', will be sorted in lexical order by file
+that begin with '.' or end with '\[ti]', will be sorted in lexical order by file
 name and summed together as if they were a single file.
 
 .I Example:
@@ -669,11 +670,15 @@ repositories, those with higher priority are preferred.
 .TP
 .B location
 Specify a cache location which serves as a partial local mirror of a
-remote repository. If unset then the effective default is PKGDIR
-(see \fBmake.conf\fR(5)).
+remote repository. If unset then the default is /var/cache/binhost/repository_name.
+It was previously PKGDIR (see \fBmake.conf\fR(5)).
 .TP
 .B sync\-uri
 Specifies URI of repository used for `emerge \-\-getbinpkg`.
+.TP
+.B verify\-signature
+Controls whether PGP signatures should be verified for binary packages
+from this repository.
 .RE
 .RE
 
@@ -686,6 +691,12 @@ priority = 9999
 # packages are fetched from here
 sync-uri = https://example.com/binhost
 
+# Introduced in portage-3.0.74 for per-repo verification choices
+verify-signature = true
+
+# Defaults to /var/cache/binhost/$NAME with >=portage-3.0.77
+# Stores downloaded binpkgs separately rather than comingling in PKGDIR.
+#location = /var/cache/binhost/example-binhost
 .fi
 .TP
 .BR categories
@@ -773,9 +784,9 @@ modifies effective KEYWORDS (rather than ACCEPT_KEYWORDS).
 
 .I Example:
 # always use unstable libgd
-media\-libs/libgd \(tix86
+media\-libs/libgd \[ti]x86
 # only use stable mplayer
-media\-video/mplayer \-\(tix86
+media\-video/mplayer \-\[ti]x86
 # always use unstable netcat
 net-analyzer/netcat
 .fi
@@ -787,7 +798,7 @@ three special tokens:
 
 .nf
 \fB*\fR  package is visible if it is stable on any architecture
-\fB\(ti*\fR package is visible if it is in testing on any architecture
+\fB\[ti]*\fR package is visible if it is in testing on any architecture
 \fB**\fR package is always visible (KEYWORDS are ignored completely)
 .fi
 
@@ -1217,8 +1228,27 @@ only for protocols supporting cryptographic verification, provided
 that the respective verification option is enabled. If unset, the user's
 keyring is used.
 .TP
-.B sync\-openpgp\-key\-refresh = yes
+.B sync\-openpgp\-key\-refresh = yes|true|wkd|keyserver|no|false|false-nowarn
 Enable OpenPGP key(ring) refresh. This option is enabled by default.
+
+The refresh method is determined by the value:
+.RS
+.TP
+\fIyes\fR (\fItrue\fR)
+Attempt refresh first via WKD (Web Key Directory), with a fallback to the configured keyserver. (Default)
+.TP
+\fIwkd\fR
+Refresh keys using WKD only.
+.TP
+\fIkeyserver\fR
+Refresh keys using the configured keyserver only.
+.TP
+\fIno\fR (\fIfalse\fR)
+Disable refresh and emit a warning about the security impact.
+.TP
+\fIfalse\-nowarn\fR
+Disable refresh without emitting a warning.
+.RE
 
 \fBWarning\fR: It is a security vulnerability to disable this option
 because this will prevent detection of revoked keys!
@@ -1538,7 +1568,8 @@ The EAPI to use for profiles when unspecified. This attribute is
 supported only if profile-default-eapi is included in profile-formats.
 .TP
 .BR profile\-formats " = [pms] [portage-1] [portage-2] [profile-bashrcs] \
-[profile-set] [profile-default-eapi] [build-id] [profile-repo-deps]"
+[profile-set] [profile-default-eapi] [build-id] [profile-repo-deps] \
+[profile-license]"
 Control functionality available to profiles in this repo such as which files
 may be dirs, or the syntax available in parent files.  Use "portage-2" if you're
 unsure.  The default is "portage-1-compat" mode which is meant to be compatible
@@ -1555,6 +1586,8 @@ build\-id atom is identical to a version-specific atom, except that the
 version is followed by a hyphen and an integer build\-id.
 Setting profile\-repo\-deps allows dependency atoms in the profile to
 refer to specific repositories.
+Setting profile\-license allows \fBpackage.license\fR to be used in
+profiles.
 .RE
 .RE
 
@@ -1708,7 +1741,7 @@ given package should vary depending on which profile the user has selected.
 # add stable keyword to libgd
 media\-libs/libgd x86
 # remove stable keyword from mplayer and add unstable keyword
-media\-video/mplayer \-x86 \(tix86
+media\-video/mplayer \-x86 \[ti]x86
 # remove all keywords from netcat
 net-analyzer/netcat -*
 .fi

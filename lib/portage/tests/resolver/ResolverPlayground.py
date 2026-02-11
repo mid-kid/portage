@@ -1,4 +1,4 @@
-# Copyright 2010-2024 Gentoo Authors
+# Copyright 2010-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 import bz2
@@ -50,6 +50,7 @@ class ResolverPlayground:
     config_files = frozenset(
         (
             "eapi",
+            "binrepos.conf",
             "layout.conf",
             "make.conf",
             "modules",
@@ -65,11 +66,13 @@ class ResolverPlayground:
             "package.use",
             "package.use.force",
             "package.use.mask",
+            "package.use.stable",
             "package.use.stable.force",
             "package.use.stable.mask",
             "soname.provided",
             "use.force",
             "use.mask",
+            "use.stable",
             "layout.conf",
         )
     )
@@ -179,7 +182,7 @@ class ResolverPlayground:
                 "rm",
                 "sed",
                 "sort",
-                "tar",
+                "gtar",
                 "tr",
                 "uname",
                 "uniq",
@@ -341,7 +344,9 @@ class ResolverPlayground:
                 env=self.settings.environ(),
             )
             if result.returncode != os.EX_OK:
-                raise AssertionError(f"command failed: {egencache_cmd}")
+                raise AssertionError(
+                    f"command failed with returncode {result.returncode}: {egencache_cmd}"
+                )
 
     def _create_binpkgs(self, binpkgs):
         # When using BUILD_ID, there can be multiple instances for the
@@ -1032,6 +1037,7 @@ class ResolverPlaygroundResult:
         "forced_rebuilds",
         "required_use_unsatisfied",
         "graph_order",
+        "virtual_cycle",
     )
     optional_checks = (
         "forced_rebuilds",
@@ -1055,6 +1061,7 @@ class ResolverPlaygroundResult:
         self.unsatisfied_deps = frozenset()
         self.forced_rebuilds = None
         self.required_use_unsatisfied = None
+        self.virtual_cycle = None
 
         self.graph_order = [
             _mergelist_str(node, self.depgraph)
@@ -1132,6 +1139,9 @@ class ResolverPlaygroundResult:
                 required_use_unsatisfied.append(pargs[1])
         if required_use_unsatisfied:
             self.required_use_unsatisfied = set(required_use_unsatisfied)
+
+        if self.depgraph._virtual_cycle:
+            self.virtual_cycle = {pkg.cpv for pkg in self.depgraph._virtual_cycle}
 
 
 class ResolverPlaygroundDepcleanResult:

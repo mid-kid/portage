@@ -1,5 +1,5 @@
 # versions.py -- core Portage functionality
-# Copyright 1998-2024 Gentoo Authors
+# Copyright 1998-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = [
@@ -22,14 +22,6 @@ from functools import lru_cache
 from typing import Any, Optional, Union
 from collections.abc import Sequence
 
-
-import portage
-
-portage.proxy.lazyimport.lazyimport(
-    globals(),
-    "portage.repository.config:_gen_valid_repo",
-    "portage.util:cmp_sort_key",
-)
 from portage import _unicode_decode
 from portage.eapi import _eapi_attrs, _get_eapi_attrs
 from portage.exception import InvalidData
@@ -40,17 +32,17 @@ _unknown_repo = "__unknown__"
 # \w is [a-zA-Z0-9_]
 
 # PMS 3.1.3: A slot name may contain any of the characters [A-Za-z0-9+_.-].
-# It must not begin with a hyphen or a dot.
-_slot = r"([\w+][\w+.-]*)"
+# It must not begin with a hyphen, a dot or a plus sign.
+_slot = r"([\w][\w+.-]*)"
 
 # 2.1.1 A category name may contain any of the characters [A-Za-z0-9+_.-].
-# It must not begin with a hyphen or a dot.
-_cat = r"[\w+][\w+.-]*"
+# It must not begin with a hyphen, a dot or a plus sign.
+_cat = r"[\w][\w+.-]*"
 
 # 2.1.2 A package name may contain any of the characters [A-Za-z0-9+_-].
-# It must not begin with a hyphen,
+# It must not begin with a hyphen or a plus sign,
 # and must not end in a hyphen followed by one or more digits.
-_pkg = r"[\w+][\w+-]*?"
+_pkg = r"[\w][\w+-]*?"
 
 _v = r"(\d+)((\.\d+)*)([a-z]?)((_(pre|p|beta|alpha|rc)\d*)*)"
 _rev = r"\d+"
@@ -90,7 +82,7 @@ def _get_slot_re(eapi_attrs: _eapi_attrs) -> typing.Pattern:
     else:
         slot_re = _slot
 
-    slot_re = re.compile("^" + slot_re + "$", re.VERBOSE | re.UNICODE)
+    slot_re = re.compile("^" + slot_re + "$", re.VERBOSE | re.ASCII)
 
     _slot_re_cache[cache_key] = slot_re
     return slot_re
@@ -104,7 +96,7 @@ def _get_pv_re(eapi_attrs: _eapi_attrs) -> typing.Pattern:
     if _pv_re is not None:
         return _pv_re
 
-    _pv_re = re.compile(r"^" + _pv + r"$", re.VERBOSE | re.UNICODE)
+    _pv_re = re.compile(r"^" + _pv + r"$", re.VERBOSE | re.ASCII)
 
     return _pv_re
 
@@ -315,7 +307,7 @@ def _pkgsplit(mypkg: str, eapi: Any = None) -> Optional[tuple[str, str, str]]:
     return (m.group("pn"), m.group("ver"), rev)
 
 
-_cat_re = re.compile(f"^{_cat}$", re.UNICODE)
+_cat_re = re.compile(f"^{_cat}$", re.ASCII)
 _missing_cat = "null"
 
 
@@ -405,6 +397,8 @@ class _pkg_str(str):
         db: Any = None,
         repoconfig: Any = None,
     ):
+        from portage.repository.config import _gen_valid_repo
+
         if not isinstance(cpv, str):
             # Avoid TypeError from str.__init__ with PyPy.
             cpv = _unicode_decode(cpv)
@@ -572,6 +566,7 @@ def cpv_sort_key(eapi: Any = None) -> Any:
     @return: object for use as the 'key' parameter in places like
             list.sort() or sorted()
     """
+    from portage.util import cmp_sort_key
 
     split_cache = {}
 
