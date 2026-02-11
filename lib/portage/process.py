@@ -1251,6 +1251,7 @@ def _exec2(
         pre_exec()
 
     # And switch to the new process.
+    print("EXEC", binary, myargs, flush=True, file=sys.stderr)
     os.execve(binary, myargs, env)
 
 

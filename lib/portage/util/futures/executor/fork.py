@@ -38,6 +38,7 @@ class ForkExecutor:
         Returns:
                 A Future representing the given call.
         """
+        print("FORK", fn, args, kwargs, flush=True)
         future = self._loop.create_future()
         proc = AsyncFunction(
             target=functools.partial(self._guarded_fn_call, fn, args, kwargs),
