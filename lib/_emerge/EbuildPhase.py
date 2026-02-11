@@ -7,6 +7,7 @@ import io
 import json
 import sys
 import tempfile
+import time
 
 from _emerge.AsynchronousLock import AsynchronousLock
 from _emerge.BinpkgEnvExtractor import BinpkgEnvExtractor
@@ -122,7 +123,7 @@ async def _setup_repo_revisions(settings):
 
 
 class EbuildPhase(CompositeTask):
-    __slots__ = ("actionmap", "fd_pipes", "phase", "settings") + ("_ebuild_lock",)
+    __slots__ = ("actionmap", "fd_pipes", "phase", "settings") + ("_ebuild_lock", "_time_start")
 
     # FEATURES displayed prior to setup phase
     _features_display = (
@@ -150,6 +151,21 @@ class EbuildPhase(CompositeTask):
 
     # Locked phases
     _locked_phases = ("setup", "preinst", "postinst", "prerm", "postrm")
+
+    def start(self):
+        self._time_start = time.time()
+        super().start()
+
+    def wait(self):
+        if self._time_start:
+            time_start = self._time_start
+            self._time_start = None
+            res = super().wait()
+            time_elapsed = time.time() - time_start
+            print("EBUILD_PHASE_FULL: %.3f %s" % (time_elapsed, self.phase))
+            return res
+        else:
+            return super().wait()
 
     def _start(self):
         future = asyncio.ensure_future(self._async_start(), loop=self.scheduler)

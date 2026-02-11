@@ -16,6 +16,7 @@ from portage.package.ebuild._ipc.QueryCommand import QueryCommand
 from portage import os
 from portage.util.futures import asyncio
 from portage.util import apply_secpass_permissions, no_color
+import time
 
 portage.proxy.lazyimport.lazyimport(
     globals(),
@@ -33,6 +34,7 @@ class AbstractEbuildProcess(SpawnProcess):
         "_exit_command",
         "_exit_timeout_id",
         "_start_future",
+        "_time_start"
     )
 
     _phases_without_builddir = (
@@ -63,6 +65,20 @@ class AbstractEbuildProcess(SpawnProcess):
             if not phase:
                 phase = "other"
             self.phase = phase
+
+    def start(self):
+        self._time_start = time.time()
+        super().start()
+
+    def wait(self):
+        if self._time_start:
+            time_start = self._time_start
+            self._time_start = None
+            super().wait()
+            time_elapsed = time.time() - time_start
+            print("EBUILD_PHASE: %.3f %s" % (time_elapsed, self.args or self.phase))
+        else:
+            super().wait()
 
     def _start(self):
         need_builddir = self.phase not in self._phases_without_builddir

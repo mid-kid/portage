@@ -4,4 +4,13 @@ dir="$(realpath "$(dirname "$0")/..")"
 export PORTAGE_CONFIGROOT="$dir"
 export ROOT="$dir/.root"
 export PORTDIR="$dir/repo"
-"$dir/bin/emerge" test:0 test:1 test:2 test:3 test:4 test:5 test:6 test:7 "$@"
+
+prog=eval
+taskset='taskset -c 0'
+pkgs='test:0'
+if [ "$1" = fine ]; then
+	prog='hyperfine -w 2'
+	pkgs='test:0 test:1 test:2 test:3 test:4 test:5 test:6 test:7'
+fi
+
+$prog "$taskset \"$dir/bin/emerge\" $pkgs"
