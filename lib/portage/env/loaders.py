@@ -3,12 +3,9 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import errno
+import os
 import stat
 
-from portage import os
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
 from portage.localization import _
 
 
@@ -25,10 +22,7 @@ class LoaderError(Exception):
         self.error_msg = error_msg
 
     def __str__(self):
-        return "Failed while loading resource: {}, error was: {}".format(
-            self.resource,
-            self.error_msg,
-        )
+        return f"Failed while loading resource: {self.resource}, error was: {self.error_msg}"
 
 
 def RecursiveFileLoader(filename):
@@ -56,7 +50,8 @@ def RecursiveFileLoader(filename):
                     dirs.remove(d)
             for f in files:
                 try:
-                    f = _unicode_decode(f, encoding=_encodings["fs"], errors="strict")
+                    if isinstance(f, bytes):
+                        f = f.decode("utf-8", "strict")
                 except UnicodeDecodeError:
                     continue
                 if f[:1] == "." or f[-1:] == "~":
@@ -156,8 +151,8 @@ class FileLoader(DataLoader):
         for fn in RecursiveFileLoader(self.fname):
             try:
                 with open(
-                    _unicode_encode(fn, encoding=_encodings["fs"], errors="strict"),
-                    encoding=_encodings["content"],
+                    fn,
+                    encoding="utf-8",
                     errors="replace",
                 ) as f:
                     lines = f.readlines()

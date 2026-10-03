@@ -5,35 +5,29 @@ import functools
 import gzip
 import io
 import json
+import os
 import sys
 import tempfile
 import time
 
-from _emerge.AsynchronousLock import AsynchronousLock
-from _emerge.BinpkgEnvExtractor import BinpkgEnvExtractor
-from _emerge.MiscFunctionsProcess import MiscFunctionsProcess
-from _emerge.EbuildProcess import EbuildProcess
-from _emerge.CompositeTask import CompositeTask
-from _emerge.PackagePhase import PackagePhase
-from _emerge.TaskSequence import TaskSequence
+from portage.const import SUPPORTED_GENTOO_BINPKG_FORMATS
+from portage.eapi import _get_eapi_attrs
+from portage.exception import InvalidBinaryPackageFormat
 from portage.package.ebuild._ipc.QueryCommand import QueryCommand
+from portage.package.ebuild.prepare_build_dirs import (
+    _prepare_fake_distdir,
+    _prepare_fake_filesdir,
+    _prepare_workdir,
+)
+from portage.util import ensure_dirs, writemsg
+from portage.util._async.AsyncTaskFuture import AsyncTaskFuture
+from portage.util._async.BuildLogger import BuildLogger
 from portage.util._dyn_libs.soname_deps_qa import (
     _get_all_provides,
     _get_unresolved_soname_deps,
 )
-from portage.package.ebuild.prepare_build_dirs import (
-    _prepare_workdir,
-    _prepare_fake_distdir,
-    _prepare_fake_filesdir,
-)
-from portage.eapi import _get_eapi_attrs
-from portage.util import writemsg, ensure_dirs
-from portage.util._async.AsyncTaskFuture import AsyncTaskFuture
-from portage.util._async.BuildLogger import BuildLogger
 from portage.util.futures import asyncio
 from portage.util.futures.executor.fork import ForkExecutor
-from portage.exception import InvalidBinaryPackageFormat
-from portage.const import SUPPORTED_GENTOO_BINPKG_FORMATS
 
 try:
     from portage.xml.metadata import MetaDataXML
@@ -46,9 +40,13 @@ except (ImportError, SystemError, RuntimeError, Exception):
 
 import portage
 
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
+from _emerge.AsynchronousLock import AsynchronousLock
+from _emerge.BinpkgEnvExtractor import BinpkgEnvExtractor
+from _emerge.CompositeTask import CompositeTask
+from _emerge.EbuildProcess import EbuildProcess
+from _emerge.MiscFunctionsProcess import MiscFunctionsProcess
+from _emerge.PackagePhase import PackagePhase
+from _emerge.TaskSequence import TaskSequence
 
 
 async def _setup_locale(settings):
@@ -57,11 +55,11 @@ async def _setup_locale(settings):
     eapi_attrs = _get_eapi_attrs(settings["EAPI"])
     if eapi_attrs.posixish_locale:
         split_LC_ALL(settings)
-        settings["LC_COLLATE"] = "C"
         # check_locale() returns None when check can not be executed.
         if await async_check_locale(silent=True, env=settings.environ()) is False:
             # try another locale
-            for l in ("C.UTF-8", "en_US.UTF-8", "en_GB.UTF-8", "C"):
+            for l in ("C.UTF-8", "C"):
+                settings["LC_COLLATE"] = l
                 settings["LC_CTYPE"] = l
                 if await async_check_locale(silent=True, env=settings.environ()):
                     # TODO: output the following only once
@@ -160,6 +158,14 @@ class EbuildPhase(CompositeTask):
             return super().wait()
 
     def _start(self):
+        # Notify the observability monitor (if any) that this package has
+        # entered a new ebuild phase, so "what is building?" queries reflect
+        # the live phase.  Guarded since not every SchedulerInterface that
+        # runs phases (e.g. the standalone `ebuild` command) provides it.
+        notify_phase = getattr(self.scheduler, "notifyPhase", None)
+        if notify_phase is not None:
+            notify_phase(self.settings.mycpv, self.phase)
+
         future = asyncio.ensure_future(self._async_start(), loop=self.scheduler)
         self._start_task(AsyncTaskFuture(future=future), self._async_start_exit)
 
@@ -339,6 +345,12 @@ class EbuildPhase(CompositeTask):
             alist = self.settings.configdict["pkg"].get("A", "").split()
             _prepare_fake_distdir(self.settings, alist)
             _prepare_fake_filesdir(self.settings)
+        elif self.phase == "install":
+            # Ensure FILESDIR symlink exists for install phase, which may
+            # reference files via DOCS or other declarative variables.
+            # Skip if already set up by unpack phase.
+            if not os.path.islink(self.settings.get("FILESDIR", "")):
+                _prepare_fake_filesdir(self.settings)
 
         fd_pipes = self.fd_pipes
         if fd_pipes is None:
@@ -373,10 +385,10 @@ class EbuildPhase(CompositeTask):
         from portage.package.ebuild.doebuild import (
             _check_build_log,
             _post_phase_cmds,
-            _post_phase_userpriv_perms,
             _post_phase_emptydir_cleanup,
-            _post_src_install_write_metadata,
+            _post_phase_userpriv_perms,
             _post_src_install_uid_fix,
+            _post_src_install_write_metadata,
             _postinst_bsdflags,
             _preinst_bsdflags,
         )
@@ -397,11 +409,7 @@ class EbuildPhase(CompositeTask):
                 # mark test phase as complete (bug #452030)
                 try:
                     open(
-                        _unicode_encode(
-                            os.path.join(self.settings["PORTAGE_BUILDDIR"], ".tested"),
-                            encoding=_encodings["fs"],
-                            errors="strict",
-                        ),
+                        os.path.join(self.settings["PORTAGE_BUILDDIR"], ".tested"),
                         "wb",
                     ).close()
                 except OSError:
@@ -499,9 +507,7 @@ class EbuildPhase(CompositeTask):
         return
 
     def _append_temp_log(self, temp_log, log_path):
-        temp_file = open(
-            _unicode_encode(temp_log, encoding=_encodings["fs"], errors="strict"), "rb"
-        )
+        temp_file = open(temp_log, "rb")
 
         log_file, log_file_real = self._open_log(log_path)
 
@@ -516,7 +522,7 @@ class EbuildPhase(CompositeTask):
 
     def _open_log(self, log_path):
         f = open(
-            _unicode_encode(log_path, encoding=_encodings["fs"], errors="strict"),
+            log_path,
             mode="ab",
         )
         f_real = f

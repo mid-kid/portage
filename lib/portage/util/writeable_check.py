@@ -8,13 +8,13 @@ accepts a list of directories and returns a list of mounts which need to be
 remounted RW, then add "elif ostype == (the ostype value for your OS)" to
 get_ro_checker().
 """
+
 import logging
 import os
 
-from portage import _encodings
-from portage.util import writemsg_level
-from portage.localization import _
 from portage.data import ostype
+from portage.localization import _
+from portage.util import writemsg_level
 
 
 def get_ro_checker():
@@ -45,7 +45,7 @@ def linux_ro_checker(dir_list):
     try:
         with open(
             "/proc/self/mountinfo",
-            encoding=_encodings["content"],
+            encoding="utf-8",
             errors="replace",
             newline="\n",
         ) as f:

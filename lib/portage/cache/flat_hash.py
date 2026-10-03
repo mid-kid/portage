@@ -2,15 +2,12 @@
 # Distributed under the terms of the GNU General Public License v2
 # Author(s): Brian Harring (ferringb@gentoo.org)
 
-from portage.cache import fs_template
-from portage.cache import cache_errors
 import errno
+import os
 import stat
 import tempfile
-import os as _os
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
+
+from portage.cache import cache_errors, fs_template
 from portage.exception import InvalidData
 from portage.versions import _pkg_str
 
@@ -32,11 +29,11 @@ class database(fs_template.FsBased):
 
     def _getitem(self, cpv):
         # Don't use os.path.join, for better performance.
-        fp = self.location + _os.sep + cpv
+        fp = self.location + os.sep + cpv
         try:
             with open(
-                _unicode_encode(fp, encoding=_encodings["fs"], errors="strict"),
-                encoding=_encodings["repo.content"],
+                fp,
+                encoding="utf-8",
                 errors="replace",
             ) as myf:
                 lines = myf.read().split("\n")
@@ -46,7 +43,7 @@ class database(fs_template.FsBased):
                 if "_mtime_" not in d:
                     # Backward compatibility with old cache
                     # that uses mtime mangling.
-                    d["_mtime_"] = _os.fstat(myf.fileno())[stat.ST_MTIME]
+                    d["_mtime_"] = os.fstat(myf.fileno())[stat.ST_MTIME]
                 return d
         except OSError as e:
             if e.errno != errno.ENOENT:
@@ -66,9 +63,7 @@ class database(fs_template.FsBased):
         except OSError as e:
             raise cache_errors.CacheCorruption(cpv, e)
 
-        with open(
-            fd, mode="w", encoding=_encodings["repo.content"], errors="backslashreplace"
-        ) as myf:
+        with open(fd, mode="w", encoding="utf-8", errors="backslashreplace") as myf:
             for k in self._write_keys:
                 v = values.get(k)
                 if not v:

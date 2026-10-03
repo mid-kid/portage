@@ -1,23 +1,22 @@
-# Copyright 1999-2024 Gentoo Authors
+# Copyright 1999-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-from collections import deque
-import io
+import functools
 import gc
 import gzip
+import io
 import logging
+import os
 import signal
 import sys
+import tempfile
 import textwrap
 import time
-import warnings
 import weakref
 import zlib
+from collections import deque
 
 import portage
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
 from portage import installation
 from portage.cache.mappings import slot_dict_class
 from portage.elog.messages import eerror
@@ -26,17 +25,27 @@ from portage.output import colorize, create_color_func, red
 bad = create_color_func("BAD")
 from portage._sets import SETPREFIX
 from portage._sets.base import InternalPackageSet
-from portage.util import ensure_dirs, writemsg, writemsg_level
-from portage.util.futures import asyncio
-from portage.util.path import first_existing
-from portage.util.SlotObject import SlotObject
-from portage.util._async.SchedulerInterface import SchedulerInterface
 from portage.package.ebuild.digestcheck import digestcheck
 from portage.package.ebuild.digestgen import digestgen
 from portage.package.ebuild.doebuild import _check_temp_dir, _prepare_self_update
 from portage.package.ebuild.prepare_build_dirs import prepare_build_dirs
+from portage.util import ensure_dirs, writemsg, writemsg_level, writemsg_stdout
+from portage.util._async.SchedulerInterface import SchedulerInterface
+from portage.util.cgroup import DEFAULT_CGROUP_ROOT, CgroupManager
+from portage.util.futures import asyncio
+from portage.util.futures.iter_completed import async_iter_completed
+from portage.util.human_readable import bytes_to_human
+from portage.util.path import first_existing
+from portage.util.SlotObject import SlotObject
 
 import _emerge
+from _emerge._find_deep_system_runtime_deps import _find_deep_system_runtime_deps
+from _emerge._flush_elog_mod_echo import _flush_elog_mod_echo
+from _emerge._observability import (
+    ObservabilityMonitor,
+    format_resources,
+    freeze_resources,
+)
 from _emerge.BinpkgFetcher import BinpkgFetcher
 from _emerge.BinpkgPrefetcher import BinpkgPrefetcher
 from _emerge.BinpkgVerifier import BinpkgVerifier
@@ -45,16 +54,15 @@ from _emerge.BlockerDB import BlockerDB
 from _emerge.clear_caches import clear_caches
 from _emerge.create_depgraph_params import create_depgraph_params
 from _emerge.create_world_atom import create_world_atom
-from _emerge.DepPriority import DepPriority
+from _emerge.DepPrioritySatisfiedRange import DepPrioritySatisfiedRange
 from _emerge.depgraph import depgraph, resume_depgraph
+from _emerge.DepPriority import DepPriority
 from _emerge.EbuildBuildDir import EbuildBuildDir
 from _emerge.EbuildFetcher import EbuildFetcher
 from _emerge.EbuildPhase import EbuildPhase
 from _emerge.emergelog import emergelog
-from _emerge.FakeVartree import FakeVartree
+from _emerge.FakeVartree import FakeVartree, fake_vartree_options
 from _emerge.getloadavg import getloadavg
-from _emerge._find_deep_system_runtime_deps import _find_deep_system_runtime_deps
-from _emerge._flush_elog_mod_echo import _flush_elog_mod_echo
 from _emerge.JobStatusDisplay import JobStatusDisplay
 from _emerge.MergeListItem import MergeListItem
 from _emerge.Package import Package
@@ -84,7 +92,7 @@ class Scheduler(PollScheduler):
     )
 
     class _iface_class(SchedulerInterface):
-        __slots__ = ("fetch", "scheduleSetup", "scheduleUnpack")
+        __slots__ = ("fetch", "notifyPhase", "scheduleSetup", "scheduleUnpack")
 
     class _fetch_iface_class(SlotObject):
         __slots__ = ("log_file", "schedule")
@@ -121,13 +129,24 @@ class Scheduler(PollScheduler):
     class _failed_pkg(SlotObject):
         __slots__ = ("build_dir", "build_log", "pkg", "postinst_failure", "returncode")
 
+    class _pretend_result(SlotObject):
+        __slots__ = (
+            "build_dir",
+            "build_log",
+            "index",
+            "msgs",
+            "output",
+            "pkg",
+            "returncode",
+        )
+
     class _ConfigPool:
         """Interface for a task to temporarily allocate a config
         instance from a pool. This allows a task to be constructed
         long before the config instance actually becomes needed, like
         when prefetchers are constructed for the whole merge list."""
 
-        __slots__ = ("_root", "_allocate", "_deallocate")
+        __slots__ = ("_allocate", "_deallocate", "_root")
 
         def __init__(self, root, allocate, deallocate):
             self._root = root
@@ -156,20 +175,10 @@ class Scheduler(PollScheduler):
         mtimedb,
         myopts,
         spinner,
-        mergelist=None,
         favorites=None,
         graph_config=None,
     ):
         PollScheduler.__init__(self, main=True)
-
-        if mergelist is not None:
-            warnings.warn(
-                "The mergelist parameter of the "
-                + "_emerge.Scheduler constructor is now unused. Use "
-                + "the graph_config parameter instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
         self.settings = settings
         self.target_root = settings["EROOT"]
@@ -218,6 +227,8 @@ class Scheduler(PollScheduler):
         # being merged, these packages go to merge_wait_queue, to be merged
         # when no other packages are building.
         self._deep_system_deps = set()
+        # Packages that are part of a dependency cycle.
+        self._cyclic_nodes = set()
 
         # Holds packages to merge which will satisfy currently unsatisfied
         # deep runtime dependencies of system packages. If this is not empty
@@ -229,10 +240,21 @@ class Scheduler(PollScheduler):
         self._status_display = JobStatusDisplay(
             xterm_titles=("notitles" not in settings.features)
         )
+        self._observability = ObservabilityMonitor(self)
+        self._cgroup = None
+        if "cgroup" in settings.features:
+            cg = CgroupManager(settings.get("PORTAGE_CGROUP_ROOT", DEFAULT_CGROUP_ROOT))
+            if cg.setup():
+                self._cgroup = cg
+                settings.unlock()
+                settings["PORTAGE_CGROUP_ROOT"] = cg.emerge_root
+                settings.backup_changes("PORTAGE_CGROUP_ROOT")
+                settings.lock()
         self._max_load = myopts.get("--load-average")
         max_jobs = myopts.get("--jobs", 1)
         self._set_max_jobs(max_jobs)
         self._running_root = trees[trees._running_eroot]["root_config"]
+        self._merge_wait_scope = myopts.get("--merge-wait-scope", "deep")
         self._jobs_tmpdir_require_free_gb = myopts.get("--jobs-tmpdir-require-free-gb")
         if self._jobs_tmpdir_require_free_gb is None:
             # dev-lang/rust-1.77.1: ~16 GiB
@@ -263,6 +285,7 @@ class Scheduler(PollScheduler):
             fetch=fetch_iface,
             scheduleSetup=self._schedule_setup,
             scheduleUnpack=self._schedule_unpack,
+            notifyPhase=self._observability_phase,
         )
 
         self._prefetchers = weakref.WeakValueDictionary()
@@ -280,6 +303,7 @@ class Scheduler(PollScheduler):
         self._failed_pkgs_die_msgs = []
         self._post_mod_echo_msgs = []
         self._parallel_fetch = False
+        self._fetch_log_announced = False
         self._init_graph(graph_config)
         merge_count = len(
             [
@@ -341,16 +365,6 @@ class Scheduler(PollScheduler):
             except OSError:
                 pass
 
-        self._running_portage = None
-        portage_match = self._running_root.trees["vartree"].dbapi.match(
-            portage.const.PORTAGE_PACKAGE_ATOM
-        )
-        if portage_match:
-            cpv = portage_match.pop()
-            self._running_portage = self._pkg(
-                cpv, "installed", self._running_root, installed=True
-            )
-
     def _handle_self_update(self):
         if installation.TYPE != installation.TYPES.SYSTEM:
             return os.EX_OK
@@ -396,6 +410,39 @@ class Scheduler(PollScheduler):
         for q in self._task_queues.values():
             q.clear()
 
+    def _observability_phase(self, cpv, phase):
+        """Record that the given package has entered the named ebuild phase.
+
+        Invoked by EbuildPhase via the scheduler interface's notifyPhase
+        callback so the observability snapshot reflects the live phase.
+        """
+        self._observability.note_phase(cpv, phase)
+
+    def _cgroup_finish(self, build, action="build", record=True):
+        """Log the final cgroup resource summary for a build or merge and remove it."""
+        if self._cgroup is None:
+            return
+        cpv = build.pkg.cpv
+        # The only read of these counters: the cgroup goes away below, and
+        # what the monitor keeps is what the merge goes on reporting. Log
+        # exactly that, rendered the way "emerge --status" renders it.
+        stats = self._cgroup.read_stats(cpv)
+        resources = (
+            self._observability.note_build_resources(cpv, stats)
+            if record
+            else freeze_resources(stats)
+        )
+        elapsed = self._observability.build_elapsed(cpv) if record else None
+        rendered = format_resources(resources, elapsed)
+        if rendered:
+            msg = f"=== Resource usage for {action} of {cpv}: {rendered}"
+            log_path = build.settings.get("PORTAGE_LOG_FILE")
+            self._sched_iface.output(f"{msg}\n", log_path=log_path)
+            self._logger.log(f" {msg}")
+            if self._background and "--verbose" in self.myopts:
+                self._status_display.displayMessage(msg, raw=True)
+        self._cgroup.destroy(cpv)
+
     def _init_graph(self, graph_config):
         """
         Initialization structures used for dependency calculations
@@ -403,23 +450,32 @@ class Scheduler(PollScheduler):
         """
         self._set_graph_config(graph_config)
         self._blocker_db = {}
-        depgraph_params = create_depgraph_params(self.myopts, None)
-        dynamic_deps = "dynamic_deps" in depgraph_params
-        ignore_built_slot_operator_deps = (
-            self.myopts.get("--ignore-built-slot-operator-deps", "n") == "y"
-        )
+        fake_vartree_kwargs = fake_vartree_options(self.myopts)
         for root in self.trees:
             if graph_config is None:
                 fake_vartree = FakeVartree(
                     self.trees[root]["root_config"],
                     pkg_cache=self._pkg_cache,
-                    dynamic_deps=dynamic_deps,
-                    ignore_built_slot_operator_deps=ignore_built_slot_operator_deps,
+                    **fake_vartree_kwargs,
                 )
                 fake_vartree.sync()
             else:
                 fake_vartree = graph_config.trees[root]["vartree"]
+
+            if not self._opts_ignore_blockers.intersection(self.myopts):
+                # findInstalledBlockers() runs from inside the event loop,
+                # where the lazy apply cannot run (bug 982753). When blockers
+                # are ignored, the only BlockerDB caller left is
+                # discardBlocker(), which drops the instances it touches.
+                fake_vartree.apply_dynamic_deps(
+                    self.myopts, notice=self._dynamic_deps_notice
+                )
+
             self._blocker_db[root] = BlockerDB(fake_vartree)
+
+    def _dynamic_deps_notice(self):
+        if "--quiet" not in self.myopts:
+            writemsg_stdout(">>> Applying dynamic dependencies...\n")
 
     def _destroy_graph(self):
         """
@@ -446,11 +502,10 @@ class Scheduler(PollScheduler):
         @return: True if background mode is enabled, False otherwise.
         """
         parallel_jobs = self._max_jobs is True or self._max_jobs > 1
-        background = (
-            parallel_jobs
-            or "--quiet" in self.myopts
-            or self.myopts.get("--quiet-build") == "y"
-        ) and not bool(self._opts_no_background.intersection(self.myopts))
+        quiet = "--quiet" in self.myopts or self.myopts.get("--quiet-build") == "y"
+        background = (parallel_jobs or quiet) and not bool(
+            self._opts_no_background.intersection(self.myopts)
+        )
 
         if background:
             interactive_tasks = self._get_interactive_tasks()
@@ -489,6 +544,10 @@ class Scheduler(PollScheduler):
                         level=logging.INFO,
                         noiselevel=-1,
                     )
+            elif len(self._mergelist) <= 1 and not quiet:
+                self._set_max_jobs(1)
+                background = False
+
         self._status_display.quiet = not background or (
             "--quiet" in self.myopts and "--verbose" not in self.myopts
         )
@@ -516,6 +575,7 @@ class Scheduler(PollScheduler):
             self._mergelist = []
             self._world_atoms = None
             self._deep_system_deps.clear()
+            self._cyclic_nodes.clear()
             return
 
         self._graph_config = graph_config
@@ -550,6 +610,7 @@ class Scheduler(PollScheduler):
 
         self._find_system_deps()
         self._prune_digraph()
+        self._find_cyclic_nodes()
         self._prevent_builddir_collisions()
         if "--debug" in self.myopts:
             writemsg("\nscheduler digraph:\n\n", noiselevel=-1)
@@ -571,7 +632,9 @@ class Scheduler(PollScheduler):
 
         deep_system_deps = self._deep_system_deps
         deep_system_deps.clear()
-        deep_system_deps.update(_find_deep_system_runtime_deps(self._digraph))
+        deep_system_deps.update(
+            _find_deep_system_runtime_deps(self._digraph, scope=self._merge_wait_scope)
+        )
         deep_system_deps.difference_update(
             [pkg for pkg in deep_system_deps if pkg.operation != "merge"]
         )
@@ -598,6 +661,23 @@ class Scheduler(PollScheduler):
             if not removed_nodes:
                 break
             removed_nodes.clear()
+
+    def _find_cyclic_nodes(self):
+        """
+        Find the packages that are part of a dependency cycle. Within a
+        cycle, post-merge dependencies do not have to delay a build,
+        since the merge order has already decided to ignore them, and
+        waiting for them serializes builds that could run in parallel
+        (bug 452172).
+        """
+        self._cyclic_nodes.clear()
+        if self._digraph is None:
+            return
+        for component in self._digraph.strongly_connected_components(
+            ignore_priority=DepPrioritySatisfiedRange.ignore_soft
+        ):
+            if len(component) > 1:
+                self._cyclic_nodes.update(component)
 
     def _prevent_builddir_collisions(self):
         """
@@ -846,7 +926,7 @@ class Scheduler(PollScheduler):
 
         elif (
             pkg.type_name == "binary"
-            and "--getbinpkg" in self.myopts
+            and self.myopts.get("--getbinpkg") is True
             and pkg.root_config.trees["bintree"].download_required(pkg.cpv)
         ):
             prefetcher = BinpkgPrefetcher(
@@ -855,272 +935,428 @@ class Scheduler(PollScheduler):
 
         return prefetcher
 
+    def _pkg_needs_pretend(self, pkg):
+        return (
+            isinstance(pkg, Package)
+            and pkg.operation != "uninstall"
+            and pkg.eapi not in ("0", "1", "2", "3")
+            and "pretend" in pkg.defined_phases
+        )
+
     async def _run_pkg_pretend(self, loop=None):
         """
         Since pkg_pretend output may be important, this method sends all
         output directly to stdout (regardless of options like --quiet or
         --jobs).
+
+        When more than one job is allowed, the phases run concurrently and
+        their output is buffered, then replayed in mergelist order.
         """
+        loop = asyncio._wrap_loop(loop or self._sched_iface)
+
+        pretend_pkgs = [x for x in self._mergelist if self._pkg_needs_pretend(x)]
+        if not pretend_pkgs:
+            return os.EX_OK
+
+        max_jobs = self._max_jobs
+        if max_jobs is True:
+            max_jobs = len(pretend_pkgs)
+        max_jobs = max(1, min(max_jobs, len(pretend_pkgs)))
+
+        # A max_load of True disables load average throttling, which is
+        # what we want when the user has not requested --load-average.
+        max_load = True if self._max_load is None else self._max_load
+
+        # With a single job there is nothing to interleave. A
+        # PROPERTIES=interactive package needs the terminal to itself, and
+        # _background_mode() has already forced --jobs=1 for those, so they
+        # take the unbuffered path here.
+        buffered = max_jobs > 1
+
+        def future_generator():
+            for index, pkg in enumerate(pretend_pkgs):
+                yield asyncio.ensure_future(
+                    self._run_pkg_pretend_one(index, pkg, buffered, loop), loop=loop
+                )
 
         failures = 0
-        sched_iface = loop = asyncio._wrap_loop(loop or self._sched_iface)
+        results = {}
+        next_index = 0
 
-        for x in self._mergelist:
-            if not isinstance(x, Package):
-                continue
+        for done_set_future in async_iter_completed(
+            future_generator(),
+            max_jobs=max_jobs,
+            max_load=max_load,
+            loop=loop,
+        ):
+            for future in await done_set_future:
+                result = future.result()
+                results[result.index] = result
 
-            if x.operation == "uninstall":
-                continue
-
-            if x.eapi in ("0", "1", "2", "3"):
-                continue
-
-            if "pretend" not in x.defined_phases:
-                continue
+            while next_index in results:
+                failures += self._emit_pkg_pretend_result(results.pop(next_index))
+                next_index += 1
 
             self._termination_check()
             if self._terminated_tasks:
                 raise asyncio.CancelledError
 
-            root_config = x.root_config
-            settings = self._allocate_config(root_config.root)
-            settings.setcpv(x)
+        if failures:
+            return FAILURE
+        return os.EX_OK
 
-            color = "PKG_BINARY_MERGE" if x.built else "INFORM"
-            self._status_msg(f"Running pre-merge checks for {colorize(color, x.cpv)}")
+    def _emit_pkg_pretend_result(self, result):
+        """
+        Send buffered pkg_pretend output to stdout and record a failure if
+        the job failed.
 
-            if not x.built:
-                # Get required SRC_URI metadata (it's not cached in x.metadata
-                # because some packages have an extremely large SRC_URI value).
-                portdb = root_config.trees["porttree"].dbapi
-                (settings.configdict["pkg"]["SRC_URI"],) = await portdb.async_aux_get(
-                    x.cpv, ["SRC_URI"], myrepo=x.repo, loop=loop
-                )
+        @rtype: int
+        @return: the number of failures (0 or 1)
+        """
+        for msg in result.msgs:
+            msg()
 
-            # setcpv/package.env allows for per-package PORTAGE_TMPDIR so we
-            # have to validate it for each package
-            rval = _check_temp_dir(settings)
-            if rval != os.EX_OK:
-                failures += 1
-                self._record_pkg_failure(x, settings, FAILURE)
-                self._deallocate_config(settings)
-                continue
+        if result.output:
+            # Use the file descriptor that unbuffered phase output would
+            # have gone to, and flush first so that pending output does not
+            # appear afterwards.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.__stdout__.buffer.write(result.output)
+            sys.__stdout__.buffer.flush()
 
-            build_dir_path = os.path.join(
-                os.path.realpath(settings["PORTAGE_TMPDIR"]),
-                "portage",
-                x.category,
-                x.pf,
+        if result.returncode == os.EX_OK:
+            return 0
+
+        self._record_pkg_failure(
+            result.pkg, result.build_dir, result.build_log, result.returncode
+        )
+        return 1
+
+    def _read_pretend_log(self, capture_path):
+        """
+        Return the contents of a buffered pkg_pretend log, and remove it.
+        """
+        try:
+            with open(capture_path, "rb") as f:
+                return f.read()
+        finally:
+            os.unlink(capture_path)
+
+    async def _run_pkg_pretend_one(self, index, x, buffered, loop):
+        """
+        Run the pkg_pretend phase for a single package. If buffered is True
+        then all output is captured in the returned result, so that the
+        caller can replay it in mergelist order.
+
+        @rtype: Scheduler._pretend_result
+        """
+        sched_iface = loop
+
+        self._termination_check()
+        if self._terminated_tasks:
+            raise asyncio.CancelledError
+
+        msgs = []
+        capture_path = None
+        real_log_path = None
+        result = self._pretend_result(index=index, msgs=msgs, output=b"", pkg=x)
+
+        def add_msg(func, *args, **kwargs):
+            if buffered:
+                msgs.append(functools.partial(func, *args, **kwargs))
+            else:
+                func(*args, **kwargs)
+
+        def finish(returncode, settings):
+            result.build_dir = settings.get("PORTAGE_BUILDDIR")
+            result.build_log = (
+                real_log_path if buffered else settings.get("PORTAGE_LOG_FILE")
             )
-            existing_builddir = os.path.isdir(build_dir_path)
-            settings["PORTAGE_BUILDDIR"] = build_dir_path
-            build_dir = EbuildBuildDir(scheduler=sched_iface, settings=settings)
-            await build_dir.async_lock()
-            current_task = None
+            result.returncode = returncode
+            return result
 
-            try:
-                # Clean up the existing build dir, in case pkg_pretend
-                # checks for available space (bug #390711).
-                if existing_builddir:
-                    if x.built:
-                        tree = "bintree"
-                        infloc = os.path.join(build_dir_path, "build-info")
-                        ebuild_path = os.path.join(infloc, x.pf + ".ebuild")
-                    else:
-                        tree = "porttree"
-                        portdb = root_config.trees["porttree"].dbapi
-                        ebuild_path = portdb.findname(x.cpv, myrepo=x.repo)
-                        if ebuild_path is None:
-                            raise AssertionError(f"ebuild not found for '{x.cpv}'")
-                    portage.package.ebuild.doebuild.doebuild_environment(
-                        ebuild_path,
-                        "clean",
-                        settings=settings,
-                        db=self.trees[settings["EROOT"]][tree].dbapi,
-                    )
-                    clean_phase = EbuildPhase(
-                        background=False,
-                        phase="clean",
-                        scheduler=sched_iface,
-                        settings=settings,
-                    )
-                    current_task = clean_phase
-                    clean_phase.start()
-                    await clean_phase.async_wait()
-                    current_task = None
+        root_config = x.root_config
+        settings = self._allocate_config(root_config.root)
+        settings.setcpv(x)
 
+        color = "PKG_BINARY_MERGE" if x.built else "INFORM"
+        add_msg(
+            self._status_msg, f"Running pre-merge checks for {colorize(color, x.cpv)}"
+        )
+
+        if not x.built:
+            # Get required SRC_URI metadata (it's not cached in x.metadata
+            # because some packages have an extremely large SRC_URI value).
+            portdb = root_config.trees["porttree"].dbapi
+            (settings.configdict["pkg"]["SRC_URI"],) = await portdb.async_aux_get(
+                x.cpv, ["SRC_URI"], myrepo=x.repo, loop=loop
+            )
+
+        # setcpv/package.env allows for per-package PORTAGE_TMPDIR so we
+        # have to validate it for each package
+        rval = _check_temp_dir(settings)
+        if rval != os.EX_OK:
+            finish(FAILURE, settings)
+            self._deallocate_config(settings)
+            return result
+
+        build_dir_path = os.path.join(
+            os.path.realpath(settings["PORTAGE_TMPDIR"]),
+            "portage",
+            x.category,
+            x.pf,
+        )
+        existing_builddir = os.path.isdir(build_dir_path)
+        settings["PORTAGE_BUILDDIR"] = build_dir_path
+        build_dir = EbuildBuildDir(scheduler=sched_iface, settings=settings)
+        await build_dir.async_lock()
+        current_task = None
+
+        try:
+            # Clean up the existing build dir, in case pkg_pretend
+            # checks for available space (bug #390711).
+            if existing_builddir:
                 if x.built:
                     tree = "bintree"
-                    bintree = root_config.trees["bintree"].dbapi.bintree
-                    fetched = False
-
-                    # Display fetch on stdout, so that it's always clear what
-                    # is consuming time here.
-                    if bintree.download_required(x.cpv):
-                        fetcher = self._get_prefetcher(x)
-                        if fetcher is not None and not fetcher.isAlive():
-                            # Cancel it because it hasn't started yet.
-                            fetcher.cancel()
-                            fetcher = None
-                        if fetcher is None:
-                            fetcher = BinpkgFetcher(pkg=x, scheduler=loop)
-                            fetcher.start()
-                            # We only set the fetched value when fetcher
-                            # is a BinpkgFetcher, since BinpkgPrefetcher
-                            # handles fetch, verification, and the
-                            # bintree.inject call which moves the file.
-                            fetched = fetcher.pkg_path
-                        else:
-                            msg = (
-                                "Fetching in the background:",
-                                fetcher.pkg_path,
-                                "To view fetch progress, run in another terminal:",
-                                f"tail -f {self._fetch_log}",
-                            )
-                            out = portage.output.EOutput()
-                            for l in msg:
-                                out.einfo(l)
-                        if await fetcher.async_wait() != os.EX_OK:
-                            failures += 1
-                            self._record_pkg_failure(x, settings, fetcher.returncode)
-                            continue
-
-                    if fetched is False:
-                        filename = bintree.getname(x.cpv)
-                    else:
-                        filename = fetched
-                    verifier = BinpkgVerifier(
-                        pkg=x, scheduler=sched_iface, _pkg_path=filename
-                    )
-                    current_task = verifier
-                    verifier.start()
-                    if await verifier.async_wait() != os.EX_OK:
-                        failures += 1
-                        self._record_pkg_failure(x, settings, verifier.returncode)
-                        continue
-
-                    current_task = None
-                    if fetched and bintree.get_local_repo_location(x.cpv):
-                        os.rename(fetched, fetcher.pkg_allocated_path)
-                    elif fetched:
-                        injected_pkg = None
-                        stdout_orig = sys.stdout
-                        stderr_orig = sys.stderr
-                        out = io.StringIO()
-                        try:
-                            sys.stdout = out
-                            sys.stderr = out
-
-                            injected_pkg = bintree.inject(
-                                x.cpv,
-                                current_pkg_path=fetched,
-                                allocated_pkg_path=fetcher.pkg_allocated_path,
-                            )
-                        finally:
-                            sys.stdout = stdout_orig
-                            sys.stderr = stderr_orig
-
-                        output_value = out.getvalue()
-                        if injected_pkg is None:
-                            msg = ["Binary package is not usable:"]
-                            if output_value:
-                                msg.extend(
-                                    "\t" + line for line in output_value.splitlines()
-                                )
-                            self._elog("eerror", msg)
-
-                            failures += 1
-                            self._record_pkg_failure(x, settings, 1)
-                            continue
-
                     infloc = os.path.join(build_dir_path, "build-info")
-                    ensure_dirs(infloc)
-                    try:
-                        await bintree.dbapi.unpack_metadata(settings, infloc, loop=loop)
-                    except portage.exception.SignatureException as e:
-                        writemsg(
-                            f"!!! Invalid binary package: '{bintree.getname(x.cpv)}', {e}\n",
-                            noiselevel=-1,
-                        )
-                        failures += 1
-                        self._record_pkg_failure(x, settings, 1)
-                        continue
                     ebuild_path = os.path.join(infloc, x.pf + ".ebuild")
-                    settings.configdict["pkg"]["EMERGE_FROM"] = "binary"
-                    settings.configdict["pkg"]["MERGE_TYPE"] = "binary"
-
                 else:
                     tree = "porttree"
                     portdb = root_config.trees["porttree"].dbapi
                     ebuild_path = portdb.findname(x.cpv, myrepo=x.repo)
                     if ebuild_path is None:
                         raise AssertionError(f"ebuild not found for '{x.cpv}'")
-                    settings.configdict["pkg"]["EMERGE_FROM"] = "ebuild"
-                    if self._build_opts.buildpkgonly:
-                        settings.configdict["pkg"]["MERGE_TYPE"] = "buildonly"
-                    else:
-                        settings.configdict["pkg"]["MERGE_TYPE"] = "source"
-
                 portage.package.ebuild.doebuild.doebuild_environment(
                     ebuild_path,
-                    "pretend",
+                    "clean",
                     settings=settings,
                     db=self.trees[settings["EROOT"]][tree].dbapi,
                 )
-
-                prepare_build_dirs(root_config.root, settings, cleanup=0)
-
-                vardb = root_config.trees["vartree"].dbapi
-                settings["REPLACING_VERSIONS"] = " ".join(
-                    {
-                        portage.versions.cpv_getversion(match)
-                        for match in vardb.match(x.slot_atom) + vardb.match("=" + x.cpv)
-                    }
+                clean_phase = EbuildPhase(
+                    background=buffered,
+                    phase="clean",
+                    scheduler=sched_iface,
+                    settings=settings,
                 )
-                pretend_phase = EbuildPhase(
-                    phase="pretend", scheduler=sched_iface, settings=settings
+                current_task = clean_phase
+                clean_phase.start()
+                await clean_phase.async_wait()
+                current_task = None
+
+            if x.built:
+                tree = "bintree"
+                bintree = root_config.trees["bintree"].dbapi.bintree
+                fetched = False
+
+                # Display fetch on stdout, or say where its output is, so
+                # that it's always clear what is consuming time here.
+                if bintree.download_required(x.cpv):
+                    fetcher = self._get_prefetcher(x)
+                    if fetcher is not None and not fetcher.isAlive():
+                        # Cancel it because it hasn't started yet.
+                        fetcher.cancel()
+                        fetcher = None
+                    if fetcher is None:
+                        background = buffered and os.access(
+                            first_existing(self._fetch_log), os.W_OK
+                        )
+                        fetcher = BinpkgFetcher(
+                            background=background,
+                            logfile=self._fetch_log if background else None,
+                            pkg=x,
+                            scheduler=loop,
+                        )
+                        if buffered:
+                            # Fetch one package at a time, so that output
+                            # in the fetch log is not interleaved.
+                            self._schedule_fetch(fetcher, force_queue=True)
+                        else:
+                            fetcher.start()
+                        # We only set the fetched value when fetcher
+                        # is a BinpkgFetcher, since BinpkgPrefetcher
+                        # handles fetch, verification, and the
+                        # bintree.inject call which moves the file.
+                        fetched = fetcher.pkg_path
+                    else:
+                        background = True
+                    if background:
+                        # Not buffered, since buffered output is only shown
+                        # once pkg_pretend has finished.
+                        out = portage.output.EOutput()
+                        out.einfo(f"Fetching in the background: {fetcher.pkg_path}")
+                        if not self._fetch_log_announced:
+                            self._fetch_log_announced = True
+                            out.einfo(
+                                "To view fetch progress, run in another terminal:"
+                            )
+                            out.einfo(f"tail -f {self._fetch_log}")
+                    if await fetcher.async_wait() != os.EX_OK:
+                        if background:
+                            add_msg(
+                                portage.output.EOutput().eerror,
+                                f"Fetch of {x.cpv} failed, see {self._fetch_log}",
+                            )
+                        return finish(fetcher.returncode, settings)
+
+                if fetched is False:
+                    filename = bintree.getname(x.cpv)
+                else:
+                    filename = fetched
+                verifier = BinpkgVerifier(
+                    pkg=x, scheduler=sched_iface, _pkg_path=filename
                 )
+                current_task = verifier
+                verifier.start()
+                if await verifier.async_wait() != os.EX_OK:
+                    return finish(verifier.returncode, settings)
 
-                current_task = pretend_phase
-                pretend_phase.start()
-                ret = await pretend_phase.async_wait()
-                # Leave current_task assigned in order to trigger clean
-                # on success in the below finally block.
-                if ret != os.EX_OK:
-                    failures += 1
-                    self._record_pkg_failure(x, settings, ret)
-            finally:
-                if current_task is not None:
-                    if current_task.isAlive():
-                        current_task.cancel()
+                current_task = None
+                if fetched and bintree.get_local_repo_location(x.cpv):
+                    os.rename(fetched, fetcher.pkg_allocated_path)
+                elif fetched:
+                    injected_pkg = None
+                    stdout_orig = sys.stdout
+                    stderr_orig = sys.stderr
+                    out = io.StringIO()
+                    try:
+                        sys.stdout = out
+                        sys.stderr = out
 
-                portage.elog.elog_process(x.cpv, settings)
+                        injected_pkg = bintree.inject(
+                            x.cpv,
+                            current_pkg_path=fetched,
+                            allocated_pkg_path=fetcher.pkg_allocated_path,
+                        )
+                    finally:
+                        sys.stdout = stdout_orig
+                        sys.stderr = stderr_orig
 
-                if current_task is not None and current_task.returncode == os.EX_OK:
-                    clean_phase = EbuildPhase(
-                        background=False,
-                        phase="clean",
-                        scheduler=sched_iface,
-                        settings=settings,
+                    output_value = out.getvalue()
+                    if injected_pkg is None:
+                        msg = ["Binary package is not usable:"]
+                        if output_value:
+                            msg.extend(
+                                "\t" + line for line in output_value.splitlines()
+                            )
+                        add_msg(
+                            writemsg,
+                            "".join(f"!!! {line}\n" for line in msg),
+                            noiselevel=-1,
+                        )
+
+                        return finish(1, settings)
+
+                infloc = os.path.join(build_dir_path, "build-info")
+                ensure_dirs(infloc)
+                try:
+                    await bintree.dbapi.unpack_metadata(settings, infloc, loop=loop)
+                except portage.exception.SignatureException as e:
+                    add_msg(
+                        writemsg,
+                        f"!!! Invalid binary package: '{bintree.getname(x.cpv)}', {e}\n",
+                        noiselevel=-1,
                     )
-                    clean_phase.start()
-                    await clean_phase.async_wait()
+                    return finish(1, settings)
+                ebuild_path = os.path.join(infloc, x.pf + ".ebuild")
+                settings.configdict["pkg"]["EMERGE_FROM"] = "binary"
+                settings.configdict["pkg"]["MERGE_TYPE"] = "binary"
 
-                await build_dir.async_unlock()
-                self._deallocate_config(settings)
+            else:
+                tree = "porttree"
+                portdb = root_config.trees["porttree"].dbapi
+                ebuild_path = portdb.findname(x.cpv, myrepo=x.repo)
+                if ebuild_path is None:
+                    raise AssertionError(f"ebuild not found for '{x.cpv}'")
+                settings.configdict["pkg"]["EMERGE_FROM"] = "ebuild"
+                if self._build_opts.buildpkgonly:
+                    settings.configdict["pkg"]["MERGE_TYPE"] = "buildonly"
+                else:
+                    settings.configdict["pkg"]["MERGE_TYPE"] = "source"
 
-        if failures:
-            return FAILURE
-        return os.EX_OK
+            portage.package.ebuild.doebuild.doebuild_environment(
+                ebuild_path,
+                "pretend",
+                settings=settings,
+                db=self.trees[settings["EROOT"]][tree].dbapi,
+            )
 
-    def _record_pkg_failure(self, pkg, settings, ret):
+            prepare_build_dirs(root_config.root, settings, cleanup=0)
+
+            if buffered:
+                # Redirect phase output to a temporary file, so that it can
+                # be replayed in mergelist order once this job completes.
+                real_log_path = settings.get("PORTAGE_LOG_FILE")
+                fd, capture_path = tempfile.mkstemp(
+                    dir=settings["T"], suffix=".pretend.log"
+                )
+                os.close(fd)
+                settings["PORTAGE_LOG_FILE"] = capture_path
+
+            vardb = root_config.trees["vartree"].dbapi
+            settings["REPLACING_VERSIONS"] = " ".join(
+                {
+                    portage.versions.cpv_getversion(match)
+                    for match in vardb.match(x.slot_atom) + vardb.match("=" + x.cpv)
+                }
+            )
+            pretend_phase = EbuildPhase(
+                background=buffered,
+                phase="pretend",
+                scheduler=sched_iface,
+                settings=settings,
+            )
+
+            current_task = pretend_phase
+            pretend_phase.start()
+            ret = await pretend_phase.async_wait()
+            # Leave current_task assigned in order to trigger clean
+            # on success in the below finally block.
+            return finish(ret, settings)
+        finally:
+            if current_task is not None:
+                if current_task.isAlive():
+                    current_task.cancel()
+
+            if capture_path is not None:
+                # Collect the phase output before the clean phase below
+                # removes it, and restore the real log file before settings
+                # is returned to the config pool.
+                result.output = self._read_pretend_log(capture_path)
+                if real_log_path is None:
+                    settings.pop("PORTAGE_LOG_FILE", None)
+                else:
+                    settings["PORTAGE_LOG_FILE"] = real_log_path
+                    if result.output:
+                        self._sched_iface.output(
+                            result.output.decode("utf-8", "replace"),
+                            log_path=real_log_path,
+                            background=True,
+                        )
+
+            portage.elog.elog_process(x.cpv, settings)
+
+            if current_task is not None and current_task.returncode == os.EX_OK:
+                clean_phase = EbuildPhase(
+                    background=buffered,
+                    phase="clean",
+                    scheduler=sched_iface,
+                    settings=settings,
+                )
+                clean_phase.start()
+                await clean_phase.async_wait()
+
+            await build_dir.async_unlock()
+            self._deallocate_config(settings)
+
+    def _record_pkg_failure(self, pkg, build_dir, build_log, ret):
         """Record a package failure. This eliminates the package
         from the --keep-going merge list, and immediately calls
         _failed_pkg_msg if we have not been terminated."""
         self._failed_pkgs.append(
             self._failed_pkg(
-                build_dir=settings.get("PORTAGE_BUILDDIR"),
-                build_log=settings.get("PORTAGE_LOG_FILE"),
+                build_dir=build_dir,
+                build_log=build_log,
                 pkg=pkg,
                 returncode=ret,
             )
@@ -1189,97 +1425,105 @@ class Scheduler(PollScheduler):
         if rval != os.EX_OK and not keep_going:
             return rval
 
-        while True:
-            received_signal = []
+        try:
+            while True:
+                received_signal = []
 
-            def sighandler(signum, frame):
-                signal.signal(signal.SIGINT, signal.SIG_IGN)
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                portage.util.writemsg(f"\n\nExiting on signal {signum}\n")
-                self.terminate()
-                received_signal.append(128 + signum)
+                def sighandler(signum, frame):
+                    signal.signal(signal.SIGINT, signal.SIG_IGN)
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    portage.util.writemsg(f"\n\nExiting on signal {signum}\n")
+                    self.terminate()
+                    received_signal.append(128 + signum)
 
-            def sigusr2handler(signum, frame):
-                self._flush_merge_wait_queue = True
+                def sigusr2handler(signum, frame):
+                    self._flush_merge_wait_queue = True
 
-            earlier_sigint_handler = signal.signal(signal.SIGINT, sighandler)
-            earlier_sigterm_handler = signal.signal(signal.SIGTERM, sighandler)
-            earlier_sigcont_handler = signal.signal(
-                signal.SIGCONT, self._sigcont_handler
-            )
-            signal.siginterrupt(signal.SIGCONT, False)
-            earlier_sigusr2_handler = signal.signal(signal.SIGUSR2, sigusr2handler)
+                earlier_sigint_handler = signal.signal(signal.SIGINT, sighandler)
+                earlier_sigterm_handler = signal.signal(signal.SIGTERM, sighandler)
+                earlier_sigcont_handler = signal.signal(
+                    signal.SIGCONT, self._sigcont_handler
+                )
+                signal.siginterrupt(signal.SIGCONT, False)
+                earlier_sigusr2_handler = signal.signal(signal.SIGUSR2, sigusr2handler)
 
-            earlier_sigwinch_handler = signal.signal(
-                signal.SIGWINCH, self._sigwinch_handler
-            )
-            try:
-                rval = self._merge()
-            finally:
-                # Restore previous handlers
-                if earlier_sigint_handler is not None:
-                    signal.signal(signal.SIGINT, earlier_sigint_handler)
-                else:
-                    signal.signal(signal.SIGINT, signal.SIG_DFL)
-                if earlier_sigterm_handler is not None:
-                    signal.signal(signal.SIGTERM, earlier_sigterm_handler)
-                else:
-                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                if earlier_sigcont_handler is not None:
-                    signal.signal(signal.SIGCONT, earlier_sigcont_handler)
-                else:
-                    signal.signal(signal.SIGCONT, signal.SIG_DFL)
-                if earlier_sigusr2_handler is not None:
-                    signal.signal(signal.SIGUSR2, earlier_sigusr2_handler)
-                else:
-                    signal.signal(signal.SIGUSR2, signal.SIG_DFL)
+                earlier_sigwinch_handler = signal.signal(
+                    signal.SIGWINCH, self._sigwinch_handler
+                )
+                try:
+                    rval = self._merge()
+                finally:
+                    # Restore previous handlers
+                    if earlier_sigint_handler is not None:
+                        signal.signal(signal.SIGINT, earlier_sigint_handler)
+                    else:
+                        signal.signal(signal.SIGINT, signal.SIG_DFL)
+                    if earlier_sigterm_handler is not None:
+                        signal.signal(signal.SIGTERM, earlier_sigterm_handler)
+                    else:
+                        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                    if earlier_sigcont_handler is not None:
+                        signal.signal(signal.SIGCONT, earlier_sigcont_handler)
+                    else:
+                        signal.signal(signal.SIGCONT, signal.SIG_DFL)
+                    if earlier_sigusr2_handler is not None:
+                        signal.signal(signal.SIGUSR2, earlier_sigusr2_handler)
+                    else:
+                        signal.signal(signal.SIGUSR2, signal.SIG_DFL)
 
-                if earlier_sigwinch_handler is not None:
-                    signal.signal(signal.SIGWINCH, earlier_sigwinch_handler)
-                else:
-                    signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+                    if earlier_sigwinch_handler is not None:
+                        signal.signal(signal.SIGWINCH, earlier_sigwinch_handler)
+                    else:
+                        signal.signal(signal.SIGWINCH, signal.SIG_DFL)
 
-            self._termination_check()
-            if received_signal:
-                sys.exit(received_signal[0])
+                self._termination_check()
+                if received_signal:
+                    sys.exit(received_signal[0])
 
-            if rval == os.EX_OK or fetchonly or not keep_going:
-                break
-            if "resume" not in mtimedb:
-                break
-            mergelist = self._mtimedb["resume"].get("mergelist")
-            if not mergelist:
-                break
+                if rval == os.EX_OK or fetchonly or not keep_going:
+                    break
+                if "resume" not in mtimedb:
+                    break
+                mergelist = self._mtimedb["resume"].get("mergelist")
+                if not mergelist:
+                    break
 
-            if not failed_pkgs:
-                break
+                if not failed_pkgs:
+                    break
 
-            for failed_pkg in failed_pkgs:
-                mergelist.remove(list(failed_pkg.pkg))
+                for failed_pkg in failed_pkgs:
+                    mergelist.remove(list(failed_pkg.pkg))
 
-            self._failed_pkgs_all.extend(failed_pkgs)
-            del failed_pkgs[:]
+                self._failed_pkgs_all.extend(failed_pkgs)
+                del failed_pkgs[:]
 
-            if not mergelist:
-                break
+                if not mergelist:
+                    break
 
-            if not self._calc_resume_list():
-                break
+                if not self._calc_resume_list():
+                    break
 
-            clear_caches(self.trees)
-            if not self._mergelist:
-                break
+                clear_caches(self.trees)
+                if not self._mergelist:
+                    break
 
-            self._save_resume_list()
-            self._pkg_count.curval = 0
-            self._pkg_count.maxval = len(
-                [
-                    x
-                    for x in self._mergelist
-                    if isinstance(x, Package) and x.operation == "merge"
-                ]
-            )
-            self._status_display.maxval = self._pkg_count.maxval
+                self._save_resume_list()
+                self._pkg_count.curval = 0
+                self._pkg_count.maxval = len(
+                    [
+                        x
+                        for x in self._mergelist
+                        if isinstance(x, Package) and x.operation == "merge"
+                    ]
+                )
+                self._status_display.maxval = self._pkg_count.maxval
+        finally:
+            # _merge() runs once per --keep-going pass, but the monitor and
+            # the cgroup manager are created once per Scheduler and nothing
+            # recreates them, so they can only be torn down out here.
+            self._observability.close()
+            if self._cgroup is not None:
+                self._cgroup.close()
 
         # Cleanup any callbacks that have been registered with the global
         # event loop by calls to the terminate method.
@@ -1309,9 +1553,7 @@ class Scheduler(PollScheduler):
             if log_path is not None:
                 try:
                     log_file = open(
-                        _unicode_encode(
-                            log_path, encoding=_encodings["fs"], errors="strict"
-                        ),
+                        log_path,
                         mode="rb",
                     )
                 except OSError:
@@ -1493,11 +1735,14 @@ class Scheduler(PollScheduler):
 
     def _merge_exit(self, merge):
         self._running_tasks.pop(id(merge), None)
+        self._observability.note_task_finished(merge)
         self._do_merge_exit(merge)
+        self._cgroup_finish(merge.merge, action="install", record=False)
         self._deallocate_config(merge.merge.settings)
         if merge.returncode == os.EX_OK and not merge.merge.pkg.installed:
             self._status_display.curval += 1
         self._status_display.merges = len(self._task_queues.merge)
+        self._observability.update()
         self._schedule()
 
     def _do_merge_exit(self, merge):
@@ -1563,10 +1808,13 @@ class Scheduler(PollScheduler):
 
     def _build_exit(self, build):
         self._running_tasks.pop(id(build), None)
+        self._observability.note_task_finished(build)
+        self._cgroup_finish(build)
         self._release_job_token(id(build))
         if build.returncode == os.EX_OK and self._terminated_tasks:
             # We've been interrupted, so we won't
             # add this to the merge queue.
+            self._observability.forget_build(build)
             self.curval += 1
             self._deallocate_config(build.settings)
         elif build.returncode == os.EX_OK:
@@ -1578,6 +1826,7 @@ class Scheduler(PollScheduler):
             )
             # move the job token to the merge task
             self._running_tasks[id(merge)] = merge
+            self._observability.note_task_started(merge)
             # By default, merge-wait only allows merge when no builds are executing.
             # As a special exception, dependencies on system packages are frequently
             # unspecified and will therefore force merge-wait.
@@ -1592,6 +1841,7 @@ class Scheduler(PollScheduler):
                 merge.addExitListener(self._merge_exit)
                 self._status_display.merges = len(self._task_queues.merge)
         else:
+            self._observability.forget_build(build)
             settings = build.settings
             build_dir = settings.get("PORTAGE_BUILDDIR")
             build_log = settings.get("PORTAGE_LOG_FILE")
@@ -1611,6 +1861,7 @@ class Scheduler(PollScheduler):
         self._jobs -= 1
         self._status_display.running = self._jobs
         self._status_display.merge_wait = len(self._merge_wait_queue)
+        self._observability.update()
         self._schedule()
 
     def _extract_exit(self, build):
@@ -1806,6 +2057,17 @@ class Scheduler(PollScheduler):
 
         return chosen_pkg
 
+    def _ignore_priority(self, pkg):
+        """
+        Return the ignore_priority to use for the dependencies of pkg
+        when deciding whether its build can start. Post-merge
+        dependencies within a cycle are ignored, since the merge order
+        already ignores them.
+        """
+        if pkg in self._cyclic_nodes:
+            return DepPrioritySatisfiedRange.ignore_medium_post
+        return None
+
     def _dependent_on_scheduled_merges(self, pkg, later):
         """
         Traverse the subgraph of the given packages deep dependencies
@@ -1826,7 +2088,7 @@ class Scheduler(PollScheduler):
 
         dependent = False
         traversed_nodes = {pkg}
-        direct_deps = graph.child_nodes(pkg)
+        direct_deps = graph.child_nodes(pkg, ignore_priority=self._ignore_priority(pkg))
         node_stack = direct_deps
         direct_deps = frozenset(direct_deps)
         while node_stack:
@@ -1846,7 +2108,9 @@ class Scheduler(PollScheduler):
             # Don't traverse children of uninstall nodes since
             # those aren't dependencies in the usual sense.
             if node.operation != "uninstall":
-                node_stack.extend(graph.child_nodes(node))
+                node_stack.extend(
+                    graph.child_nodes(node, ignore_priority=self._ignore_priority(node))
+                )
 
         return dependent
 
@@ -1913,15 +2177,12 @@ class Scheduler(PollScheduler):
                         level=logging.ERROR,
                     )
                 else:
-                    # Use a decaying function to take potential future PORTAGE_TMPDIR consumption
+                    # Use a function to take potential future PORTAGE_TMPDIR consumption
                     # of currently running jobs and the new job into account.
-                    def scale_to_jobs(num):
+                    def scale_to_jobs(num, p90):
                         # The newly started job is fully taken into account.
                         res = num
-                        # All currently running jobs are taken into account with less weight,
-                        # since it is likely that they are already using space in PORTAGE_TMPDIR.
-                        for i in range(2, running_job_count + 2):
-                            res += (1 / i) * num
+                        res += running_job_count * p90
                         return res
 
                     if (
@@ -1931,14 +2192,17 @@ class Scheduler(PollScheduler):
                         required_free_bytes = (
                             self._jobs_tmpdir_require_free_gb * 1024 * 1024 * 1024
                         )
-                        required_free_bytes = scale_to_jobs(required_free_bytes)
+                        p90_bytes = (
+                            1 * 1024 * 1024 * 1024
+                        )  # Assume 1 GiB for 90th percentile job size
+                        required_free_bytes = scale_to_jobs(
+                            required_free_bytes, p90_bytes
+                        )
 
                         actual_free_bytes = vfs_stat.f_bsize * vfs_stat.f_bavail
 
                         if actual_free_bytes < required_free_bytes:
                             if not self._warned_tmpdir_free_space:
-                                from portage.util.human_readable import bytes_to_human
-
                                 actual_free_bytes_hr = bytes_to_human(actual_free_bytes)
                                 required_free_bytes_hr = bytes_to_human(
                                     required_free_bytes
@@ -2115,8 +2379,7 @@ class Scheduler(PollScheduler):
                 return False
 
             delay = self._job_delay_max * avg1 / self._max_load
-            if delay > self._job_delay_max:
-                delay = self._job_delay_max
+            delay = min(delay, self._job_delay_max)
             elapsed_seconds = current_time - self._previous_job_start_time
             # elapsed_seconds < 0 means the system clock has been adjusted
             if elapsed_seconds > 0 and elapsed_seconds < delay:
@@ -2232,6 +2495,7 @@ class Scheduler(PollScheduler):
             if pkg.installed:
                 merge = PackageMerge(merge=task, scheduler=self._sched_iface)
                 self._running_tasks[id(merge)] = merge
+                self._observability.note_task_started(merge)
                 self._task_queues.merge.addFront(merge)
                 merge.addExitListener(self._merge_exit)
 
@@ -2241,6 +2505,7 @@ class Scheduler(PollScheduler):
                 self._status_display.running = self._jobs
                 self._jobserver_tokens[id(task)] = token
                 self._running_tasks[id(task)] = task
+                self._observability.note_task_started(task)
                 task.scheduler = self._sched_iface
                 self._task_queues.jobs.add(task)
 
@@ -2248,6 +2513,8 @@ class Scheduler(PollScheduler):
                     task.addExitListener(self._extract_exit)
                 else:
                     task.addExitListener(self._build_exit)
+
+            self._observability.update()
 
     def _get_prefetcher(self, pkg):
         try:
@@ -2476,7 +2743,7 @@ class Scheduler(PollScheduler):
             if not atoms:
                 msg += " dropped because it is masked or unavailable"
             else:
-                msg += f" dropped because it requires {', '.join(set(atoms))}"
+                msg += f" dropped because it requires {', '.join(str(a) for a in set(atoms))}"
             for line in textwrap.wrap(msg, msg_width):
                 eerror(line, phase="other", key=pkg.cpv)
             settings = self.pkgsettings[pkg.root]
@@ -2560,7 +2827,7 @@ class Scheduler(PollScheduler):
                     else:
                         writemsg_level(
                             f'\n!!! Unable to record {atom} in "world"\n',
-                            level=logging.WARN,
+                            level=logging.WARNING,
                             noiselevel=-1,
                         )
         finally:

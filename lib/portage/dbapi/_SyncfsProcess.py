@@ -2,10 +2,10 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import functools
+import os
 
-from portage import os
-from portage.util._ctypes import load_libc
 from portage.util._async.ForkProcess import ForkProcess
+from portage.util._ctypes import load_libc
 
 
 class SyncfsProcess(ForkProcess):
@@ -24,7 +24,7 @@ class SyncfsProcess(ForkProcess):
 
     @staticmethod
     def _get_syncfs():
-        (libc, _) = load_libc()
+        libc, _ = load_libc()
         if libc is not None:
             return getattr(libc, "syncfs", None)
         return None

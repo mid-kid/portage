@@ -1,14 +1,17 @@
-# Copyright 2010-2018 Gentoo Foundation
+# Copyright 2010-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 import errno
+import fcntl
+import io
 import logging
+import os
 import pickle
-from portage import os
-from portage.exception import TryAgain
+
 from portage.localization import _
-from portage.locks import lockfile, unlockfile
 from portage.util import writemsg_level
+from portage.util.pickle import NoGlobalsUnpickler
+
 from _emerge.FifoIpcDaemon import FifoIpcDaemon
 
 
@@ -40,7 +43,7 @@ class EbuildIpcDaemon(FifoIpcDaemon):
             pass  # EAGAIN
         elif data:
             try:
-                obj = pickle.loads(data)
+                obj = NoGlobalsUnpickler(io.BytesIO(data)).load()
             except SystemExit:
                 raise
             except Exception:
@@ -53,21 +56,13 @@ class EbuildIpcDaemon(FifoIpcDaemon):
                 cmd_key = obj[0]
                 cmd_handler = self.commands[cmd_key]
                 reply = cmd_handler(obj)
-                try:
-                    self._send_reply(reply)
-                except OSError as e:
-                    if e.errno == errno.ENXIO:
-                        # This happens if the client side has been killed.
-                        pass
-                    else:
-                        raise
-
-                # Allow the command to execute hooks after its reply
-                # has been sent. This hook is used by the 'exit'
-                # command to kill the ebuild process. For some
-                # reason, the ebuild-ipc helper hangs up the
-                # ebuild process if it is waiting for a reply
-                # when we try to kill the ebuild process.
+                # The command may have a hook to run once its reply has
+                # been sent. The 'exit' command, which is only sent when
+                # PORTAGE_EBUILD_EXIT_FD is not set, uses it to start the
+                # timer that kills a phase which does not exit by itself,
+                # so that ebuild-ipc is not killed while it waits for the
+                # reply.
+                self._send_reply(reply)
                 reply_hook = getattr(cmd_handler, "reply_hook", None)
                 if reply_hook is not None:
                     reply_hook()
@@ -80,17 +75,26 @@ class EbuildIpcDaemon(FifoIpcDaemon):
             # write something to the pipe just before we close it, and in that
             # case the write will be lost. Therefore, try for a non-blocking
             # lock, and only re-open the pipe if the lock is acquired.
+            #
+            # Only the daemon and its clients lock this file, so both
+            # sides use flock() directly rather than portage.locks.
             lock_filename = os.path.join(os.path.dirname(self.input_fifo), "lock")
+            old_mask = os.umask(0o000)
             try:
-                lock_obj = lockfile(lock_filename, unlinkfile=True, flags=os.O_NONBLOCK)
-            except TryAgain:
-                # We'll try again when another IO_HUP event arrives.
-                pass
-            else:
+                lock_fd = os.open(lock_filename, os.O_CREAT | os.O_RDWR, 0o660)
+            finally:
+                os.umask(old_mask)
+            try:
                 try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+                    # We'll try again when another IO_HUP event arrives.
+                else:
                     self._reopen_input()
-                finally:
-                    unlockfile(lock_obj)
+            finally:
+                os.close(lock_fd)
 
     def _send_reply(self, reply):
         # File streams are in unbuffered mode since we do atomic
@@ -100,17 +104,26 @@ class EbuildIpcDaemon(FifoIpcDaemon):
         # of this fifo before it sends its request, since otherwise
         # we'd have a race condition with this open call raising
         # ENXIO if the client hasn't opened the fifo yet.
+        buf = pickle.dumps(reply)
         try:
             output_fd = os.open(self.output_fifo, os.O_WRONLY | os.O_NONBLOCK)
             try:
-                os.write(output_fd, pickle.dumps(reply))
+                written = os.write(output_fd, buf)
             finally:
                 os.close(output_fd)
         except OSError as e:
             # This probably means that the client has been killed,
             # which causes open to fail with ENXIO.
-            writemsg_level(
-                f"!!! EbuildIpcDaemon {_('failed to send reply')}: {e}\n",
-                level=logging.ERROR,
-                noiselevel=-1,
-            )
+            error = e
+        else:
+            # A reply that does not fit in the pipe buffer is truncated.
+            # Writing the rest later would leave it in the fifo for the
+            # next client to read if this one is killed.
+            if written == len(buf):
+                return
+            error = f"reply truncated to {written} of {len(buf)} bytes"
+        writemsg_level(
+            f"!!! EbuildIpcDaemon {_('failed to send reply')}: {error}\n",
+            level=logging.ERROR,
+            noiselevel=-1,
+        )

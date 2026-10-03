@@ -3,9 +3,11 @@
 
 __all__ = ("VirtualsManager",)
 
+import os
+import warnings
 from copy import deepcopy
 
-from portage import os
+import portage
 from portage.dep import Atom
 from portage.exception import InvalidAtom
 from portage.localization import _
@@ -48,6 +50,16 @@ class VirtualsManager:
         for x in profiles:
             virtuals_file = os.path.join(x, "virtuals")
             virtuals_dict = grabdict(virtuals_file)
+            if virtuals_dict and portage._internal_caller:
+                warnings.warn(
+                    _(
+                        "%s is deprecated, support for PROVIDE virtuals "
+                        "was removed in portage-2.3.25, use GLEP 37 virtual "
+                        "packages instead"
+                    )
+                    % virtuals_file,
+                    UserWarning,
+                )
             atoms_dict = {}
             for k, v in virtuals_dict.items():
                 try:
@@ -232,7 +244,7 @@ class VirtualsManager:
         virts = self.getvirtuals()
         virts_p = {}
         for x in virts:
-            vkeysplit = x.split("/")
+            vkeysplit = str(x).split("/")
             if vkeysplit[1] not in virts_p:
                 virts_p[vkeysplit[1]] = virts[x]
         self._virts_p = virts_p

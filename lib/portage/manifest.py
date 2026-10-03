@@ -1,17 +1,14 @@
-# Copyright 1999-2025 Gentoo Authors
+# Copyright 1999-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 import errno
 import itertools
 import logging
+import os
 import re
 import stat
-import warnings
 
-from portage import os
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
+from portage.const import MANIFEST2_HASH_DEFAULTS, MANIFEST2_IDENTIFIERS
 from portage.exception import (
     DigestException,
     FileNotFound,
@@ -21,7 +18,6 @@ from portage.exception import (
     PortageException,
     PortagePackageException,
 )
-from portage.const import MANIFEST2_HASH_DEFAULTS, MANIFEST2_IDENTIFIERS
 from portage.localization import _
 
 _manifest_re = re.compile(
@@ -84,7 +80,7 @@ def parseManifest2(line):
 
 
 class ManifestEntry:
-    __slots__ = ("type", "name", "hashes")
+    __slots__ = ("hashes", "name", "type")
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -120,7 +116,6 @@ class Manifest:
         pkgdir,
         distdir=None,
         fetchlist_dict=None,
-        manifest1_compat=DeprecationWarning,
         from_scratch=False,
         thin=False,
         allow_missing=False,
@@ -139,18 +134,12 @@ class Manifest:
         from portage.checksum import get_valid_checksum_keys
         from portage.repository.config import _find_invalid_path_char
 
-        if manifest1_compat is not DeprecationWarning:
-            warnings.warn(
-                "The manifest1_compat parameter of the "
-                "portage.manifest.Manifest constructor is deprecated.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         if find_invalid_path_char is None:
             find_invalid_path_char = _find_invalid_path_char
         self._find_invalid_path_char = find_invalid_path_char
-        self.pkgdir = _unicode_decode(pkgdir).rstrip(os.sep) + os.sep
+        if isinstance(pkgdir, bytes):
+            pkgdir = pkgdir.decode("utf-8", "replace")
+        self.pkgdir = pkgdir.rstrip(os.sep) + os.sep
         self.hashes = set()
         self.required_hashes = set()
 
@@ -213,8 +202,8 @@ class Manifest:
         Otherwise, a new dict will be created and returned."""
         try:
             with open(
-                _unicode_encode(file_path, encoding=_encodings["fs"], errors="strict"),
-                encoding=_encodings["repo.content"],
+                file_path,
+                encoding="utf-8",
                 errors="replace",
             ) as f:
                 if myhashdict is None:
@@ -317,12 +306,8 @@ class Manifest:
             if myentries and not force:
                 try:
                     with open(
-                        _unicode_encode(
-                            self.getFullname(),
-                            encoding=_encodings["fs"],
-                            errors="strict",
-                        ),
-                        encoding=_encodings["repo.content"],
+                        self.getFullname(),
+                        encoding="utf-8",
                         errors="replace",
                     ) as f:
                         oldentries = list(self._parseManifestLines(f))
@@ -422,9 +407,8 @@ class Manifest:
             # self.pkgdir is already included via preserved_stats.
             for parent_dir, dirs, files in os.walk(self.pkgdir.rstrip(os.sep)):
                 try:
-                    parent_dir = _unicode_decode(
-                        parent_dir, encoding=_encodings["fs"], errors="strict"
-                    )
+                    if isinstance(parent_dir, bytes):
+                        parent_dir = parent_dir.decode("utf-8", "strict")
                 except UnicodeDecodeError:
                     # If an absolute path cannot be decoded, then it is
                     # always excluded from the manifest (repoman will
@@ -601,9 +585,8 @@ class Manifest:
 
         def _process_for_cpv(filename):
             try:
-                filename = _unicode_decode(
-                    filename, encoding=_encodings["fs"], errors="strict"
-                )
+                if isinstance(filename, bytes):
+                    filename = filename.decode("utf-8", "strict")
             except UnicodeDecodeError:
                 return None
             if filename.startswith("."):
@@ -623,7 +606,8 @@ class Manifest:
         cpvlist = []
         for f in pkgdir_files:
             try:
-                f = _unicode_decode(f, encoding=_encodings["fs"], errors="strict")
+                if isinstance(f, bytes):
+                    f = f.decode("utf-8", "strict")
             except UnicodeDecodeError:
                 continue
             if f.startswith("."):
@@ -646,7 +630,8 @@ class Manifest:
         for parentdir, dirs, files in os.walk(os.path.join(pkgdir, "files")):
             for f in files:
                 try:
-                    f = _unicode_decode(f, encoding=_encodings["fs"], errors="strict")
+                    if isinstance(f, bytes):
+                        f = f.decode("utf-8", "strict")
                 except UnicodeDecodeError:
                     continue
                 full_path = os.path.join(parentdir, f)
@@ -806,11 +791,11 @@ class Manifest:
         if not os.path.exists(mfname):
             return []
         with open(
-            _unicode_encode(mfname, encoding=_encodings["fs"], errors="strict"),
-            encoding=_encodings["repo.content"],
+            mfname,
+            encoding="utf-8",
             errors="replace",
         ) as myfile:
-            line_splits = (line.split() for line in myfile.readlines())
+            line_splits = (line.split() for line in myfile)
             validation = (
                 True
                 for line_split in line_splits

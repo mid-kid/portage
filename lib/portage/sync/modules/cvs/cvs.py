@@ -2,12 +2,12 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import logging
+import os
 import shlex
 
 import portage
-from portage import os
-from portage.util import writemsg_level
 from portage.sync.syncbase import NewBase
+from portage.util import writemsg_level
 
 
 class CVSSync(NewBase):
@@ -31,11 +31,16 @@ class CVSSync(NewBase):
             self._kwargs(kwargs)
         # initial checkout
         cvs_root = self.repo.sync_uri
+        cvs = "cvs"
+        quiet = self.settings.get("PORTAGE_QUIET") == "1"
+        if quiet:
+            cvs += " -q"
         if (
             portage.process.spawn_bash(
-                "cd %s; exec cvs -z0 -d %s co -P -d %s %s"
+                "cd %s; exec %s -z0 -d %s co -P -d %s %s"
                 % (
                     shlex.quote(os.path.dirname(self.repo.location)),
+                    cvs,
                     shlex.quote(cvs_root),
                     shlex.quote(os.path.basename(self.repo.location)),
                     shlex.quote(self.repo.module_specific_options["sync-cvs-repo"]),
@@ -60,8 +65,12 @@ class CVSSync(NewBase):
         """
 
         # cvs update
+        cvs = "cvs"
+        quiet = self.settings.get("PORTAGE_QUIET") == "1"
+        if quiet:
+            cvs += " -q"
         exitcode = portage.process.spawn_bash(
-            f"cd {shlex.quote(self.repo.location)}; exec cvs -z0 -q update -dP",
+            f"cd {shlex.quote(self.repo.location)}; exec {cvs} -z0 update -dP",
             **self.spawn_kwargs,
         )
         if exitcode != os.EX_OK:

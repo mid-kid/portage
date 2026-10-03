@@ -1,16 +1,17 @@
 # Copyright 2008-2021 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import fcntl
 import errno
+import fcntl
 import gzip
+import os
+
+from _emerge.AbstractPollTask import AbstractPollTask
 
 import portage
-from portage import os, _encodings, _unicode_encode
 from portage.util.futures import asyncio
 from portage.util.futures._asyncio.streams import _writer
 from portage.util.futures.unix_events import _set_nonblocking
-from _emerge.AbstractPollTask import AbstractPollTask
 
 
 class PipeLogger(AbstractPollTask):
@@ -38,9 +39,7 @@ class PipeLogger(AbstractPollTask):
         elif log_file_path is not None:
             try:
                 self._log_file = open(
-                    _unicode_encode(
-                        log_file_path, encoding=_encodings["fs"], errors="strict"
-                    ),
+                    log_file_path,
                     mode="ab",
                 )
 

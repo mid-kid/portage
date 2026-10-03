@@ -1,24 +1,28 @@
-# Copyright 1999-2024 Gentoo Authors
+# Copyright 1999-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-from _emerge.AsynchronousLock import AsynchronousLock
-from _emerge.CompositeTask import CompositeTask
-from _emerge.SpawnProcess import SpawnProcess
-from urllib.parse import urlparse as urllib_parse_urlparse
+import os
 import shlex
 import stat
 import sys
+from urllib.parse import urlparse as urllib_parse_urlparse
+
 import portage
-from portage import os
 from portage.binpkg import get_binpkg_format
+from portage.data import portage_gid, portage_uid, userpriv_groups
 from portage.exception import FileNotFound
+from portage.package.ebuild.fetch import _want_userfetch
 from portage.util._async.AsyncTaskFuture import AsyncTaskFuture
 from portage.util._async.FileCopier import FileCopier
 from portage.util._pty import _create_pty_or_pipe
 
+from _emerge.AsynchronousLock import AsynchronousLock
+from _emerge.CompositeTask import CompositeTask
+from _emerge.SpawnProcess import SpawnProcess
+
 
 class BinpkgFetcher(CompositeTask):
-    __slots__ = ("pkg", "pretend", "logfile", "pkg_path", "pkg_allocated_path")
+    __slots__ = ("logfile", "pkg", "pkg_allocated_path", "pkg_path", "pretend")
 
     def __init__(self, **kwargs):
         CompositeTask.__init__(self, **kwargs)
@@ -30,7 +34,7 @@ class BinpkgFetcher(CompositeTask):
         binpkg_path = bintree._remotepkgs[instance_key].get("PATH")
         if not binpkg_path:
             raise FileNotFound(
-                "PATH not found in the binpkg index, the binhost's portage is probably out of date."
+                "PATH not found in the binpkg index, the binhost's Portage is probably out of date."
             )
         binpkg_format = get_binpkg_format(binpkg_path)
 
@@ -83,8 +87,8 @@ class BinpkgFetcher(CompositeTask):
                 ]
                 rel_uri = remote_metadata.get("PATH")
                 if not rel_uri:
-                    # Assume that the remote index is out of date. No path should
-                    # never happen in new portage versions.
+                    # Assume that the remote index is out of date. We should always
+                    # have a PATH in newer Portage versions.
                     rel_uri = pkg.cpv + ".tbz2"
                 remote_base_uri = remote_metadata["BASE_URI"]
                 uri = remote_base_uri.rstrip("/") + "/" + rel_uri.lstrip("/")
@@ -116,6 +120,11 @@ class BinpkgFetcher(CompositeTask):
                 if copier.returncode == os.EX_OK:
                     fetcher.sync_timestamp()
             else:
+                if _want_userfetch(self.pkg.root_config.settings):
+                    self.pkg.root_config.trees["bintree"]._ensure_dir(
+                        os.path.dirname(self.pkg_path)
+                    )
+
                 fetcher.start()
                 try:
                     await fetcher.async_wait()
@@ -139,7 +148,7 @@ class BinpkgFetcher(CompositeTask):
 
 
 class _BinpkgFetcherProcess(SpawnProcess):
-    __slots__ = ("pkg", "pretend", "locked", "pkg_path", "_lock_obj")
+    __slots__ = ("_lock_obj", "locked", "pkg", "pkg_path", "pretend")
 
     def _start(self):
         pkg = self.pkg
@@ -227,6 +236,13 @@ class _BinpkgFetcherProcess(SpawnProcess):
         if settings.selinux_enabled():
             self._selinux_type = settings["PORTAGE_FETCH_T"]
         self.log_filter_file = settings.get("PORTAGE_LOG_FILTER_FILE_CMD")
+
+        if _want_userfetch(self.pkg.root_config.settings):
+            self.uid = int(portage_uid)
+            self.gid = int(portage_gid)
+            self.groups = userpriv_groups
+            self.umask = 0o02
+
         SpawnProcess._start(self)
 
     def _pipe(self, fd_pipes):
@@ -239,35 +255,29 @@ class _BinpkgFetcherProcess(SpawnProcess):
         stdout_pipe = None
         if not self.background:
             stdout_pipe = fd_pipes.get(1)
-        self._pty_ready, master_fd, slave_fd = _create_pty_or_pipe(
-            copy_term_size=stdout_pipe
-        )
-        return (master_fd, slave_fd)
+        master_fd, slave_fd = _create_pty_or_pipe(copy_term_size=stdout_pipe)
+        return master_fd, slave_fd
 
     def sync_timestamp(self):
         # If possible, update the mtime to match the remote package if
         # the fetcher didn't already do it automatically.
         bintree = self.pkg.root_config.trees["bintree"]
-        if bintree._remote_has_index:
-            remote_mtime = bintree._remotepkgs[
-                bintree.dbapi._instance_key(self.pkg.cpv)
-            ].get("_mtime_")
-            if remote_mtime is not None:
-                try:
-                    remote_mtime = int(remote_mtime)
-                except ValueError:
-                    pass
-                else:
-                    try:
-                        local_mtime = os.stat(self.pkg_path)[stat.ST_MTIME]
-                    except OSError:
-                        pass
-                    else:
-                        if remote_mtime != local_mtime:
-                            try:
-                                os.utime(self.pkg_path, (remote_mtime, remote_mtime))
-                            except OSError:
-                                pass
+        if not bintree._remote_has_index:
+            return
+
+        remote_mtime = bintree._remotepkgs[
+            bintree.dbapi._instance_key(self.pkg.cpv)
+        ].get("_mtime_")
+        if remote_mtime is None:
+            return
+
+        try:
+            remote_mtime = int(remote_mtime)
+            local_mtime = os.stat(self.pkg_path)[stat.ST_MTIME]
+            if remote_mtime != local_mtime:
+                os.utime(self.pkg_path, (remote_mtime, remote_mtime))
+        except OSError:
+            pass
 
     def async_lock(self):
         """

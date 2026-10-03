@@ -2,14 +2,13 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import logging
+import os
 import shlex
 import subprocess
 
 import portage
-from portage import os
-from portage.util import writemsg_level
-
 from portage.sync.syncbase import NewBase
+from portage.util import writemsg_level
 
 
 class MercurialSync(NewBase):
@@ -42,8 +41,7 @@ class MercurialSync(NewBase):
             return (1, False)
 
         sync_uri = self.repo.sync_uri
-        if sync_uri.startswith("file://"):
-            sync_uri = sync_uri[7:]
+        sync_uri = sync_uri.removeprefix("file://")
 
         hg_cmd_opts = ""
         if self.repo.module_specific_options.get("sync-mercurial-env"):
@@ -80,7 +78,7 @@ class MercurialSync(NewBase):
 
         exitcode = portage.process.spawn(
             shlex.split(hg_cmd),
-            cwd=portage._unicode_encode(self.repo.location),
+            cwd=self.repo.location.encode("utf-8", "backslashreplace"),
             **self.spawn_kwargs,
         )
         if exitcode != os.EX_OK:
@@ -132,12 +130,12 @@ class MercurialSync(NewBase):
 
         rev_cmd = [self.bin_command, "id", "--id", "--rev", "tip"]
         previous_rev = subprocess.check_output(
-            rev_cmd, cwd=portage._unicode_encode(self.repo.location)
+            rev_cmd, cwd=self.repo.location.encode("utf-8", "backslashreplace")
         )
 
         exitcode = portage.process.spawn(
             shlex.split(hg_cmd),
-            cwd=portage._unicode_encode(self.repo.location),
+            cwd=self.repo.location.encode("utf-8", "backslashreplace"),
             **self.spawn_kwargs,
         )
         if exitcode != os.EX_OK:
@@ -147,7 +145,7 @@ class MercurialSync(NewBase):
             return (exitcode, False)
 
         current_rev = subprocess.check_output(
-            rev_cmd, cwd=portage._unicode_encode(self.repo.location)
+            rev_cmd, cwd=self.repo.location.encode("utf-8", "backslashreplace")
         )
 
         return (os.EX_OK, current_rev != previous_rev)
@@ -160,11 +158,9 @@ class MercurialSync(NewBase):
         try:
             ret = (
                 os.EX_OK,
-                portage._unicode_decode(
-                    subprocess.check_output(
-                        rev_cmd, cwd=portage._unicode_encode(self.repo.location)
-                    )
-                ),
+                subprocess.check_output(
+                    rev_cmd, cwd=self.repo.location.encode("utf-8", "backslashreplace")
+                ).decode("utf-8", "replace"),
             )
         except subprocess.CalledProcessError:
             ret = (1, False)

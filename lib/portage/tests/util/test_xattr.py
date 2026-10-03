@@ -3,14 +3,12 @@
 
 """Tests for the portage.util._xattr module"""
 
+import subprocess
 from unittest import mock
 
-import subprocess
-
-import portage
 from portage.tests import TestCase
-from portage.util._xattr import xattr as _xattr, _XattrSystemCommands, _XattrStub
-
+from portage.util._xattr import _XattrStub, _XattrSystemCommands
+from portage.util._xattr import xattr as _xattr
 
 orig_popen = subprocess.Popen
 
@@ -25,7 +23,7 @@ def MockSubprocessPopen(stdin):
     """
     # pylint: disable=protected-access
     proc = orig_popen(["cat"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
-    proc.stdin.write(portage._unicode_encode(stdin, portage._encodings["stdio"]))
+    proc.stdin.write(stdin.encode("utf-8", "backslashreplace"))
     return proc
 
 

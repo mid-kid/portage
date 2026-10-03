@@ -1,9 +1,9 @@
 # Copyright 2012-2023 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 import threading
 
-from portage import os
 from _emerge.AbstractPollTask import AbstractPollTask
 
 
@@ -20,7 +20,7 @@ class PipeReaderBlockingIO(AbstractPollTask):
     support in The Future (TM) may be possible.
     """
 
-    __slots__ = ("input_files", "_read_data", "_terminate", "_threads", "_thread_rlock")
+    __slots__ = ("_read_data", "_terminate", "_thread_rlock", "_threads", "input_files")
 
     def _start(self):
         self._terminate = threading.Event()

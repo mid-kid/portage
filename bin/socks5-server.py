@@ -3,25 +3,22 @@
 # Copyright 2015-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import asyncio
-import errno
+import locale
 import os
-import socket
-import struct
 import sys
 
-if hasattr(asyncio, "ensure_future"):
-    # Python >=3.4.4.
-    asyncio_ensure_future = asyncio.ensure_future
-else:
-    # getattr() necessary because async is a keyword in Python >=3.7.
-    asyncio_ensure_future = getattr(asyncio, "async")
+if (
+    sys.getfilesystemencoding().lower() != "utf-8"
+    or locale.getpreferredencoding(False).lower() != "utf-8"
+):
+    os.environ["PYTHONUTF8"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
-try:
-    current_task = asyncio.current_task
-except AttributeError:
-    # Deprecated since Python 3.7
-    current_task = asyncio.Task.current_task
+
+import asyncio
+import errno
+import socket
+import struct
 
 
 class Socks5Server:
@@ -157,8 +154,8 @@ class Socks5Server:
 
             # otherwise, start two loops:
             # remote -> local...
-            t = asyncio_ensure_future(
-                self.handle_proxied_conn(proxied_reader, writer, current_task())
+            t = asyncio.ensure_future(
+                self.handle_proxied_conn(proxied_reader, writer, asyncio.current_task())
             )
 
             # and local -> remote...

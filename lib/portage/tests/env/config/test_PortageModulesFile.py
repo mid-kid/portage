@@ -1,10 +1,11 @@
 # Copyright 2006-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-from portage import os
-from portage.tests import TestCase
-from portage.env.config import PortageModulesFile
+import os
 from tempfile import mkstemp
+
+from portage.env.config import PortageModulesFile
+from portage.tests import TestCase
 
 
 class PortageModulesFileTestCase(TestCase):

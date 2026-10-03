@@ -2,33 +2,29 @@
 # Distributed under the terms of the GNU General Public License v2
 
 from portage.cache.mappings import UserDict
-from portage.proxy.objectproxy import ObjectProxy
-from portage.localization import _
+from portage.const import VCS_DIRS
 from portage.exception import (
-    InvalidAtom,
-    PortageException,
     FileNotFound,
+    InvalidAtom,
     InvalidLocation,
     OperationNotPermitted,
     ParseError,
     PermissionDenied,
+    PortageException,
     ReadOnlyFileSystem,
 )
-from portage.const import VCS_DIRS
-from portage import _unicode_decode
-from portage import _unicode_encode
-from portage import _os_merge
-from portage import _encodings
-from portage import os
+from portage.localization import _
+from portage.proxy.objectproxy import ObjectProxy
 
 __all__ = [
+    "ConfigProtect",
+    "LazyItemsDict",
     "apply_permissions",
     "apply_recursive_permissions",
     "apply_secpass_permissions",
     "apply_stat_permissions",
     "atomic_ofstream",
     "cmp_sort_key",
-    "ConfigProtect",
     "dump_traceback",
     "ensure_dirs",
     "find_updated_config_files",
@@ -40,11 +36,11 @@ __all__ = [
     "grabfile_package",
     "grablines",
     "initialize_logger",
-    "LazyItemsDict",
     "map_dictlist_vals",
     "new_protect_filename",
+    "no_color",
     "normalize_path",
-    "pickle_read",
+    "split_interned",
     "stack_dictlist",
     "stack_dicts",
     "stack_lists",
@@ -56,15 +52,13 @@ __all__ = [
     "writemsg",
     "writemsg_level",
     "writemsg_stdout",
-    "no_color",
 ]
 
-from contextlib import AbstractContextManager
-from copy import deepcopy
 import errno
+import glob
 import io
-from itertools import chain, filterfalse
 import logging
+import os
 import re
 import shlex
 import stat
@@ -72,12 +66,28 @@ import string
 import sys
 import tempfile
 import traceback
-import glob
+from contextlib import AbstractContextManager
+from copy import deepcopy
+from functools import lru_cache
+from itertools import chain, filterfalse
 from typing import Optional, TextIO
 
 import portage
 
 noiselimit = 0
+
+
+@lru_cache(maxsize=4096)
+def split_interned(value: str) -> tuple:
+    """
+    Split a whitespace separated metadata value, interning the tokens.
+
+    Metadata like IUSE and USE repeats the same flag names in thousands of
+    packages, and str.split() creates a new string object for every one of
+    them. Interning the tokens makes all of those packages share a single
+    instance of each flag name.
+    """
+    return tuple(sys.intern(token) for token in value.split())
 
 
 def initialize_logger(level=logging.WARNING) -> None:
@@ -105,13 +115,11 @@ def writemsg(mystr: str, noiselevel: int = 0, fd: Optional[TextIO] = None) -> No
     if noiselevel <= noiselimit:
         # avoid potential UnicodeEncodeError
         if isinstance(fd, io.TextIOBase):
-            mystr = _unicode_decode(
-                mystr, encoding=_encodings["content"], errors="replace"
-            )
+            if isinstance(mystr, bytes):
+                if isinstance(mystr, bytes):
+                    mystr = mystr.decode("utf-8", "replace")
         else:
-            mystr = _unicode_encode(
-                mystr, encoding=_encodings["stdio"], errors="backslashreplace"
-            )
+            mystr = mystr.encode("utf-8", "backslashreplace")
             if fd in (sys.stdout, sys.stderr):
                 fd = fd.buffer
         fd.write(mystr)
@@ -160,7 +168,7 @@ def normalize_path(mypath) -> str:
     return os.path.normpath(mypath)
 
 
-def grabfile(myfilename, compat_level=0, recursive=0, remember_source_file=False):
+def grabfile(myfilename, recursive=0, remember_source_file=False):
     """This function grabs the lines in a file, normalizes whitespace and returns lines in a list; if a line
     begins with a #, it is ignored, as are empty lines"""
 
@@ -184,19 +192,7 @@ def grabfile(myfilename, compat_level=0, recursive=0, remember_source_file=False
         if not myline:
             continue
         if myline[0] == "#":
-            # Check if we have a compat-level string. BC-integration data.
-            # '##COMPAT==>N<==' 'some string attached to it'
-            mylinetest = myline.split("<==", 1)
-            if len(mylinetest) == 2:
-                myline_potential = mylinetest[1]
-                mylinetest = mylinetest[0].split("##COMPAT==>")
-                if len(mylinetest) == 2:
-                    if compat_level >= int(mylinetest[1]):
-                        # It's a compat line, and the key matches.
-                        newlines.append(myline_potential)
-                continue
-            else:
-                continue
+            continue
         if remember_source_file:
             newlines.append((myline, source_file))
         else:
@@ -252,7 +248,7 @@ def stack_dictlist(original_dicts, incremental=0, incrementals=[], ignore_none=0
         if mydict is None:
             continue
         for y in mydict:
-            if not y in final_dict:
+            if y not in final_dict:
                 final_dict[y] = []
 
             for thing in mydict[y]:
@@ -261,9 +257,9 @@ def stack_dictlist(original_dicts, incremental=0, incrementals=[], ignore_none=0
                         if thing == "-*":
                             final_dict[y] = []
                             continue
-                        elif thing[:1] == "-":
+                        elif str(thing)[:1] == "-":
                             try:
-                                final_dict[y].remove(thing[1:])
+                                final_dict[y].remove(str(thing)[1:])
                             except ValueError:
                                 pass
                             continue
@@ -336,19 +332,20 @@ def stack_lists(
             if incremental:
                 if token == "-*":
                     new_list.clear()
-                elif token[:1] == "-":
+                elif str(token).startswith("-"):
                     matched = False
-                    if ignore_repo and not "::" in token:
+                    if ignore_repo and "::" not in token:
                         # Let -cat/pkg remove cat/pkg::repo.
                         to_be_removed = []
-                        token_slice = token[1:]
+                        token_str = str(token)
+                        token_slice = token_str[1:]
                         for atom in new_list:
                             atom_without_repo = atom
                             if atom.repo is not None:
                                 # Atom.without_repo instantiates a new Atom,
                                 # which is unnecessary here, so use string
                                 # replacement instead.
-                                atom_without_repo = atom.replace(
+                                atom_without_repo = str(atom).replace(
                                     "::" + atom.repo, "", 1
                                 )
                             if atom_without_repo == token_slice:
@@ -359,7 +356,7 @@ def stack_lists(
                                 new_list.pop(atom)
                     else:
                         try:
-                            new_list.pop(token[1:])
+                            new_list.pop(str(token)[1:])
                             matched = True
                         except KeyError:
                             pass
@@ -474,8 +471,8 @@ def read_corresponding_eapi_file(filename, default="0"):
     eapi = None
     try:
         with open(
-            _unicode_encode(eapi_file, encoding=_encodings["fs"], errors="strict"),
-            encoding=_encodings["repo.content"],
+            eapi_file,
+            encoding="utf-8",
             errors="replace",
         ) as f:
             lines = f.readlines()
@@ -565,7 +562,6 @@ def grabdict_package(
 
 def grabfile_package(
     myfilename,
-    compatlevel=0,
     recursive=0,
     allow_wildcard=False,
     allow_repo=False,
@@ -577,9 +573,7 @@ def grabfile_package(
 ):
     from portage.dep import Atom
 
-    pkgs = grabfile(
-        myfilename, compatlevel, recursive=recursive, remember_source_file=True
-    )
+    pkgs = grabfile(myfilename, recursive=recursive, remember_source_file=True)
     if not pkgs:
         return pkgs
     if verify_eapi and eapi is None:
@@ -682,12 +676,12 @@ def grablines(myfilename, recursive=0, remember_source_file=False):
     else:
         try:
             with open(
-                _unicode_encode(myfilename, encoding=_encodings["fs"], errors="strict"),
-                encoding=_encodings["content"],
+                myfilename,
+                encoding="utf-8",
                 errors="replace",
             ) as myfile:
                 if remember_source_file:
-                    mylines = [(line, myfilename) for line in myfile.readlines()]
+                    mylines = [(line, myfilename) for line in myfile]
                 else:
                     mylines = myfile.readlines()
         except OSError as e:
@@ -719,7 +713,7 @@ class _getconfig_shlex(shlex.shlex):
         self.__portage_tolerant = portage_tolerant
 
     def allow_sourcing(self, var_expand_map):
-        self.source = portage._native_string("source")
+        self.source = "source"
         self.var_expand_map = var_expand_map
 
     def sourcehook(self, newfile):
@@ -785,8 +779,8 @@ def getconfig(
     f = None
     try:
         f = open(
-            _unicode_encode(mycfg, encoding=_encodings["fs"], errors="strict"),
-            encoding=_encodings["content"],
+            mycfg,
+            encoding="utf-8",
             errors="replace",
         )
         content = f.read()
@@ -802,19 +796,15 @@ def getconfig(
         if f is not None:
             f.close()
 
-    # Since this file has unicode_literals enabled, and Python 2's
-    # shlex implementation does not support unicode, the following code
-    # uses _native_string() to encode unicode literals when necessary.
-
     # Workaround for avoiding a silent error in shlex that is
     # triggered by a source statement at the end of the file
     # without a trailing newline after the source statement.
-    if content and content[-1] != portage._native_string("\n"):
-        content += portage._native_string("\n")
+    if content and content[-1] != "\n":
+        content += "\n"
 
     # Warn about dos-style line endings since that prevents
     # people from being able to source them with bash.
-    if portage._native_string("\r") in content:
+    if "\r" in content:
         writemsg(
             (
                 "!!! "
@@ -836,22 +826,20 @@ def getconfig(
         lex = _getconfig_shlex(
             instream=content, infile=mycfg, posix=True, portage_tolerant=tolerant
         )
-        lex.wordchars = portage._native_string(
-            string.digits + string.ascii_letters + r"~!@#$%*_\:;?,./-+{}"
-        )
-        lex.quotes = portage._native_string("\"'")
+        lex.wordchars = string.digits + string.ascii_letters + r"~!@#$%*_\:;?,./-+{}"
+        lex.quotes = "\"'"
         if allow_sourcing:
             lex.allow_sourcing(expand_map)
 
         while True:
-            key = _unicode_decode(lex.get_token())
+            key = lex.get_token()
             if key == "export":
-                key = _unicode_decode(lex.get_token())
+                key = lex.get_token()
             if key is None:
                 # normal end of file
                 break
 
-            equ = _unicode_decode(lex.get_token())
+            equ = lex.get_token()
             if not equ:
                 msg = lex.error_leader() + _("Unexpected EOF")
                 if not tolerant:
@@ -868,7 +856,7 @@ def getconfig(
                     writemsg(f"{msg}\n", noiselevel=-1)
                     return mykeys
 
-            val = _unicode_decode(lex.get_token())
+            val = lex.get_token()
             if val is None:
                 msg = lex.error_leader() + _(
                     "Unexpected end of config file: variable '%s'"
@@ -893,7 +881,7 @@ def getconfig(
                 expand_map[key] = mykeys[key]
             else:
                 mykeys[key] = val
-    except SystemExit as e:
+    except SystemExit:
         raise
     except Exception as e:
         if isinstance(e, ParseError) or lex is None:
@@ -1038,34 +1026,6 @@ def varexpand(mystring, mydict=None, error_leader=None):
             pos += 1
 
     return "".join(newstring)
-
-
-# broken and removed, but can still be imported
-pickle_write = None
-
-
-def pickle_read(filename, default=None, debug=0):
-    import pickle
-
-    if not os.access(filename, os.R_OK):
-        writemsg(_("pickle_read(): File not readable. '") + filename + "'\n", 1)
-        return default
-    data = None
-    try:
-        myf = open(
-            _unicode_encode(filename, encoding=_encodings["fs"], errors="strict"), "rb"
-        )
-        mypickle = pickle.Unpickler(myf)
-        data = mypickle.load()
-        myf.close()
-        del mypickle, myf
-        writemsg(_("pickle_read(): Loaded pickle. '") + filename + "'\n", 1)
-    except SystemExit as e:
-        raise
-    except Exception as e:
-        writemsg(_("!!! Failed to load pickle: ") + str(e) + "\n", 1)
-        data = default
-    return data
 
 
 def dump_traceback(msg, noiselevel=1):
@@ -1438,7 +1398,7 @@ class atomic_ofstream(AbstractContextManager, ObjectProxy):
             open_func = open
         else:
             open_func = io.open
-            kargs.setdefault("encoding", _encodings["content"])
+            kargs.setdefault("encoding", "utf-8")
             kargs.setdefault("errors", "backslashreplace")
 
         if follow_links:
@@ -1743,7 +1703,7 @@ class LazyItemsDict(UserDict):
         return result
 
     class _LazyItem:
-        __slots__ = ("func", "pargs", "kwargs", "singleton")
+        __slots__ = ("func", "kwargs", "pargs", "singleton")
 
         def __init__(self, func, pargs, kwargs, singleton):
             if not pargs:
@@ -1786,8 +1746,6 @@ class ConfigProtect:
     def updateprotect(self):
         """Update internal state for isprotected() calls.  Nonexistent paths
         are ignored."""
-
-        os = _os_merge
 
         self.protect = []
         self._dirs = set()
@@ -1870,8 +1828,6 @@ def new_protect_filename(mydest, newmd5=None, force=False):
     # ._cfg0000_foo
     # 0123456789012
 
-    os = _os_merge
-
     prot_num = -1
     last_pfile = ""
 
@@ -1911,18 +1867,12 @@ def new_protect_filename(mydest, newmd5=None, force=False):
                 try:
                     # Read symlink target as bytes, in case the
                     # target path has a bad encoding.
-                    pfile_link = os.readlink(
-                        _unicode_encode(
-                            old_pfile, encoding=_encodings["merge"], errors="strict"
-                        )
-                    )
-                except OSError:
+                    pfile_link = os.readlink(old_pfile.encode("utf-8", "strict"))
+                except OSError as e:
                     if e.errno != errno.ENOENT:
                         raise
                 else:
-                    pfile_link = _unicode_decode(
-                        pfile_link, encoding=_encodings["merge"], errors="replace"
-                    )
+                    pfile_link = pfile_link.decode("utf-8", "replace")
                     if pfile_link == newmd5:
                         return old_pfile
             else:
@@ -1949,7 +1899,7 @@ def find_updated_config_files(target_root, config_protect):
     """
     import subprocess
 
-    encoding = _encodings["fs"]
+    encoding = "utf-8"
 
     if config_protect:
         # directories with some protect files in them
@@ -1986,13 +1936,11 @@ def find_updated_config_files(target_root, config_protect):
             mycommand += " ! -name '.*~' ! -iname '.*.bak' -print0"
             cmd = shlex.split(mycommand)
 
-            cmd = [
-                _unicode_encode(arg, encoding=encoding, errors="strict") for arg in cmd
-            ]
+            cmd = [arg for arg in cmd]
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
             )
-            output = _unicode_decode(proc.communicate()[0], encoding=encoding)
+            output = proc.communicate()[0].decode("utf-8", "replace")
             status = proc.wait()
             if os.WIFEXITED(status) and os.WEXITSTATUS(status) == os.EX_OK:
                 files = output.split("\0")

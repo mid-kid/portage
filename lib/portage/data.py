@@ -40,8 +40,6 @@ if not lchown:
 
         lchown()
 
-lchown = portage._unicode_func_wrapper(lchown)
-
 
 def _target_eprefix():
     """
@@ -133,6 +131,7 @@ _initialized_globals = set()
 
 def _get_global(k):
     import subprocess
+
     from portage.output import colorize
     from portage.util import writemsg
     from portage.util.path import first_existing
@@ -226,11 +225,7 @@ def _get_global(k):
             # Get a list of group IDs for the portage user. Do not use
             # grp.getgrall() since it is known to trigger spurious
             # SIGPIPE problems with nss_ldap.
-            encoding = portage._encodings["content"]
-            cmd = (
-                portage._unicode_encode(x, encoding=encoding, errors="strict")
-                for x in ("id", "-G", _portage_username)
-            )
+            cmd = (x for x in ("id", "-G", _portage_username))
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
             )
@@ -244,9 +239,7 @@ def _get_global(k):
                     except ValueError:
                         return None
 
-                unicode_decode = portage._unicode_decode(
-                    myoutput, encoding=encoding, errors="strict"
-                )
+                unicode_decode = myoutput.decode("utf-8", "strict")
                 checked_v = (check(x) for x in unicode_decode.split())
                 filtered_v = (x for x in checked_v if x)
                 v = sorted(set(filtered_v))
@@ -336,13 +329,13 @@ def _init(settings):
 
         v = settings.get("PORTAGE_GRPNAME", "portage")
         if native_string:
-            v = portage._native_string(v)
+            v = v
         globals()["_portage_grpname"] = v
         _initialized_globals.add("_portage_grpname")
 
         v = settings.get("PORTAGE_USERNAME", "portage")
         if native_string:
-            v = portage._native_string(v)
+            v = v
         globals()["_portage_username"] = v
         _initialized_globals.add("_portage_username")
 

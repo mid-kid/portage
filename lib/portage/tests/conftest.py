@@ -2,21 +2,23 @@
 # Copyright 2006-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import importlib
 import grp
+import importlib
+import math
 import os
 import os.path as osp
 import pwd
-import signal
-import tempfile
 import shutil
+import signal
+import subprocess
 import sys
+import tempfile
 
 import pytest
 
 import portage
-from portage.util._eventloop.global_event_loop import global_event_loop
 from portage.const import PORTAGE_BIN_PATH
+from portage.util._eventloop.global_event_loop import global_event_loop
 
 
 def debug_signal(signum, frame):
@@ -26,6 +28,57 @@ def debug_signal(signum, frame):
 
 
 signal.signal(signal.SIGUSR1, debug_signal)
+
+
+_GOLDEN_RATIO_CONJUGATE = (math.sqrt(5) - 1) / 2
+
+
+def pytest_collection_modifyitems(config, items):
+    """
+    Under pytest-xdist, spread the tests of each module evenly across the
+    collection, so that the expensive tests, which are clustered in a few
+    modules, do not end up queued back to back on one worker.
+    """
+    if not hasattr(config, "workerinput"):
+        return
+
+    by_module = {}
+    for item in items:
+        by_module.setdefault(item.nodeid.partition("::")[0], []).append(item)
+
+    keyed = []
+    for m, module_items in enumerate(by_module.values()):
+        # Offset modules by multiples of the golden ratio, so that those
+        # with only a few tests do not all land at the same positions.
+        offset = (m * _GOLDEN_RATIO_CONJUGATE) % 1.0
+        n = len(module_items)
+        for i, item in enumerate(module_items):
+            keyed.append(((i + offset) / n, item))
+
+    # Every worker must compute the same order, as xdist requires.
+    keyed.sort(key=lambda k: k[0])
+    items[:] = [item for _, item in keyed]
+
+
+@pytest.fixture(autouse=True, scope="session")
+def metadata_cache(request, tmp_path_factory):
+    """
+    Share generated ebuild metadata between the playgrounds of this test
+    run, including those of other xdist workers.
+    """
+    from portage.tests.resolver.ResolverPlayground import ResolverPlayground
+
+    basetemp = tmp_path_factory.getbasetemp()
+    if hasattr(request.config, "workerinput"):
+        # Each worker has its own basetemp below the one of the run.
+        basetemp = basetemp.parent
+    cache_dir = basetemp / "metadata-cache"
+    cache_dir.mkdir(mode=0o700, exist_ok=True)
+    ResolverPlayground.metadata_cache_dir = str(cache_dir)
+    try:
+        yield
+    finally:
+        ResolverPlayground.metadata_cache_dir = None
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -66,10 +119,10 @@ def prepare_environment():
         path.insert(0, PORTAGE_BIN_PATH)
         os.environ["PATH"] = ":".join(path)
 
-    try:
-        # Copy GnuPG test keys to temporary directory
-        gpg_path = tempfile.mkdtemp(prefix="gpg_")
+    # Copy GnuPG test keys to temporary directory
+    gpg_path = tempfile.mkdtemp(prefix="gpg_")
 
+    try:
         shutil.copytree(
             os.path.join(os.path.dirname(os.path.realpath(__file__)), ".gnupg"),
             gpg_path,
@@ -83,6 +136,17 @@ def prepare_environment():
 
     finally:
         global_event_loop().close()
+        # Signing spawns a gpg-agent and scdaemon which daemonize, so they
+        # outlive the test session unless they are shut down here.
+        try:
+            subprocess.run(
+                ["gpgconf", "--homedir", gpg_path, "--kill", "all"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            # No gpgconf, so no agent can have been started either.
+            pass
         shutil.rmtree(gpg_path, ignore_errors=True)
 
 

@@ -1,13 +1,12 @@
 # Copyright 2012-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import gzip
 import errno
+import gzip
 
-from portage import _encodings
-from portage import _unicode_encode
 from portage.util import writemsg_level
 from portage.util.futures._asyncio.streams import _writer
+
 from ..SlotObject import SlotObject
 
 
@@ -86,7 +85,7 @@ class SchedulerInterface(SlotObject):
             writemsg_level(msg, level=level, noiselevel=noiselevel)
 
         if log_file is not None:
-            await _writer(log_file, _unicode_encode(msg))
+            await _writer(log_file, msg.encode("utf-8", "backslashreplace"))
 
     def output(self, msg, log_path=None, background=None, level=0, noiselevel=-1):
         """
@@ -112,9 +111,7 @@ class SchedulerInterface(SlotObject):
         if log_path is not None:
             try:
                 f = open(
-                    _unicode_encode(
-                        log_path, encoding=_encodings["fs"], errors="strict"
-                    ),
+                    log_path,
                     mode="ab",
                 )
                 f_real = f
@@ -131,7 +128,7 @@ class SchedulerInterface(SlotObject):
                     # instead of unicode.
                     f = gzip.GzipFile(filename="", mode="ab", fileobj=f)
 
-                f.write(_unicode_encode(msg))
+                f.write(msg.encode("utf-8", "backslashreplace"))
                 f.close()
                 if f_real is not f:
                     f_real.close()

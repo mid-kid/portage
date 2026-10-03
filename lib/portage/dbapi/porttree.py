@@ -1,46 +1,42 @@
 # Copyright 1998-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-__all__ = ["close_portdbapi_caches", "FetchlistDict", "portagetree", "portdbapi"]
+__all__ = ["FetchlistDict", "close_portdbapi_caches", "portagetree", "portdbapi"]
+
+import collections
+import contextlib
+import errno
+import os
+import shlex
+import threading
+import traceback
+import warnings
+from collections import OrderedDict
+from collections.abc import Sequence
+from typing import Optional, Union
+from urllib.parse import urlparse
+
+from _emerge.EbuildMetadataPhase import EbuildMetadataPhase
 
 import portage
-
+from portage import _eapi_is_deprecated, eapi_is_supported, eclass_cache
 from portage.cache import volatile
 from portage.cache.cache_errors import CacheError
 from portage.cache.mappings import Mapping
 from portage.dbapi import dbapi
 from portage.exception import (
-    PortageException,
-    PortageKeyError,
     FileNotFound,
     InvalidAtom,
     InvalidData,
     InvalidDependString,
     InvalidPackageName,
+    PortageException,
+    PortageKeyError,
 )
 from portage.localization import _
-
-from portage import eclass_cache, eapi_is_supported, _eapi_is_deprecated
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
 from portage.util.futures import asyncio
 from portage.util.futures.iter_completed import iter_gather
-from _emerge.EbuildMetadataPhase import EbuildMetadataPhase
-
-import contextlib
-import os as _os
-import threading
-import traceback
-import warnings
-import errno
-import shlex
-
-import collections
-from collections import OrderedDict
-from collections.abc import Sequence
-from typing import Optional, Union
-from urllib.parse import urlparse
+from portage.versions import pkgsplit
 
 
 def close_portdbapi_caches():
@@ -86,8 +82,11 @@ portage.process.atexit_register(close_portdbapi_caches)
 
 class _dummy_list(list):
     def remove(self, item):
-        # TODO: Trigger a DeprecationWarning here, after stable portage
-        # has dummy portdbapi_instances.
+        warnings.warn(
+            "_dummy_list.remove() is no longer necessary for portdbapi_instances; drop the call",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         try:
             list.remove(self, item)
         except ValueError:
@@ -174,33 +173,8 @@ class portdbapi(dbapi):
     def _categories(self):
         return self.settings.categories
 
-    @property
-    def porttree_root(self):
-        warnings.warn(
-            "portage.dbapi.porttree.portdbapi.porttree_root is deprecated in favor of portage.repository.config.RepoConfig.location "
-            "(available as repositories[repo_name].location attribute of instances of portage.dbapi.porttree.portdbapi class)",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.settings.repositories.mainRepoLocation()
-
-    @property
-    def eclassdb(self):
-        warnings.warn(
-            "portage.dbapi.porttree.portdbapi.eclassdb is deprecated in favor of portage.repository.config.RepoConfig.eclass_db "
-            "(available as repositories[repo_name].eclass_db attribute of instances of portage.dbapi.porttree.portdbapi class)",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        main_repo = self.repositories.mainRepo()
-        if main_repo is None:
-            return None
-        return main_repo.eclass_db
-
-    def __init__(self, _unused_param=DeprecationWarning, mysettings=None):
+    def __init__(self, mysettings=None):
         """
-        @param _unused_param: deprecated, use mysettings['PORTDIR'] instead
-        @type _unused_param: None
         @param mysettings: an immutable config instance
         @type mysettings: portage.config
         """
@@ -214,16 +188,6 @@ class portdbapi(dbapi):
             self.settings = mysettings
         else:
             self.settings = config(clone=portage.settings)
-
-        if _unused_param is not DeprecationWarning:
-            warnings.warn(
-                "The first parameter of the "
-                + "portage.dbapi.porttree.portdbapi"
-                + " constructor is unused since portage-2.1.8. "
-                + "mysettings['PORTDIR'] is used instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
         self.repositories = self.settings.repositories
         self.treemap = self.repositories.treemap
@@ -431,9 +395,10 @@ class portdbapi(dbapi):
         if not hasattr(self, "auxdb"):
             # unhandled exception thrown from constructor
             return
-        for x in self.auxdb:
-            self.auxdb[x].sync()
-        self.auxdb.clear()
+        for caches in (self.auxdb, self._ro_auxdb):
+            for x in caches.values():
+                x.close()
+            caches.clear()
 
     def flush_cache(self):
         for x in self.auxdb.values():
@@ -521,8 +486,6 @@ class portdbapi(dbapi):
         the file we wanted.
         If myrepo is not None it will find packages from this repository(overlay)
         """
-        from portage.versions import pkgsplit
-
         if not mycpv:
             return (None, 0)
 
@@ -563,11 +526,8 @@ class portdbapi(dbapi):
 
         # For optimal performance in this hot spot, we do manual unicode
         # handling here instead of using the wrapped os module.
-        encoding = _encodings["fs"]
-        errors = "strict"
-
         relative_path = (
-            mysplit[0] + _os.sep + psplit[0] + _os.sep + mysplit[1] + ".ebuild"
+            mysplit[0] + os.sep + psplit[0] + os.sep + mysplit[1] + ".ebuild"
         )
 
         # There is no need to access the filesystem when the package
@@ -579,13 +539,11 @@ class portdbapi(dbapi):
             and myrepo == getattr(mycpv, "repo", None)
             and self is getattr(mycpv, "_db", None)
         ):
-            return (mytree + _os.sep + relative_path, mytree)
+            return (mytree + os.sep + relative_path, mytree)
 
         for x in mytrees:
-            filename = x + _os.sep + relative_path
-            if _os.access(
-                _unicode_encode(filename, encoding=encoding, errors=errors), _os.R_OK
-            ):
+            filename = x + os.sep + relative_path
+            if os.access(filename, os.R_OK):
                 return (filename, x)
         return (None, 0)
 
@@ -853,6 +811,11 @@ class portdbapi(dbapi):
             proc.cancel()
             raise
 
+        if proc.returncode == 2:
+            from portage.exception import CorruptionKeyError
+
+            raise CorruptionKeyError(mycpv)
+
         return proc
 
     def _aux_get_return(
@@ -885,7 +848,7 @@ class portdbapi(dbapi):
 
         return returnme
 
-    def getFetchMap(self, mypkg, useflags=None, mytree=None):
+    def getFetchMap(self, mypkg, useflags=None, mytree=None, only_restricted=False):
         """
         Get the SRC_URI metadata as a dict which maps each file name to a
         set of alternative URIs.
@@ -904,10 +867,18 @@ class portdbapi(dbapi):
         """
         loop = self._event_loop
         return loop.run_until_complete(
-            self.async_fetch_map(mypkg, useflags=useflags, mytree=mytree, loop=loop)
+            self.async_fetch_map(
+                mypkg,
+                useflags=useflags,
+                mytree=mytree,
+                loop=loop,
+                only_restricted=only_restricted,
+            )
         )
 
-    def async_fetch_map(self, mypkg, useflags=None, mytree=None, loop=None):
+    def async_fetch_map(
+        self, mypkg, useflags=None, mytree=None, loop=None, only_restricted=False
+    ):
         """
         Asynchronous form of getFetchMap.
 
@@ -946,7 +917,7 @@ class portdbapi(dbapi):
                     result.set_exception(aux_get_future.exception())
                 return
 
-            eapi, myuris = aux_get_future.result()
+            eapi, myuris, restrict = aux_get_future.result()
 
             if not eapi_is_supported(eapi):
                 # Convert this to an InvalidDependString exception
@@ -961,14 +932,19 @@ class portdbapi(dbapi):
             try:
                 result.set_result(
                     _parse_uri_map(
-                        mypkg, {"EAPI": eapi, "SRC_URI": myuris}, use=useflags
+                        mypkg,
+                        {"EAPI": eapi, "SRC_URI": myuris, "RESTRICT": restrict},
+                        use=useflags,
+                        only_restricted=only_restricted,
                     )
                 )
             except Exception as e:
                 result.set_exception(e)
 
         aux_get_future = asyncio.ensure_future(
-            self.async_aux_get(mypkg, ["EAPI", "SRC_URI"], mytree=mytree, loop=loop),
+            self.async_aux_get(
+                mypkg, ["EAPI", "SRC_URI", "RESTRICT"], mytree=mytree, loop=loop
+            ),
             loop,
         )
         result.add_done_callback(
@@ -977,7 +953,9 @@ class portdbapi(dbapi):
         aux_get_future.add_done_callback(aux_get_done)
         return result
 
-    def getfetchsizes(self, mypkg, useflags=None, debug=0, myrepo=None):
+    def getfetchsizes(
+        self, mypkg, useflags=None, debug=0, myrepo=None, only_restricted=False
+    ):
         from portage.package.ebuild.fetch import _download_suffix
         from portage.util import writemsg
 
@@ -995,7 +973,9 @@ class portdbapi(dbapi):
                 writemsg(_("[empty/missing/bad digest]: %s\n") % (mypkg,))
             return {}
         filesdict = {}
-        myfiles = self.getFetchMap(mypkg, useflags=useflags, mytree=mytree)
+        myfiles = self.getFetchMap(
+            mypkg, useflags=useflags, mytree=mytree, only_restricted=only_restricted
+        )
         # XXX: maybe this should be improved: take partial downloads
         # into account? check checksums?
         for myfile in myfiles:
@@ -1135,9 +1115,7 @@ class portdbapi(dbapi):
             trees = self.porttrees
         for x in categories:
             for oroot in trees:
-                for y in listdir(
-                    oroot + "/" + x, EmptyOnError=1, ignorecvs=1, dirsonly=1
-                ):
+                for y in listdir(oroot + "/" + x, ignorecvs=1, dirsonly=1):
                     try:
                         atom = Atom(f"{x}/{y}")
                     except InvalidAtom:
@@ -1152,7 +1130,7 @@ class portdbapi(dbapi):
 
     def cp_list(self, mycp, use_cache=1, mytree=None):
         from portage.util import writemsg
-        from portage.versions import pkgsplit, ver_regexp, _pkg_str
+        from portage.versions import _pkg_str, ver_regexp
 
         # NOTE: Cache can be safely shared with the match cache, since the
         # match cache uses the result from dep_expand for the cache_key.
@@ -1337,7 +1315,7 @@ class portdbapi(dbapi):
                 or list of _pkg_str (depends on level)
         """
         from portage.dbapi.dep_expand import dep_expand
-        from portage.dep import match_from_list, _match_slot
+        from portage.dep import _match_slot, match_from_list
         from portage.versions import _pkg_str
 
         mydep = dep_expand(origdep, mydb=self, settings=self.settings)
@@ -1569,16 +1547,10 @@ class portdbapi(dbapi):
 
 
 class portagetree:
-    def __init__(
-        self, root=DeprecationWarning, virtual=DeprecationWarning, settings=None
-    ):
+    def __init__(self, settings=None):
         """
         Constructor for a PortageTree
 
-        @param root: deprecated, defaults to settings['ROOT']
-        @type root: String/Path
-        @param virtual: UNUSED
-        @type virtual: No Idea
         @param settings: Portage Configuration object (portage.settings)
         @type settings: Instance of portage.config
         """
@@ -1587,64 +1559,10 @@ class portagetree:
             settings = portage.settings
         self.settings = settings
 
-        if root is not DeprecationWarning:
-            warnings.warn(
-                "The root parameter of the "
-                + "portage.dbapi.porttree.portagetree"
-                + " constructor is now unused. Use "
-                + "settings['ROOT'] instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-        if virtual is not DeprecationWarning:
-            warnings.warn(
-                "The 'virtual' parameter of the "
-                "portage.dbapi.porttree.portagetree"
-                " constructor is unused",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-        self.__virtual = virtual
         self.dbapi = portdbapi(mysettings=settings)
 
-    @property
-    def portroot(self):
-        """Deprecated. Use the portdbapi getRepositoryPath method instead."""
-        warnings.warn(
-            "The portroot attribute of "
-            "portage.dbapi.porttree.portagetree is deprecated. Use the "
-            "portdbapi getRepositoryPath method instead.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return self.settings["PORTDIR"]
-
-    @property
-    def root(self):
-        warnings.warn(
-            "The root attribute of "
-            + "portage.dbapi.porttree.portagetree"
-            + " is deprecated. Use "
-            + "settings['ROOT'] instead.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return self.settings["ROOT"]
-
-    @property
-    def virtual(self):
-        warnings.warn(
-            "The 'virtual' attribute of "
-            + "portage.dbapi.porttree.portagetree"
-            + " is deprecated.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return self.__virtual
-
     def dep_bestmatch(self, mydep):
+        # FIXME: DeprecationWarning?
         "compatibility method"
         mymatch = self.dbapi.xmatch("bestmatch-visible", mydep)
         if mymatch is None:
@@ -1652,6 +1570,7 @@ class portagetree:
         return mymatch
 
     def dep_match(self, mydep):
+        # FIXME: DeprecationWarning?
         "compatibility method"
         mymatch = self.dbapi.xmatch("match-visible", mydep)
         if mymatch is None:
@@ -1665,23 +1584,6 @@ class portagetree:
         """new behavior: these are all *unmasked* nodes.  There may or may not be available
         masked package for nodes in this nodes list."""
         return self.dbapi.cp_all()
-
-    def getname(self, pkgname):
-        """Deprecated. Use the portdbapi findname method instead."""
-        from portage.versions import pkgsplit
-
-        warnings.warn(
-            "The getname method of "
-            "portage.dbapi.porttree.portagetree is deprecated. "
-            "Use the portdbapi findname method instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if not pkgname:
-            return ""
-        mysplit = pkgname.split("/")
-        psplit = pkgsplit(mysplit[1])
-        return "/".join([self.portroot, mysplit[0], psplit[0], mysplit[1]]) + ".ebuild"
 
     def getslot(self, mycatpkg):
         "Get a slot for a catpkg; assume it exists."
@@ -1815,8 +1717,15 @@ def _async_manifest_fetchlist(
     return result
 
 
-def _parse_uri_map(cpv, metadata, use=None):
+def _parse_uri_map(cpv, metadata, use=None, only_restricted=False):
     from portage.dep import use_reduce
+
+    restricted = only_restricted and "fetch" in use_reduce(
+        metadata.get("RESTRICT", ""),
+        uselist=use,
+        matchall=(use is None),
+        eapi=metadata["EAPI"],
+    )
 
     myuris = use_reduce(
         metadata.get("SRC_URI", ""),
@@ -1831,6 +1740,10 @@ def _parse_uri_map(cpv, metadata, use=None):
     myuris.reverse()
     while myuris:
         uri = myuris.pop()
+
+        if restricted and (uri.startswith("mirror+") or uri.startswith("fetch+")):
+            continue
+
         if myuris and myuris[-1] == "->":
             myuris.pop()
             distfile = myuris.pop()

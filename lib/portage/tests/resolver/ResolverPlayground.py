@@ -3,32 +3,20 @@
 
 import bz2
 import fnmatch
+import glob
+import hashlib
+import os
+import shutil
 import subprocess
 import tempfile
-import portage
-
 from itertools import permutations
-from portage import os
-from portage import shutil
-from portage.const import (
-    GLOBAL_CONFIG_PATH,
-    PORTAGE_BIN_PATH,
-    USER_CONFIG_PATH,
-    SUPPORTED_GENTOO_BINPKG_FORMATS,
-)
-from portage.process import find_binary
-from portage.dep import Atom, _repo_separator
-from portage.dbapi.bintree import binarytree
-from portage._sets import load_default_config
-from portage._sets.base import InternalPackageSet
-from portage.tests import cnf_path
-from portage.util import ensure_dirs, normalize_path
-from portage.versions import catsplit
-from portage.exception import InvalidBinaryPackageFormat
-from portage.gpg import GPG
 
 import _emerge
-from _emerge.actions import _calc_depclean, expand_set_arguments
+from _emerge.actions import (
+    _calc_depclean,
+    binpkg_selection_config,
+    expand_set_arguments,
+)
 from _emerge.Blocker import Blocker
 from _emerge.create_depgraph_params import create_depgraph_params
 from _emerge.DependencyArg import DependencyArg
@@ -39,6 +27,51 @@ from _emerge.depgraph import (
 from _emerge.Package import Package
 from _emerge.RootConfig import RootConfig
 
+import portage
+from portage._sets import load_default_config
+from portage._sets.base import InternalPackageSet
+from portage.const import (
+    GLOBAL_CONFIG_PATH,
+    PORTAGE_BIN_PATH,
+    SUPPORTED_GENTOO_BINPKG_FORMATS,
+    USER_CONFIG_PATH,
+)
+from portage.dbapi.bintree import binarytree
+from portage.dbapi.vartree import _in_metadata_file, _write_metadata_file
+from portage.dep import Atom, _repo_separator
+from portage.exception import InvalidBinaryPackageFormat
+from portage.gpg import GPG
+from portage.process import find_binary
+from portage.tests import cnf_path
+from portage.util import ensure_dirs, normalize_path
+from portage.versions import catsplit
+
+# Fixed mtime for binary packages created in a remote binhost, so that
+# they never collide with the local PKGDIR copies of the same packages
+# (see _create_binpkgs).
+_BINREPO_MTIME = 1000000000
+
+
+def _combine_repo_config(conf, lines):
+    merged = lines.copy()
+    for section in reversed(conf):
+        header = f"[{section}]"
+        if header in merged:
+            index = merged.index(header) + 1
+            conflicts = [any(l.startswith(k) for l in lines) for k in conf[section]]
+            if any(conflicts):
+                reserved = ",".join(conf[section].keys())
+                raise AssertionError(
+                    f"cannot override config attributes [{reserved}] set by ResolverPlayground"
+                )
+        else:
+            merged.insert(0, header)
+            index = 1
+        for entry in conf[section].items():
+            merged.insert(index, ("%s = %s" % entry))
+            index += 1
+    return merged
+
 
 class ResolverPlayground:
     """
@@ -46,6 +79,16 @@ class ResolverPlayground:
     the needed settings instances, etc. for the resolver to do
     its work.
     """
+
+    # Directory of metadata cache entries shared between playgrounds (see
+    # _iter_metadata_cache_entries). Set by the test suite's conftest; None
+    # disables sharing.
+    metadata_cache_dir = None
+
+    # Restore nothing from the cache, and check the files that egencache
+    # generates against the ones that would have been restored (see
+    # TEST-NOTES).
+    verify_metadata_cache = "PORTAGE_TEST_VERIFY_METADATA_CACHE" in os.environ
 
     config_files = frozenset(
         (
@@ -69,11 +112,11 @@ class ResolverPlayground:
             "package.use.stable",
             "package.use.stable.force",
             "package.use.stable.mask",
+            "repos.conf",
             "soname.provided",
             "use.force",
             "use.mask",
             "use.stable",
-            "layout.conf",
         )
     )
 
@@ -116,6 +159,7 @@ class ResolverPlayground:
         self,
         ebuilds={},
         binpkgs={},
+        binrepos={},
         installed={},
         profile={},
         repo_configs={},
@@ -124,9 +168,11 @@ class ResolverPlayground:
         world=[],
         world_sets=[],
         distfiles={},
+        patches={},
         eclasses={},
         eprefix=None,
         targetroot=False,
+        share_metadata=True,
         debug=False,
     ):
         """
@@ -134,6 +180,9 @@ class ResolverPlayground:
         installed: cpv -> metadata mapping simulating installed packages.
                 If a metadata key is missing, it gets a default value.
         profile: settings defined by the profile.
+        share_metadata: whether the metadata of the ebuilds may be shared
+                with other playgrounds (see TEST-NOTES). Pass False for a
+                test that exercises metadata generation itself.
         """
 
         self.debug = debug
@@ -223,6 +272,14 @@ class ResolverPlayground:
         self.vdbdir = os.path.join(self.eroot, "var/db/pkg")
         os.makedirs(self.vdbdir)
 
+        # A depcachedir entry names the eclass directory that it was
+        # generated from, which is specific to the playground, and the
+        # auxdb module decides which entries egencache writes at all, so
+        # neither kind of playground can share metadata with another.
+        self._share_metadata = (
+            share_metadata and not eclasses and "modules" not in user_config
+        )
+
         if not debug:
             portage.util.noiselimit = -2
 
@@ -230,19 +287,34 @@ class ResolverPlayground:
         # Make sure the main repo is always created
         self._get_repo_dir("test_repo")
 
+        self._binrepos = {}
+        for binrepo in binrepos:
+            self._get_binrepo_dir(binrepo)
+
         self._create_distfiles(distfiles)
         self._create_ebuilds(ebuilds)
         self._create_installed(installed)
         self._create_profile(
-            ebuilds, eclasses, installed, profile, repo_configs, user_config, sets
+            ebuilds,
+            eclasses,
+            installed,
+            profile,
+            repo_configs,
+            user_config,
+            sets,
+            patches,
         )
         self._create_world(world, world_sets)
 
         self.settings, self.trees = self._load_config()
 
         self.gpg = None
-        self._create_binpkgs(binpkgs)
+        self._create_binpkgs(self.pkgdir, binpkgs)
         self._create_ebuild_manifests(ebuilds)
+
+        for binrepo, binpkgs in binrepos.items():
+            binrepo_dir = self._get_binrepo_dir(binrepo)
+            self._create_binpkgs(binrepo_dir, binpkgs, mtime=_BINREPO_MTIME)
 
         portage.util.noiselimit = 0
 
@@ -278,6 +350,23 @@ class ResolverPlayground:
                 f.write(f"{repo}\n")
 
         return self._repositories[repo]["location"]
+
+    def _get_binrepo_dir(self, binrepo):
+        """
+        Create the binrepo directory if needed.
+        """
+        if binrepo not in self._binrepos:
+            self._binrepos["DEFAULT"] = {"frozen": "yes"}
+
+            repo_path = os.path.join(self.eroot, "var", "binrepos", binrepo)
+            self._binrepos[binrepo] = {"sync-uri": repo_path}
+
+            try:
+                os.makedirs(repo_path)
+            except OSError:
+                pass
+
+        return self._binrepos[binrepo]["sync-uri"]
 
     def _create_distfiles(self, distfiles):
         os.makedirs(self.distdir)
@@ -320,15 +409,154 @@ class ResolverPlayground:
                 if copyright_header is not None:
                     f.write(copyright_header)
                 f.write(f'EAPI="{eapi}"\n')
-                for k, v in metadata.items():
-                    f.write(f'{k}="{v}"\n')
+                f.writelines(f'{k}="{v}"\n' for k, v in metadata.items())
                 if misc_content is not None:
                     f.write(misc_content)
 
+    @staticmethod
+    def _digest_tree(digest, root, skip=()):
+        """
+        Update digest with the name and content of every file below root,
+        in a fixed order.
+        """
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for filename in sorted(filenames):
+                path = os.path.join(dirpath, filename)
+                if path in skip:
+                    continue
+                digest.update(os.path.relpath(path, root).encode() + b"\0")
+                with open(path, "rb") as f:
+                    digest.update(f.read())
+
+    def _iter_metadata_cache_entries(self, repo_name, ebuild_paths):
+        """
+        Yield (key, path, reused) for every file that egencache generates
+        for the repository: the depcachedir and md5-cache entry of each
+        ebuild, and the Manifest of each package directory. key identifies
+        what the file is generated from. reused is true only for the
+        depcachedir entries, which egencache validates and reuses rather
+        than rewriting.
+        """
+        repo_dir = self._repositories[repo_name]["location"]
+        dep_repo_dir = os.path.join(self.settings.depcachedir, repo_dir.lstrip(os.sep))
+        md5_cache_dir = os.path.join(repo_dir, "metadata", "md5-cache")
+        pkg_dirs = set()
+        for ebuild_path in ebuild_paths:
+            pkg_dir = os.path.dirname(ebuild_path)
+            pkg_dirs.add(pkg_dir)
+            cat = os.path.basename(os.path.dirname(pkg_dir))
+            pf = os.path.basename(ebuild_path)[: -len(".ebuild")]
+            with open(ebuild_path, "rb") as f:
+                content = f.read()
+            key = hashlib.sha256(
+                f"{repo_name}\0{cat}/{pf}\0".encode() + content
+            ).hexdigest()
+            yield f"{key}-dep", os.path.join(dep_repo_dir, cat, pf), True
+            yield f"{key}-md5", os.path.join(md5_cache_dir, cat, pf), False
+
+        # A Manifest covers every file of the package directory, and the
+        # distfiles that the ebuilds fetch.
+        distfiles = hashlib.sha256()
+        self._digest_tree(distfiles, self.distdir)
+        distfiles = distfiles.hexdigest()
+        for pkg_dir in sorted(pkg_dirs):
+            manifest_path = os.path.join(pkg_dir, "Manifest")
+            digest = hashlib.sha256()
+            digest.update(
+                f"{repo_name}\0{os.path.relpath(pkg_dir, repo_dir)}\0{distfiles}\0".encode()
+            )
+            self._digest_tree(digest, pkg_dir, skip=(manifest_path,))
+            yield f"{digest.hexdigest()}-manifest", manifest_path, False
+
+    @staticmethod
+    def _restore_cache_entries(entries):
+        for entry_path, entry in entries:
+            ensure_dirs(os.path.dirname(entry_path))
+            with open(entry_path, "wb") as f:
+                f.write(entry)
+
+    def _check_cache_entries(self, repo_name, repo_dir, ebuild_paths, cached, complete):
+        """
+        Raise unless the files that egencache has just generated for the
+        repository are the ones that the cache would have restored. Only a
+        complete cache is expected to account for every generated file, so
+        a partial one is checked for its own entries alone.
+        """
+        if complete:
+            generated = set()
+            for root in (
+                os.path.join(self.settings.depcachedir, repo_dir.lstrip(os.sep)),
+                os.path.join(repo_dir, "metadata", "md5-cache"),
+            ):
+                for dirpath, _dirnames, filenames in os.walk(root):
+                    generated.update(os.path.join(dirpath, x) for x in filenames)
+            for ebuild_path in ebuild_paths:
+                manifest_path = os.path.join(os.path.dirname(ebuild_path), "Manifest")
+                if os.path.exists(manifest_path):
+                    generated.add(manifest_path)
+
+            if generated != set(cached):
+                raise AssertionError(
+                    f"the cache of repository {repo_name} restores the wrong files: "
+                    f"missing {sorted(generated - set(cached))}, "
+                    f"unexpected {sorted(set(cached) - generated)}"
+                )
+        for entry_path, entry in cached.items():
+            with open(entry_path, "rb") as f:
+                generated_entry = f.read()
+            if entry != generated_entry:
+                raise AssertionError(
+                    f"the cache of {entry_path} differs from the generated file:\n"
+                    f"cached:    {entry!r}\n"
+                    f"generated: {generated_entry!r}"
+                )
+
     def _create_ebuild_manifests(self, ebuilds):
+        cache_dir = self.metadata_cache_dir if self._share_metadata else None
         for repo_name in self._repositories:
             if repo_name == "DEFAULT":
                 continue
+            repo_dir = self._repositories[repo_name]["location"]
+            ebuild_paths = glob.glob(os.path.join(repo_dir, "*", "*", "*.ebuild"))
+            if not ebuild_paths:
+                # egencache would only create an empty md5-cache directory.
+                ensure_dirs(os.path.join(repo_dir, "metadata", "md5-cache"))
+                continue
+
+            # Restore the files generated by earlier playgrounds. Seeding
+            # the depcachedir saves a depend phase, since egencache
+            # validates and reuses a seeded entry and regenerates a stale
+            # one. The other files are only worth restoring if egencache
+            # can be skipped altogether, which it can once every file of
+            # the repository is cached.
+            seed = []
+            restore = []
+            uncached = []
+            if cache_dir is not None:
+                for key, entry_path, reused in self._iter_metadata_cache_entries(
+                    repo_name, ebuild_paths
+                ):
+                    try:
+                        with open(os.path.join(cache_dir, key), "rb") as f:
+                            entry = f.read()
+                    except FileNotFoundError:
+                        uncached.append((key, entry_path))
+                        continue
+                    restore.append((entry_path, entry))
+                    if reused:
+                        seed.append((entry_path, entry))
+
+            complete = cache_dir is not None and not uncached
+            if complete and not self.verify_metadata_cache:
+                self._restore_cache_entries(restore)
+                continue
+
+            # In verification mode, restore nothing, so that egencache
+            # generates every file from scratch to be compared against.
+            if not self.verify_metadata_cache:
+                self._restore_cache_entries(seed)
+
             egencache_cmd = [
                 "egencache",
                 f"--repo={repo_name}",
@@ -348,10 +576,37 @@ class ResolverPlayground:
                     f"command failed with returncode {result.returncode}: {egencache_cmd}"
                 )
 
-    def _create_binpkgs(self, binpkgs):
+            if self.verify_metadata_cache and restore:
+                self._check_cache_entries(
+                    repo_name, repo_dir, ebuild_paths, dict(restore), complete
+                )
+
+            for key, entry_path in uncached:
+                try:
+                    with open(entry_path, "rb") as f:
+                        entry = f.read()
+                except FileNotFoundError:
+                    # No metadata, e.g. for an ebuild that dies.
+                    continue
+                # Write atomically, since playgrounds in other xdist
+                # workers may read the same entry concurrently.
+                fd, tmp_path = tempfile.mkstemp(dir=cache_dir)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(entry)
+                os.rename(tmp_path, os.path.join(cache_dir, key))
+
+    def _create_binpkgs(self, repo_dir, binpkgs, mtime=None):
         # When using BUILD_ID, there can be multiple instances for the
         # same cpv. Therefore, binpkgs may be an iterable instead of
         # a dict.
+        #
+        # A binary package instance is identified by
+        # (cpv, build_id, file_size, build_time, mtime), so a package created
+        # here in two different repositories differs only by file mtime.
+        # Callers creating a remote binhost pass an explicit mtime to keep
+        # those instances distinct from the local PKGDIR copies regardless of
+        # how the two creation times happen to fall relative to a one-second
+        # boundary.
         items = getattr(binpkgs, "items", None)
         items = items() if items is not None else binpkgs
         binpkg_format = self.settings.get(
@@ -378,7 +633,6 @@ class ResolverPlayground:
             metadata["PF"] = pf
             metadata["BINPKG_FORMAT"] = binpkg_format
 
-            repo_dir = self.pkgdir
             category_dir = os.path.join(repo_dir, cat)
             if "BUILD_ID" in metadata:
                 if binpkg_format == "xpak":
@@ -411,8 +665,11 @@ class ResolverPlayground:
             else:
                 raise InvalidBinaryPackageFormat(binpkg_format)
 
-            bintree = binarytree(pkgdir=self.pkgdir, settings=self.settings)
-            bintree.populate(force_reindex=True)
+            if mtime is not None:
+                os.utime(binpkg_path, (mtime, mtime))
+
+        bintree = binarytree(pkgdir=repo_dir, settings=self.settings)
+        bintree.populate(force_reindex=True)
 
     def _create_installed(self, installed):
         for cpv in installed:
@@ -448,9 +705,18 @@ class ResolverPlayground:
                 )
 
             metadata["repository"] = repo
+            metadata_kv = {}
             for k, v in metadata.items():
+                # Write the individual file for every field, the way a real
+                # merge does. The metadata file is a read optimization layered
+                # on top of them, not a replacement: both portage consumers
+                # (e.g. quickpkg, xpak binpkgs) and non-portage consumers
+                # (e.g. portage-utils, pkgcore) still read the per-field files
+                # directly.
                 with open(os.path.join(vdb_pkg_dir, k), "w") as f:
                     f.write(f"{v}\n")
+                if _in_metadata_file(k):
+                    metadata_kv[k] = str(v)
 
             ebuild_path = os.path.join(vdb_pkg_dir, a.cpv.split("/")[1] + ".ebuild")
             with open(ebuild_path, "w") as f:
@@ -463,8 +729,23 @@ class ResolverPlayground:
                 with open(ebuild_path, "rb") as inputfile:
                     f.write(inputfile.read())
 
+            # Written last: the metadata file records the package directory's
+            # mtime and is rejected if it no longer matches, so creating any
+            # further entry in the directory afterwards would invalidate it and
+            # leave tests silently exercising only the per-field fallback.
+            if metadata_kv:
+                _write_metadata_file(vdb_pkg_dir, metadata_kv)
+
     def _create_profile(
-        self, ebuilds, eclasses, installed, profile, repo_configs, user_config, sets
+        self,
+        ebuilds,
+        eclasses,
+        installed,
+        profile,
+        repo_configs,
+        user_config,
+        sets,
+        patches,
     ):
         user_config_dir = os.path.join(self.eroot, USER_CONFIG_PATH)
 
@@ -493,8 +774,7 @@ class ResolverPlayground:
 
             categories_file = os.path.join(profile_dir, "categories")
             with open(categories_file, "w") as f:
-                for cat in categories:
-                    f.write(cat + "\n")
+                f.writelines(cat + "\n" for cat in categories)
 
             # Create $REPO/profiles/license_groups
             license_file = os.path.join(profile_dir, "license_groups")
@@ -519,8 +799,7 @@ class ResolverPlayground:
                         ):
                             os.makedirs(os.path.dirname(file_name))
                     with open(file_name, "w") as f:
-                        for line in lines:
-                            f.write(f"{line}\n")
+                        f.writelines(f"{line}\n" for line in lines)
                         # Temporarily write empty value of masters until it becomes default.
                         # TODO: Delete all references to "# use implicit masters" when empty value becomes default.
                         if config_file == "layout.conf" and not any(
@@ -537,8 +816,7 @@ class ResolverPlayground:
                 with open(os.path.join(eclass_dir, f"{eclass_name}.eclass"), "w") as f:
                     if isinstance(eclass_content, str):
                         eclass_content = [eclass_content]
-                    for line in eclass_content:
-                        f.write(f"{line}\n")
+                    f.writelines(f"{line}\n" for line in eclass_content)
 
             # Temporarily write empty value of masters until it becomes default.
             if not repo_config or "layout.conf" not in repo_config:
@@ -578,8 +856,7 @@ class ResolverPlayground:
 
                         file_name = os.path.join(sub_profile_dir, config_file)
                         with open(file_name, "w") as f:
-                            for line in lines:
-                                f.write(f"{line}\n")
+                            f.writelines(f"{line}\n" for line in lines)
 
                 # Create profile symlink
                 os.symlink(
@@ -629,14 +906,24 @@ class ResolverPlayground:
         configs = user_config.copy()
         configs["make.conf"] = make_conf_lines
 
+        repos_conf_lines = list(user_config.get("repos.conf", ()))
+        configs["repos.conf"] = _combine_repo_config(
+            self._repositories, repos_conf_lines
+        )
+
+        if self._binrepos:
+            binrepos_conf_lines = list(user_config.get("binrepos.conf", ()))
+            configs["binrepos.conf"] = _combine_repo_config(
+                self._binrepos, binrepos_conf_lines
+            )
+
         for config_file, lines in configs.items():
             if config_file not in self.config_files:
                 raise ValueError(f"Unknown config file: '{config_file}'")
 
             file_name = os.path.join(user_config_dir, config_file)
             with open(file_name, "w") as f:
-                for line in lines:
-                    f.write(f"{line}\n")
+                f.writelines(f"{line}\n" for line in lines)
 
         # Create /usr/share/portage/config/make.globals
         make_globals_path = os.path.join(
@@ -649,6 +936,18 @@ class ResolverPlayground:
         default_sets_conf_dir = os.path.join(
             self.eroot, "usr/share/portage/config/sets"
         )
+
+        # user patches
+        for cpv, files in patches.items():
+            patch_dir = os.path.join(user_config_dir, "patches", cpv)
+            os.makedirs(patch_dir)
+            for patch in files:
+                patch_file = os.path.join(patch_dir, patch)
+                with open(patch_file, "wb") as f:
+                    text = files[patch]
+                    if isinstance(text, str):
+                        text = text.encode()
+                    f.write(text)
 
         try:
             os.makedirs(default_sets_conf_dir)
@@ -671,8 +970,7 @@ class ResolverPlayground:
         for sets_file, lines in sets.items():
             file_name = os.path.join(set_config_dir, sets_file)
             with open(file_name, "w") as f:
-                for line in lines:
-                    f.write(f"{line}\n")
+                f.writelines(f"{line}\n" for line in lines)
 
     def _create_world(self, world, world_sets):
         # Create /var/lib/portage/world
@@ -683,29 +981,20 @@ class ResolverPlayground:
         world_set_file = os.path.join(var_lib_portage, "world_sets")
 
         with open(world_file, "w") as f:
-            for atom in world:
-                f.write(f"{atom}\n")
+            f.writelines(f"{atom}\n" for atom in world)
 
         with open(world_set_file, "w") as f:
-            for atom in world_sets:
-                f.write(f"{atom}\n")
+            f.writelines(f"{atom}\n" for atom in world_sets)
 
     def _load_config(self):
         create_trees_kwargs = {}
         if self.target_root != os.sep:
             create_trees_kwargs["target_root"] = self.target_root
 
-        env = {
-            "PATH": f"{self.eprefix}/usr/sbin:{self.eprefix}/usr/bin:{os.environ['PATH']}",
-            "PORTAGE_REPOSITORIES": "\n".join(
-                "[%s]\n%s"
-                % (
-                    repo_name,
-                    "\n".join(f"{k} = {v}" for k, v in repo_config.items()),
-                )
-                for repo_name, repo_config in self._repositories.items()
-            ),
-        }
+        path = f"{self.eprefix}/usr/sbin:{self.eprefix}/usr/bin:{os.environ['PATH']}"
+        env = {"PATH": path}
+        with open(os.path.join(self.eprefix, USER_CONFIG_PATH, "repos.conf")) as f:
+            env["PORTAGE_REPOSITORIES"] = f.read()
 
         if self.debug:
             env["PORTAGE_DEBUG"] = "1"
@@ -734,8 +1023,17 @@ class ResolverPlayground:
             elif options.get("--prune"):
                 action = "prune"
 
-        if "--usepkgonly" in options:
+        if options.get("--getbinpkgonly") is True:
+            options["--getbinpkg"] = True
+            options["--usepkgonly"] = True
+
+        if options.get("--getbinpkg") is True:
             options["--usepkg"] = True
+
+        if options.get("--usepkgonly") is True:
+            options["--usepkg"] = True
+
+        binpkg_selection_config(options, self.settings)
 
         global_noiselimit = portage.util.noiselimit
         global_emergelog_disable = _emerge.emergelog._disable
@@ -743,6 +1041,14 @@ class ResolverPlayground:
             if not self.debug:
                 portage.util.noiselimit = -2
             _emerge.emergelog._disable = True
+
+            if self._binrepos:
+                self.trees[self.eroot]["bintree"].populate(
+                    getbinpkgs=options.get("--getbinpkg", False),
+                    getbinpkg_exclude=options.get("--getbinpkg-exclude", None),
+                    getbinpkg_include=options.get("--getbinpkg-include", None),
+                    pretend=options.get("--pretend", False),
+                )
 
             # NOTE: frozen_config could be cached and reused if options and params were constant.
             params_action = (
@@ -848,7 +1154,7 @@ class ResolverPlaygroundTestCase:
     def compare_with_result(self, result):
         checks = dict.fromkeys(result.checks)
         for key, value in self._checks.items():
-            if not key in checks:
+            if key not in checks:
                 raise KeyError(f"Not an available check: '{key}'")
             checks[key] = value
 
@@ -866,10 +1172,10 @@ class ResolverPlaygroundTestCase:
                     if got:
                         new_got = []
                         for cpv in got:
-                            if cpv[:1] == "!":
+                            if str(cpv)[:1] == "!":
                                 new_got.append(cpv)
                                 continue
-                            new_got.append(cpv.split(_repo_separator)[0])
+                            new_got.append(str(cpv).split(_repo_separator)[0])
                         got = new_got
                     if expected:
                         new_expected = []
@@ -941,7 +1247,7 @@ class ResolverPlaygroundTestCase:
                             if not got.index(node1) < got.index(node2):
                                 fail_msgs.append(
                                     "atoms: ("
-                                    + ", ".join(result.atoms)
+                                    + ", ".join(str(a) for a in result.atoms)
                                     + "), key: "
                                     + (
                                         "merge_order_assertions, expected: %s"
@@ -978,13 +1284,43 @@ class ResolverPlaygroundTestCase:
                 # unsatisfied_deps can be a dict for depclean-like actions
                 expected = expected if isinstance(expected, dict) else set(expected)
 
-            elif key == "forced_rebuilds" and expected is not None:
+            elif (
+                key in ("forced_rebuilds", "cycle_suggestions") and expected is not None
+            ):
                 expected = {k: set(v) for k, v in expected.items()}
+
+            elif (
+                key
+                in (
+                    "circular_dependency_test_parents",
+                    "circular_dependency_masked_alternatives",
+                    "circular_dependency_search_truncated",
+                )
+                and expected is not None
+            ):
+                expected = set(expected)
+
+            elif key == "circular_dependency_message" and expected is not None:
+                # The expected value is a list of substrings that the
+                # rendered message has to contain.
+                missing = [x for x in expected if got is None or x not in got]
+                if missing:
+                    fail_msgs.append(
+                        "atoms: ("
+                        + ", ".join(str(a) for a in result.atoms)
+                        + "), key: "
+                        + key
+                        + ", missing: "
+                        + str(missing)
+                        + ", got: "
+                        + str(got)
+                    )
+                continue
 
             if got != expected:
                 fail_msgs.append(
                     "atoms: ("
-                    + ", ".join(result.atoms)
+                    + ", ".join(str(a) for a in result.atoms)
                     + "), key: "
                     + key
                     + ", expected: "
@@ -1014,9 +1350,12 @@ def _mergelist_str(x, depgraph):
         mergelist_str = x.cpv + build_id_str + repo_str
         if x.built:
             if x.operation == "merge":
-                desc = x.type_name
+                desc = [x.type_name]
             else:
-                desc = x.operation
+                desc = [x.operation]
+            if x.remote:
+                desc.append("remote")
+            desc = ",".join(desc)
             mergelist_str = f"[{desc}]{mergelist_str}"
         if x.root != depgraph._frozen_config._running_root.root:
             mergelist_str += "{targetroot}"
@@ -1032,6 +1371,10 @@ class ResolverPlaygroundResult:
         "unstable_keywords",
         "slot_collision_solutions",
         "circular_dependency_solutions",
+        "circular_dependency_message",
+        "circular_dependency_test_parents",
+        "circular_dependency_masked_alternatives",
+        "circular_dependency_search_truncated",
         "needed_p_mask_changes",
         "unsatisfied_deps",
         "forced_rebuilds",
@@ -1040,6 +1383,10 @@ class ResolverPlaygroundResult:
         "virtual_cycle",
     )
     optional_checks = (
+        "circular_dependency_message",
+        "circular_dependency_test_parents",
+        "circular_dependency_masked_alternatives",
+        "circular_dependency_search_truncated",
         "forced_rebuilds",
         "required_use_unsatisfied",
         "unsatisfied_deps",
@@ -1058,6 +1405,10 @@ class ResolverPlaygroundResult:
         self.needed_p_mask_changes = None
         self.slot_collision_solutions = None
         self.circular_dependency_solutions = None
+        self.circular_dependency_message = None
+        self.circular_dependency_test_parents = None
+        self.circular_dependency_masked_alternatives = None
+        self.circular_dependency_search_truncated = None
         self.unsatisfied_deps = frozenset()
         self.forced_rebuilds = None
         self.required_use_unsatisfied = None
@@ -1116,6 +1467,18 @@ class ResolverPlaygroundResult:
             self.circular_dependency_solutions = dict(
                 zip([x.cpv for x in sol.keys()], sol.values())
             )
+            self.circular_dependency_message = handler.circular_dep_message
+            self.circular_dependency_test_parents = {
+                pkg.cpv for pkg in handler.test_dep_parents
+            }
+            self.circular_dependency_search_truncated = {
+                pkg.cpv for pkg in handler.search_truncated
+            }
+            self.circular_dependency_masked_alternatives = {
+                alternative.cpv
+                for alternatives in handler.masked_alternatives.values()
+                for alternative in alternatives
+            }
 
         if self.depgraph._dynamic_config._unsatisfied_deps_for_display:
             self.unsatisfied_deps = {
@@ -1152,6 +1515,7 @@ class ResolverPlaygroundDepcleanResult:
         "req_pkg_count",
         "graph_order",
         "unsatisfied_deps",
+        "cycle_suggestions",
     )
     optional_checks = (
         "cleanlist",
@@ -1159,6 +1523,7 @@ class ResolverPlaygroundDepcleanResult:
         "req_pkg_count",
         "graph_order",
         "unsatisfied_deps",
+        "cycle_suggestions",
     )
 
     def __init__(self, atoms, rval, cleanlist, ordered, req_pkg_count, depgraph):
@@ -1170,6 +1535,12 @@ class ResolverPlaygroundDepcleanResult:
         self.graph_order = [
             _mergelist_str(node, depgraph) for node in depgraph._dynamic_config.digraph
         ]
+        self.cycle_suggestions = {
+            pkg.cpv: {member.cpv for member in members}
+            for pkg, members in (
+                depgraph._dynamic_config._depclean_cycle_suggestions.items()
+            )
+        }
         self.unsatisfied_deps = {}
         for dep in depgraph._dynamic_config._initially_unsatisfied_deps:
             if isinstance(dep.parent, Package):

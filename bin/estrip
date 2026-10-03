@@ -143,8 +143,7 @@ save_elf_debug() {
 			if (( has_feature[compressdebug] )); then
 				objcopy_flags+=( --compress-debug-sections )
 			fi
-			"${name_of[objcopy]}" "${objcopy_flags[@]}" "${src}" "${dst}" \
-			&& "${name_of[objcopy]}" --add-gnu-debuglink="${dst}" "${src}"
+			"${name_of[objcopy]}" "${objcopy_flags[@]}" "${src}" "${dst}"
 		fi
 
 		# Only do the following if the debug file was
@@ -171,8 +170,8 @@ save_elf_debug() {
 
 					# We need to process the splitdebug file too
 					# if we're doing it at this late juncture (bug #968220)
-					"${name_of[objcopy]}" --dump-section .note.gnu.build-id="${inode_link}_buildid" "${src}" \
-						&& "${name_of[objcopy]}" --update-section .note.gnu.build-id="${inode_link}_buildid" "${dst}"
+					"${name_of[objcopy]}" --dump-section .note.gnu.build-id="${inode_link}_buildid" "${src}" 2>/dev/null \
+						&& "${name_of[objcopy]}" --update-section .note.gnu.build-id="${inode_link}_buildid" "${dst}" 2>/dev/null
 					rm -f "${inode_link}_buildid"
 				elif ! contains_word buildid "${warned_for[debugedit]}"; then
 					warned_for[debugedit]+=" buildid"
@@ -198,6 +197,11 @@ save_elf_debug() {
 				__try_symlink "${dst_buildid_rel}" "${buildid_file}.debug"
 				__try_symlink "${src_buildid_rel}" "${buildid_file}"
 			fi
+		fi
+
+		if [[ -z ${splitdebug} ]] ; then
+			# Add debuglink last to avoid the salted build ID breaking the CRC.
+			"${name_of[objcopy]}" --add-gnu-debuglink="${dst}" "${src}"
 		fi
 	fi
 }
@@ -290,30 +294,6 @@ if  [[ ${USERLAND} == BSD ]]; then
 else
 	get_inode_number() {
 		stat -c '%i' "$1"
-	}
-fi
-
-if hash getfattr 2>/dev/null; then
-	dump_xattrs() {
-		getfattr -d -m - --absolute-names "$1"
-	}
-else
-	dump_xattrs() {
-		PYTHONPATH=${PORTAGE_PYTHONPATH:-${PORTAGE_PYM_PATH}} \
-		"${PORTAGE_PYTHON:-/usr/bin/python}" \
-		"${PORTAGE_BIN_PATH}/xattr-helper.py" --dump < <(echo -n "$1")
-	}
-fi
-
-if hash setfattr 2>/dev/null; then
-	restore_xattrs() {
-		setfattr --restore=-
-	}
-else
-	restore_xattrs() {
-		PYTHONPATH=${PORTAGE_PYTHONPATH:-${PORTAGE_PYM_PATH}} \
-		"${PORTAGE_PYTHON:-/usr/bin/python}" \
-		"${PORTAGE_BIN_PATH}/xattr-helper.py" --restore
 	}
 fi
 
@@ -451,6 +431,39 @@ set -- "${ED}"
 
 [[ ${KERNEL} == linux ]] && (( has_feature[xattr] ))
 do_preserve_xattr=$(( $? == 0 ))
+
+if (( do_preserve_xattr )); then
+	if hash getfattr 2>/dev/null; then
+		dump_xattrs() {
+			getfattr -d -m - --absolute-names "$1"
+		}
+	else
+		dump_xattrs() {
+			PYTHONPATH=${PORTAGE_PYTHONPATH:-${PORTAGE_PYM_PATH}} \
+			"${PORTAGE_PYTHON:-/usr/bin/python}" \
+			"${PORTAGE_BIN_PATH}/xattr-helper.py" --dump < <(echo -n "$1")
+		}
+	fi
+
+	if hash setfattr 2>/dev/null; then
+		# The --physical option is supported by >=sys-apps/attr-2.6.0.
+		if setfattr --help | grep -q -- --physical; then
+			restore_xattrs() {
+				setfattr -h -P --restore=-
+			}
+		else
+			restore_xattrs() {
+				setfattr -h --restore=-
+			}
+		fi
+	else
+		restore_xattrs() {
+			PYTHONPATH=${PORTAGE_PYTHONPATH:-${PORTAGE_PYM_PATH}} \
+			"${PORTAGE_PYTHON:-/usr/bin/python}" \
+			"${PORTAGE_BIN_PATH}/xattr-helper.py" --restore
+		}
+	fi
+fi
 
 # Determine the names of the tools that might subsequently be used. For several
 # of these, their ${CHOST}-prefixed variants are preferred, if found to exist.

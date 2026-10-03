@@ -1,16 +1,16 @@
 # Copyright 2010-2020 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+from portage._sets.base import InternalPackageSet
+from portage.dep import check_required_use
+from portage.output import colorize
+from portage.util import writemsg
+from portage.versions import vercmp
+
 from _emerge.AtomArg import AtomArg
 from _emerge.Package import Package
 from _emerge.PackageArg import PackageArg
 from _emerge.UseFlagDisplay import pkg_use_display
-
-from portage.dep import check_required_use
-from portage.output import colorize
-from portage._sets.base import InternalPackageSet
-from portage.util import writemsg
-from portage.versions import cpv_getversion, vercmp
 
 
 class slot_conflict_handler:
@@ -243,7 +243,7 @@ class slot_conflict_handler:
         Print all slot conflicts in a human readable way.
         """
         _pkg_use_enabled = self.depgraph._pkg_use_enabled
-        usepkgonly = "--usepkgonly" in self.myopts
+        usepkgonly = self.myopts.get("--usepkgonly") is True
         need_rebuild = {}
         verboseconflicts = "--verbose-conflicts" in self.myopts
         any_omitted_parents = False
@@ -410,8 +410,8 @@ class slot_conflict_handler:
                             for ppkg, atom, other_pkg in parents:
                                 if atom.cp in best_matches:
                                     cmp = vercmp(
-                                        cpv_getversion(atom.cpv),
-                                        cpv_getversion(best_matches[atom.cp][1].cpv),
+                                        atom.version,
+                                        best_matches[atom.cp][1].version,
                                     )
 
                                     if (
@@ -519,9 +519,7 @@ class slot_conflict_handler:
                         colored_idx = set()
                         if version:
                             op = atom.operator
-                            ver = None
-                            if atom.cp != atom.cpv:
-                                ver = cpv_getversion(atom.cpv)
+                            ver = atom.version
                             slot = atom.slot
                             sub_slot = atom.sub_slot
                             slot_operator = atom.slot_operator
@@ -665,10 +663,8 @@ class slot_conflict_handler:
                             if version_violated or slot_violated:
                                 self.is_a_version_conflict = True
 
-                            cur_line = "{} required by {} {}\n".format(
-                                atom_str,
-                                parent,
-                                use_display,
+                            cur_line = (
+                                f"{atom_str} required by {parent} {use_display}\n"
                             )
                             marker_line = ""
                             for ii in range(len(cur_line)):
@@ -829,7 +825,7 @@ class slot_conflict_handler:
                 if not atom.package:
                     continue
 
-                if ppkg in conflict_nodes and not ppkg in config:
+                if ppkg in conflict_nodes and ppkg not in config:
                     # The parent is part of a slot conflict itself and is
                     # not part of the current config.
                     continue
@@ -922,7 +918,7 @@ class slot_conflict_handler:
                 # to the same value as the installed package has it.
                 for flag in involved_flags:
                     if involved_flags[flag] == "enabled":
-                        if not flag in _pkg_use_enabled(pkg):
+                        if flag not in _pkg_use_enabled(pkg):
                             involved_flags[flag] = "contradiction"
                     elif involved_flags[flag] == "disabled":
                         if flag in _pkg_use_enabled(pkg):
@@ -1119,7 +1115,7 @@ class slot_conflict_handler:
         is_valid_solution = True
         for pkg in required_changes:
             for state in required_changes[pkg].values():
-                if not state in ("enabled", "disabled"):
+                if state not in ("enabled", "disabled"):
                     is_valid_solution = False
 
         if not is_valid_solution:

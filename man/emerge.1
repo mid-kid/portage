@@ -86,7 +86,8 @@ directory (see \fBportage\fR(5)). Note that a \fIset\fR
 is generally used in conjunction with \fB\-\-update\fR. When used as
 arguments to \fBemerge\fR sets have to be prefixed with \fB@\fR to be
 recognized. Use the \fB\-\-list\-sets\fR action to display a list of
-available package sets.
+available package sets.  In a presented merge plan, packages in \fBbold\fR
+are in a set (usually world).
 .TP
 .BR atom
 An \fIatom\fR describes bounds on a package that you wish to install.
@@ -251,6 +252,19 @@ Matches the search string against the description field as well as
 the package name.  \fBTake caution\fR as the descriptions are also
 matched as regular expressions.
 .TP
+.BR \-\-status
+Displays the packages that running \fBemerge\fR processes are currently
+building or merging, including the current ebuild phase and elapsed time.
+When the observed \fBemerge\fR also has FEATURES="cgroup" enabled, each
+package's CPU time, average parallelism, peak memory and I/O totals are
+shown alongside. The figures for a package that has finished building are
+those from the end of its build, so they do not drift while it waits to
+merge.
+.br
+This requires the target \fBemerge\fR to have been started with
+FEATURES="observability" (see \fBmake.conf\fR(5)). For machine\-readable
+output, use \fBportageq jobs \-\-json\fR instead.
+.TP
 .BR \-\-sync
 Updates repositories, for which auto\-sync, sync\-type and sync\-uri attributes are
 set in repos.conf. A list of repos or aliases can be specified, in which case
@@ -325,9 +339,8 @@ you want emerge to alert you when it is finished. If you use
 \fBemerge -auAD world\fR, emerge will courteously point out when it has
 finished calculating the graph.
 
-\fB--alert\fR may be 'y' or 'n'. 'true' and 'false' mean the same thing.
-Using \fB--alert\fR without an option is the same as using it with 'y'.
-Try it with 'emerge -aA sys-apps/portage'.
+\fB--alert\fR may be 'y' or 'n'. Using \fB--alert\fR without an option is the
+same as using it with 'y'. Try it with 'emerge -aA sys-apps/portage'.
 
 If your terminal emulator is set up to make '\\a' into a window manager
 urgency hint, move your cursor to a different window to get the effect.
@@ -461,6 +474,14 @@ If \fB\-\-binpkg\-respect\-use\fR is given explicitly,
 then it implies \fB\-\-autounmask\-use=n\fR, because these options
 naturally oppose each other.
 .TP
+.BR "\-\-binpkg\-respect\-user\-patches [ y | n ]"
+Tells emerge to ignore binary packages for which user patches do not match
+the current configuration (see \fBportage\fR(5)). Enabled by default (even
+with \fB\-\-usepkgonly\fR) to prevent binary packages from potentially
+reverting user patches. If disabled, emerge can use both binary packages
+which revert user patches and those built with user patches not in the
+current configuraiton.
+.TP
 .BR "\-\-buildpkg [ y | n ]" ", " \-b
 Tells emerge to build binary packages for all ebuilds processed in
 addition to actually merging the packages.  Useful for maintainers
@@ -510,6 +531,15 @@ changed since installation. This option also implies the
 \fB\-\-changed\-use\fR option does not trigger reinstallation when
 flags that the user has not enabled are added or removed.
 .TP
+.BR "\-\-circular\-deps\-report [ text | json ]"
+Selects the format of the circular dependency report. The default,
+\fItext\fR, is the human readable report. With \fIjson\fR, the cycles,
+the USE flags responsible for each edge, the suggested USE changes, the
+packages whose test dependencies are involved, any masked packages that
+could be used instead and the packages whose search for a USE change was
+given up on are written to stdout as a JSON object, for consumption by
+automated tools.
+.TP
 .BR "\-\-color < y | n >"
 Enable or disable color output.  This option will override \fINO_COLOR\fR
 and \fINOCOLOR\fR (see \fBmake.conf\fR(5)) and may also be used to force
@@ -545,10 +575,12 @@ version will change (upgrade or downgrade). This option is enabled by default.
 Set the \fBPORTAGE_CONFIGROOT\fR environment variable.
 .TP
 .BR \-\-debug ", " \-d
-Tells emerge to run the emerge command in \fB\-\-debug\fR mode.  In this
-mode the bash build environment will run with the \-x option, causing
-it to output verbose debugging information to stdout.  This also enables
-a plethora of other output (mostly dependency resolution messages).
+Tells emerge to run the emerge command in \fB\-\-debug\fR mode.  In this mode
+the bash build environment will run with the \-x option, causing it to output
+verbose debugging information to stdout.  It also enables a plethora of other
+output (mostly dependency resolution messages), and suppresses the
+\%dependency-\:\%calculation spinner, including the static notice that is
+otherwise displayed by \fB\-\-nospinner\fR.
 .TP
 .BR "\-\-deep [DEPTH]" ", " \-D
 This flag forces
@@ -622,15 +654,35 @@ it is automatically disabled for regular expression searches. Fuzzy
 search is slightly slower than non\-fuzzy search.
 .TP
 .BR "\-\-getbinpkg [ y | n ]" ", " \-g
-Using the server and location defined in \fIPORTAGE_BINHOST\fR (see
-\fBmake.conf\fR(5)), portage will download the information from each binary
-package found and it will use that information to help build the dependency
-list.  This option implies \fB\-k\fR.  (Use \fB\-gK\fR for binary\-only
-merging.)
+Using the server and location defined in \fBbinrepos.conf\fR
+(see \fBportage\fR(5)) or the legacy \fIPORTAGE_BINHOST\fR
+(see \fBmake.conf\fR(5)), Portage will download the information from each
+binary package found and it will use that information to help build the
+dependency list.  This option implies \fB\-k\fR.  (Use \fB\-gK\fR for
+binary\-only merging.)
 .TP
 .BR "\-\-getbinpkgonly [ y | n ]" ", " \-G
 This option is identical to \fB\-g\fR, as above, except binaries from the
 remote server are preferred over local packages if they are not identical.
+Implies \fB\-\-binpkg\-respect\-use=n\fR.  Implies \fB\-\-usepkgonly\fR.
+.TP
+.BR "\-\-getbinpkg\-exclude " ATOMS
+A space separated list of package names or slot atoms. Emerge will not fetch
+matching remote binary packages. This option only influences fetching of
+remote binary packages, local binary packages are still considered even if
+listed here. To define an explicit binary package blacklist use
+\fB\-\-usepkg\-exclude\fR instead, which also affects remote binaries when
+\fB-g\fR is used.  There is also experimental support for this option in
+\fBbinrepos.conf\fR (see \fBportage\fR(5)).
+.TP
+.BR "\-\-getbinpkg\-include " ATOMS
+A space separated list of package names or slot atoms. Emerge will not fetch
+non-matching remote binary packages. This option only influences fetching of
+remote binary packages, local binary packages are still considered even if
+not listed here. To define an explicit binary package whitelist use
+\fB\-\-usepkg\-include\fR instead, which also affects remote binaries when
+\fB-g\fR is used.  There is also experimental support for this option in
+\fBbinrepos.conf\fR (see \fBportage\fR(5)).
 .TP
 .BR \-\-ignore-default-opts
 Causes \fIEMERGE_DEFAULT_OPTS\fR (see \fBmake.conf\fR(5)) to be ignored.
@@ -679,15 +731,20 @@ effects of disabling this option is to allow the \-\-jobs option to
 spawn jobs without accounting for the possibility of implicit dependencies
 on packages that belong to the @system set. This option interacts with
 the \fImerge\-wait\fR and \fIparallel\-install\fR features as discussed
-in the \fBmake.conf\fR(5) man page.
+in the \fBmake.conf\fR(5) man page. See also the
+\fB\-\-merge\-wait\-scope\fR option, which narrows the set of packages that
+other packages are assumed to implicitly depend on, rather than dropping
+the assumption entirely.
 .TP
 .BR \-j\ [JOBS] ", "  \-\-jobs[=JOBS]
 Specifies the number of packages to build simultaneously. If this option is
 given without an argument, emerge will not limit the number of jobs that can
 run simultaneously.  If 0 is given as argument, emerge will limit the jobs to
-the number of processors.  Also see the related \fB\-\-load\-average\fR option.
+the number of processors.  Using 'n' as argument can be used to disable this
+setting.  Also see the related \fB\-\-load\-average\fR option.
 Similarly to the \-\-quiet\-build option, the \-\-jobs option causes all
-build output to be redirected to logs.
+build output to be redirected to logs, unless there is only one package
+to emerge.
 Note that interactive packages currently force a setting
 of \fI\-\-jobs=1\fR. This issue can be temporarily avoided
 by specifying \fI\-\-accept\-properties=\-interactive\fR.
@@ -712,6 +769,34 @@ This option is recommended for use in combination with \fB\-\-jobs\fR in
 order to avoid excess load. See \fBmake\fR(1) for information about
 analogous options that should be configured via \fBMAKEOPTS\fR in
 \fBmake.conf\fR(5).
+.TP
+.BR "\-\-merge\-wait\-scope < deep | system | toolchain | none >"
+Specifies which packages are treated as system packages for the purpose of
+merge\-wait, i.e. merged only while no build jobs are running, and never in
+parallel with another merge even when \fIparallel\-install\fR is enabled.
+Dependencies on system packages are frequently unspecified, so merging them
+while unrelated builds are in flight risks random build failures.
+.br
+\fBdeep\fR (the default) selects the \fB@system\fR set together with its
+transitive runtime dependencies, which on a typical installation is around
+a quarter of all packages. \fBsystem\fR selects only the \fB@system\fR set
+itself, \fBtoolchain\fR only the core toolchain, and \fBnone\fR nothing at
+all. Narrowing the scope trades away the protection described above.
+.br
+Note that this option does not disable the \fImerge\-wait\fR feature, which
+is enabled by default and holds back every package regardless of this
+setting. Since a package which is held back can only be merged once every
+build slot has gone idle, each one acts as a barrier which limits
+parallelism, and the effect grows with \fB\-\-jobs\fR. Narrowing the scope therefore only increases parallelism for
+packages which are not held back anyway, so it is most useful together with
+\fBFEATURES="\-merge\-wait"\fR, which leaves only system packages held back,
+or with \fBFEATURES="parallel\-install"\fR, which merges the packages outside
+the scope in parallel batches. See \fBmake.conf\fR(5).
+.br
+\fB\-\-merge\-wait\-scope=none\fR resembles
+\fB\-\-implicit\-system\-deps=n\fR, but affects only the scheduler. Unlike
+\fB\-\-implicit\-system\-deps=n\fR, it does not change the dependency
+calculation.
 .TP
 .BR "\-\-misspell\-suggestions < y | n >"
 Enable or disable misspell suggestions. By default, emerge will show
@@ -741,6 +826,13 @@ been added to or removed from IUSE, see the related
 \fB\-\-changed\-use\fR option. If you would like to skip rebuilds for
 specific packages, see the \fB\-\-exclude\fR option.
 .TP
+.BR \-\-nobindeps
+Prefer ebuilds for any dependencies and select binary packages only for the
+atoms or sets requested for install, i.e. those named on the command line. Has
+no effect unless \fB-k\fR is also used or implied. Both \fB--usepkg-exclude\fR
+and \fB--usepkg-include\fR are ignored when this option is used, as are the
+usepkg-exclude and usepkg-include attributes in \fBrepos.conf\fR.
+.TP
 .BR \-\-noconfmem
 Causes portage to disregard merge records indicating that a config file
 inside of a \fBCONFIG_PROTECT\fR directory has been merged already.  Portage
@@ -768,6 +860,10 @@ terminal device is determined to be a TTY.  This flag disables it regardless.
 .BR "\-\-usepkg\-exclude " ATOMS
 A space separated list of package names or slot atoms. Emerge will ignore
 matching binary packages.
+.TP
+.BR "\-\-usepkg\-include " ATOMS
+A space separated list of package names or slot names. Emerge will ignore
+non\-matching binary packages.
 .TP
 .BR "\-\-rebuild\-exclude " ATOMS
 A space separated list of package names or slot atoms. Emerge will not rebuild
@@ -851,6 +947,7 @@ r	reinstall (forced for some reason, possibly due to slot or sub\-slot)
 R	replacing (remerging same version)
 F	fetch restricted (must be manually downloaded)
 f	fetch restricted (already downloaded)
+g	remote binary (automatically download from binhost)
 I	interactive (requires user input)
 B	blocked by another package (unresolved conflict)
 b	blocked by another package (automatically resolved conflict)
@@ -896,7 +993,10 @@ Note that interactive packages currently force all build output to
 be displayed on stdout. This issue can be temporarily avoided
 by specifying \fI\-\-accept\-properties=\-interactive\fR.
 Further, note that disabling \fI\-\-quiet\-build\fR has no effect if
-\fI\-\-jobs\fR is set to anything higher than 1.
+\fI\-\-jobs\fR is set to anything higher than one and there is more than
+one package to emerge.  If there is only one package to emerge, build
+output will be displayed on stdout unless \fI\-\-quiet\fR or
+\fI\-\-quiet\-build\fR is enabled.
 .TP
 .BR "\-\-quiet\-fail [ y | n ]"
 Suppresses display of the build log on stdout when build output is hidden
@@ -1081,16 +1181,18 @@ packages must be available at the time of dependency calculation or emerge
 will simply abort.  Portage does not use ebuild repositories when calculating
 dependency information so all masking information is ignored.  Like \fB\-k\fR
 above, this option implies \fB\-\-with\-bdeps=n\fR.  To include build time
-dependencies, \fB\-\-with\-bdeps=y\fR must be specified explicitly.
+dependencies, \fB\-\-with\-bdeps=y\fR must be specified explicitly. Implies
+\fB\-\-binpkg\-respect\-use=n\fR.
 .TP
 .BR "\-\-usepkg\-exclude\-live [ y | n ]"
 Tells emerge to not install from binary packages for live ebuilds.
 .TP
 .BR "\-\-verbose [ y | n ]" ", " \-v
 Tell emerge to run in verbose mode.  Currently this flag causes emerge to print
-out GNU info errors, if any, and to show the USE flags that will be used for
-each package when pretending. The following symbols are affixed to USE flags
-in order to indicate their status:
+out GNU info errors, if any, to echo the cgroup resource usage summary to the
+terminal when running in background mode (requires FEATURES="cgroup"), and to
+show the USE flags that will be used for each package when pretending.  The
+following symbols are affixed to USE flags in order to indicate their status:
 
 .TS
 l l l
@@ -1107,6 +1209,10 @@ Symbol	Location	Meaning
 .BR \-\-verbose\-conflicts
 Make slot conflicts more verbose. Note that this may in some cases output
 hundreds of packages for slot conflicts.
+.TP
+.BR "\-\-verbose\-missing\-ebuilds [ y | n ]"
+Warn on packages in the world file with no ebuild available, which can
+prevent subslot rebuilds.  The default is set to "y" (on).
 .TP
 .BR "\-\-verbose\-slot\-rebuilds [ y | n ]"
 Turns on/off the extra emerge output to list which packages are causing rebuilds.
@@ -1179,8 +1285,9 @@ Use \fBSYSROOT\fR to specify the target root filesystem to be used for
 merging the build dependencies satisfied by \fBDEPEND\fR.  This
 variable can be set via the \fB\-\-sysroot\fR option or in
 \fBmake.conf\fR(5) (the command line overrides other settings).  The
-value must either be / or equal to \fBROOT\fR.  When cross-compiling,
-only the latter is valid.
+value must be / (or empty) when \fBROOT\fR is / (or empty), although it
+should only be set to something other than / or \fBROOT\fR when
+cross-bootstrapping a new system from scratch.
 .br
 Defaults to /.
 .TP
@@ -1200,10 +1307,12 @@ explains the abbreviations.
 .TP
 .B [blocks B     ] app\-text/dos2unix ("app\-text/dos2unix" is blocking \
 app\-text/hd2u\-0.8.0)
-Dos2unix is Blocking hd2u from being emerged.  Blockers are defined when
+dos2unix is Blocking hd2u from being emerged.  Blockers are defined when
 two packages will clobber each others files, or otherwise cause some form
 of breakage in your system.  However, blockers usually do not need to be
 simultaneously emerged because they usually provide the same functionality.
+
+Lowercase \[dq]b\[rq] is for soft\-blockers, while uppercase \[dq]B\[rq] is for hard\-blockers.
 .TP
 .B [ebuild  N    ] app\-games/qstat\-25c
 Qstat is New to your system, and will be emerged for the first time.
@@ -1448,6 +1557,10 @@ analysis.  Portage provides no stability guarantee; any feature may
 disappear in the future, and the output format may change without
 prior notice.
 .TP
+.BR PORTAGE_MULTIPROCESSING_START_METHOD
+If this environment variable is set, then Portage will override the
+default Python multiprocessing start method with its value.
+.TP
 .BR PORTAGE_SHOW_LRU_CACHE_INFO
 If this environment variable is set, then Portage will display
 statistics about its internal LRU caches.
@@ -1455,6 +1568,47 @@ statistics about its internal LRU caches.
 .BR PORTAGE_SHOW_HTTP_TRACE
 If this environment variable is set, then Portage will show
 a trace of all HTTP request.
+.TP
+.BR PORTAGE_SERIALIZE_FRONTIER_DISABLE
+If this environment variable is set, then Portage will disable the
+incremental leaf-frontier optimization in the task serialization step of
+dependency resolution and fall back to the previous implementation.
+This variable is internal and experimental; it may be removed or changed
+in a future release.
+.TP
+.BR PORTAGE_CIRCULAR_MAX_USE_FLAGS
+The number of USE flags that Portage explores per dependency when it
+looks for a USE change that breaks a circular dependency (default:
+\fI10\fR).  The number of combinations grows exponentially with this
+value, so raising it can make the search much slower.  When the search
+is given up on because a dependency is affected by more flags than this,
+the affected packages are named in the circular dependency report.  It
+may also be set in \fBmake.conf\fR(5).
+.TP
+.BR PORTAGE_NATIVE_DEP_PARSER
+If this environment variable is set to \fI0\fR, then Portage will not use
+the native C dependency\-string parser and will fall back to the
+pure\-Python implementation.  Both paths are expected to produce identical
+results; the variable exists to verify that, and to work around a defect in
+the native parser should one be found.  It is read once, when the
+\fBportage.dep\fR module is imported, so it must be set in the environment
+before Portage starts.
+This variable is internal and experimental; it may be removed or changed
+in a future release.
+.TP
+.BR PORTAGE_FORK_DEP_CALC
+Portage calculates the dependency graph in a child process, and the process
+which merges the packages only receives the result. Set this environment
+variable to \fI0\fR to calculate in the current process instead. The
+calculation allocates much more memory than the merge that follows it, and
+Python cannot return that memory to the operating system, so this keeps a
+long build from holding onto it.
+Neither \fB\-\-pretend\fR nor \fB\-\-resume\fR uses a child process. If the
+child cannot be started, Portage prints a warning and calculates in the
+current process instead; a child which fails after it starts is an error,
+since it may already have displayed the merge list or asked for confirmation.
+This variable is internal and experimental; it may be removed or changed
+in a future release.
 .TP
 .BR PORTAGE_DO_NOT_EXPORT_PMS_VARS
 If this environment variable is set, then Portage will not export PMS

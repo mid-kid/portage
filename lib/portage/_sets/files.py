@@ -2,30 +2,25 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import errno
+import os
 import re
 from itertools import chain
 
-import portage
-from portage import os
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
-from portage.util import grabfile, write_atomic, ensure_dirs, normalize_path
+from portage import cpv_getkey, portage_gid
+from portage._sets import SETPREFIX, SetConfigError, get_boolean
+from portage._sets.base import EditablePackageSet, PackageSet
 from portage.const import USER_CONFIG_PATH, VCS_DIRS, WORLD_FILE, WORLD_SETS_FILE
-from portage.localization import _
-from portage.locks import lockfile, unlockfile
-from portage import portage_gid
-from portage._sets.base import PackageSet, EditablePackageSet
-from portage._sets import SetConfigError, SETPREFIX, get_boolean
 from portage.env.loaders import ItemFileLoader, KeyListFileLoader
 from portage.env.validators import ValidAtomValidator
-from portage import cpv_getkey
+from portage.localization import _
+from portage.locks import lockfile, unlockfile
+from portage.util import ensure_dirs, grabfile, normalize_path, write_atomic
 
 __all__ = [
-    "StaticFileSet",
     "ConfigFileSet",
-    "WorldSelectedSet",
+    "StaticFileSet",
     "WorldSelectedPackagesSet",
+    "WorldSelectedSet",
     "WorldSelectedSetsSet",
 ]
 
@@ -67,9 +62,8 @@ class StaticFileSet(EditablePackageSet):
                 value.append(line)
             else:
                 pass
-        else:
-            if key is not None:
-                setattr(self, key, " ".join(value))
+        if key is not None:
+            setattr(self, key, " ".join(value))
 
     def _validate(self, atom):
         return bool(atom[:1] == SETPREFIX or ValidAtomValidator(atom, allow_repo=True))
@@ -77,7 +71,10 @@ class StaticFileSet(EditablePackageSet):
     def write(self):
         write_atomic(
             self._filename,
-            "".join(f"{atom}\n" for atom in sorted(chain(self._atoms, self._nonatoms))),
+            "".join(
+                f"{atom}\n"
+                for atom in sorted(chain(self._atoms, self._nonatoms), key=str)
+            ),
         )
 
     def load(self):
@@ -112,7 +109,7 @@ class StaticFileSet(EditablePackageSet):
             self._mtime = mtime
 
     def singleBuilder(self, options, settings, trees):
-        if not "filename" in options:
+        if "filename" not in options:
             raise SetConfigError(_("no filename specified"))
         greedy = get_boolean(options, "greedy", False)
         filename = options["filename"]
@@ -139,7 +136,7 @@ class StaticFileSet(EditablePackageSet):
             os.path.join(settings["PORTAGE_CONFIGROOT"], USER_CONFIG_PATH, "sets"),
         )
         name_pattern = options.get("name_pattern", "${name}")
-        if not "$name" in name_pattern and not "${name}" in name_pattern:
+        if "$name" not in name_pattern and "${name}" not in name_pattern:
             raise SetConfigError(_("name_pattern doesn't include ${name} placeholder"))
         greedy = get_boolean(options, "greedy", False)
         # look for repository path variables
@@ -156,50 +153,33 @@ class StaticFileSet(EditablePackageSet):
                 )
 
         try:
-            directory = _unicode_decode(
-                directory, encoding=_encodings["fs"], errors="strict"
-            )
-            # Now verify that we can also encode it.
-            _unicode_encode(directory, encoding=_encodings["fs"], errors="strict")
-        except UnicodeError:
-            directory = _unicode_decode(
-                directory, encoding=_encodings["fs"], errors="replace"
-            )
+            directory.encode("utf-8", "strict")
+        except UnicodeEncodeError:
             raise SetConfigError(
                 _(
                     "Directory path contains invalid character(s) for encoding '%s': '%s'"
                 )
-                % (_encodings["fs"], directory)
+                % ("utf-8", directory)
             )
 
-        vcs_dirs = [_unicode_encode(x, encoding=_encodings["fs"]) for x in VCS_DIRS]
+        vcs_dirs = set(VCS_DIRS)
         if os.path.isdir(directory):
             directory = normalize_path(directory)
 
             for parent, dirs, files in os.walk(directory):
-                if portage.utf8_mode:
-                    dirs_orig = dirs
-                    omit_dir = lambda d: dirs_orig.remove(os.fsdecode(d))
-                    parent = os.fsencode(parent)
-                    dirs = [os.fsencode(value) for value in dirs]
-                    files = [os.fsencode(value) for value in files]
-                else:
-                    omit_dir = lambda d: dirs.remove(d)
+                dirs_orig = dirs
+                omit_dir = lambda d: dirs_orig.remove(d)
                 try:
-                    parent = _unicode_decode(
-                        parent, encoding=_encodings["fs"], errors="strict"
-                    )
-                except UnicodeDecodeError:
+                    parent.encode("utf-8", "strict")
+                except UnicodeEncodeError:
                     continue
                 for d in dirs[:]:
-                    if d in vcs_dirs or d.startswith(b".") or d.endswith(b"~"):
+                    if d in vcs_dirs or d.startswith(".") or d.endswith("~"):
                         omit_dir(d)
                 for filename in files:
                     try:
-                        filename = _unicode_decode(
-                            filename, encoding=_encodings["fs"], errors="strict"
-                        )
-                    except UnicodeDecodeError:
+                        filename.encode("utf-8", "strict")
+                    except UnicodeEncodeError:
                         continue
                     if filename.startswith(".") or filename.endswith("~"):
                         continue
@@ -230,7 +210,7 @@ class ConfigFileSet(PackageSet):
         self._setAtoms(iter(data))
 
     def singleBuilder(self, options, settings, trees):
-        if not "filename" in options:
+        if "filename" not in options:
             raise SetConfigError(_("no filename specified"))
         return ConfigFileSet(options["filename"])
 
@@ -242,7 +222,7 @@ class ConfigFileSet(PackageSet):
             "directory", os.path.join(settings["PORTAGE_CONFIGROOT"], USER_CONFIG_PATH)
         )
         name_pattern = options.get("name_pattern", "sets/package_$suffix")
-        if not "$suffix" in name_pattern and not "${suffix}" in name_pattern:
+        if "$suffix" not in name_pattern and "${suffix}" not in name_pattern:
             raise SetConfigError(_("name_pattern doesn't include $suffix placeholder"))
         for suffix in ["keywords", "use", "mask", "unmask"]:
             myname = name_pattern.replace("$suffix", suffix)
@@ -305,7 +285,9 @@ class WorldSelectedPackagesSet(EditablePackageSet):
         return ValidAtomValidator(atom, allow_repo=True)
 
     def write(self):
-        write_atomic(self._filename, "".join(sorted(f"{x}\n" for x in self._atoms)))
+        write_atomic(
+            self._filename, "".join(sorted((f"{x}\n" for x in self._atoms), key=str))
+        )
 
     def load(self):
         atoms = []
@@ -365,10 +347,7 @@ class WorldSelectedPackagesSet(EditablePackageSet):
         for x in worldlist:
             if x.cp == mykey:
                 matches = vardb.match(x, use_cache=0)
-                if not matches:
-                    # zap our world entry
-                    pass
-                elif len(matches) == 1 and matches[0] == cpv:
+                if not matches or (len(matches) == 1 and matches[0] == cpv):
                     # zap our world entry
                     pass
                 else:
@@ -401,7 +380,9 @@ class WorldSelectedSetsSet(EditablePackageSet):
         return setname.startswith(SETPREFIX)
 
     def write(self):
-        write_atomic(self._filename, "".join(sorted(f"{x}\n" for x in self._nonatoms)))
+        write_atomic(
+            self._filename, "".join(sorted((f"{x}\n" for x in self._nonatoms), key=str))
+        )
 
     def load(self):
         atoms_changed = False

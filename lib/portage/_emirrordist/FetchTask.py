@@ -1,23 +1,23 @@
-# Copyright 2013-2025 Gentoo Authors
+# Copyright 2013-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 import collections
 import errno
 import logging
+import os
 import random
 import shlex
 import subprocess
 import tempfile
 
+from _emerge.CompositeTask import CompositeTask
+
 import portage
-from portage import _encodings, _unicode_encode
-from portage import os
 from portage.util import ensure_dirs
 from portage.util._async.FileCopier import FileCopier
 from portage.util._async.FileDigester import FileDigester
 from portage.util._async.PipeLogger import PipeLogger
 from portage.util._async.PopenProcess import PopenProcess
-from _emerge.CompositeTask import CompositeTask
 
 logger = logging.getLogger(__name__)
 
@@ -25,27 +25,27 @@ default_hash_name = portage.const.MANIFEST2_HASH_DEFAULT
 
 # Use --no-check-certificate since Manifest digests should provide
 # enough security, and certificates can be self-signed or whatnot.
-default_fetchcommand = 'wget -c -v -t 1 --passive-ftp --no-check-certificate --timeout=60 -O "${DISTDIR}/${FILE}" "${URI}"'
+default_fetchcommand = 'wget -c -v -t 1 --passive-ftp --no-check-certificate --timeout=60 -U "Portage (Gentoo, https://www.gentoo.org) emirrordist" -O "${DISTDIR}/${FILE}" "${URI}"'
 
 
 class FetchTask(CompositeTask):
     __slots__ = (
-        "distfile",
-        "digests",
-        "config",
-        "cpv",
-        "restrict",
-        "uri_tuple",
         "_current_mirror",
         "_current_stat",
         "_fetch_tmp_dir_info",
         "_fetch_tmp_file",
         "_fs_mirror_stack",
+        "_log_path",
         "_mirror_stack",
         "_previously_added",
         "_primaryuri_stack",
-        "_log_path",
         "_tried_uris",
+        "config",
+        "cpv",
+        "digests",
+        "distfile",
+        "restrict",
+        "uri_tuple",
     )
 
     def _start(self):
@@ -273,7 +273,7 @@ class FetchTask(CompositeTask):
 
     def _next_uri(self):
         remaining_tries = self.config.options.tries - len(self._tried_uris)
-        if remaining_tries > 0:
+        if remaining_tries > 0 or self._primaryuri_stack:
             if remaining_tries <= self.config.options.tries // 2:
                 while self._primaryuri_stack:
                     uri = self._primaryuri_stack.pop()
@@ -341,13 +341,7 @@ class FetchTask(CompositeTask):
         else:
             bad_digest = self._find_bad_digest(digester.digests)
             if bad_digest is not None:
-                msg = "{} {} has bad {} digest: expected {}, got {}".format(
-                    self.distfile,
-                    current_mirror.name,
-                    bad_digest,
-                    self.digests[bad_digest],
-                    digester.digests[bad_digest],
-                )
+                msg = f"{self.distfile} {current_mirror.name} has bad {bad_digest} digest: expected {self.digests[bad_digest]}, got {digester.digests[bad_digest]}"
                 self.scheduler.output(
                     msg + "\n", background=True, log_path=self._log_path
                 )
@@ -409,11 +403,7 @@ class FetchTask(CompositeTask):
 
         current_mirror = self._current_mirror
         if copier.returncode != os.EX_OK:
-            msg = "{} {} copy failed unexpectedly: {}".format(
-                self.distfile,
-                current_mirror.name,
-                copier.future.exception(),
-            )
+            msg = f"{self.distfile} {current_mirror.name} copy failed unexpectedly: {copier.future.exception()}"
             self.scheduler.output(msg + "\n", background=True, log_path=self._log_path)
             logger.error(msg)
         else:
@@ -429,11 +419,7 @@ class FetchTask(CompositeTask):
                     ns=(self._current_stat.st_mtime_ns, self._current_stat.st_mtime_ns),
                 )
             except OSError as e:
-                msg = "{} {} utime failed unexpectedly: {}".format(
-                    self.distfile,
-                    current_mirror.name,
-                    e,
-                )
+                msg = f"{self.distfile} {current_mirror.name} utime failed unexpectedly: {e}"
                 self.scheduler.output(
                     msg + "\n", background=True, log_path=self._log_path
                 )
@@ -478,10 +464,6 @@ class FetchTask(CompositeTask):
 
         args = shlex.split(default_fetchcommand)
         args = [portage.util.varexpand(x, mydict=variables) for x in args]
-
-        args = [
-            _unicode_encode(x, encoding=_encodings["fs"], errors="strict") for x in args
-        ]
 
         null_fd = os.open(os.devnull, os.O_RDONLY)
         fetcher = PopenProcess(
@@ -528,21 +510,13 @@ class FetchTask(CompositeTask):
             return
 
         if digester.returncode != os.EX_OK:
-            msg = "{} {} digester failed unexpectedly".format(
-                self.distfile,
-                self._fetch_tmp_dir_info,
-            )
+            msg = f"{self.distfile} {self._fetch_tmp_dir_info} digester failed unexpectedly"
             self.scheduler.output(msg + "\n", background=True, log_path=self._log_path)
             logger.error(msg)
         else:
             bad_digest = self._find_bad_digest(digester.digests)
             if bad_digest is not None:
-                msg = "{} has bad {} digest: expected {}, got {}".format(
-                    self.distfile,
-                    bad_digest,
-                    self.digests[bad_digest],
-                    digester.digests[bad_digest],
-                )
+                msg = f"{self.distfile} has bad {bad_digest} digest: expected {self.digests[bad_digest]}, got {digester.digests[bad_digest]}"
                 self.scheduler.output(
                     msg + "\n", background=True, log_path=self._log_path
                 )
@@ -591,11 +565,7 @@ class FetchTask(CompositeTask):
             self._make_layout_links()
         else:
             # out of space?
-            msg = "{} {} copy failed unexpectedly: {}".format(
-                self.distfile,
-                self._fetch_tmp_dir_info,
-                copier.future.exception(),
-            )
+            msg = f"{self.distfile} {self._fetch_tmp_dir_info} copy failed unexpectedly: {copier.future.exception()}"
             self.scheduler.output(msg + "\n", background=True, log_path=self._log_path)
             logger.error(msg)
             self.config.log_failure(f"{self.cpv}\t{self.distfile}\t{msg}")

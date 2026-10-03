@@ -1,14 +1,14 @@
 # Copyright 2018-2020 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-__all__ = ["install_mask_dir", "InstallMask"]
+__all__ = ["InstallMask", "install_mask_dir"]
 
 import collections
 import errno
 import fnmatch
 import operator
+import os
 
-from portage import os, _unicode_decode
 from portage.exception import (
     FileNotFound,
     IsADirectory,
@@ -175,14 +175,15 @@ def install_mask_dir(base_dir, install_mask, onerror=None):
     while todo:
         parent = todo.pop()
         try:
-            parent = _unicode_decode(parent, errors="strict")
+            if isinstance(parent, bytes):
+                parent = parent.decode("utf-8", "strict")
         except UnicodeDecodeError:
             continue
 
         dir_stack.append(parent)
         for entry in os.scandir(parent):
             try:
-                abs_path = _unicode_decode(entry.path, errors="strict")
+                abs_path = entry.path
             except UnicodeDecodeError:
                 continue
 

@@ -2,8 +2,16 @@
 # Copyright 2010-2014 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
+import locale
 import os
 import sys
+
+if (
+    sys.getfilesystemencoding().lower() != "utf-8"
+    or locale.getpreferredencoding(False).lower() != "utf-8"
+):
+    os.environ["PYTHONUTF8"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def main(args):
@@ -15,7 +23,7 @@ def main(args):
 
     if args and isinstance(args[0], bytes):
         for i, x in enumerate(args):
-            args[i] = portage._unicode_decode(x, errors="strict")
+            args[i] = x.decode("utf-8", "strict")
 
     # Make locks quiet since unintended locking messages displayed on
     # stdout would corrupt the intended output of this program.
@@ -25,7 +33,7 @@ def main(args):
     sys.stdout.flush()
     sys.stdin.read(1)
     portage.locks.unlockfile(lock_obj)
-    return portage.os.EX_OK
+    return os.EX_OK
 
 
 if __name__ == "__main__":

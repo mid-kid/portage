@@ -2,14 +2,14 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import argparse
+import os
 import sys
 import textwrap
 
 import portage
-from portage import os
+from portage.emaint.defaults import DEFAULT_OPTIONS
 from portage.module import Modules
 from portage.progress import ProgressBar
-from portage.emaint.defaults import DEFAULT_OPTIONS
 
 
 class OptionItem:
@@ -153,9 +153,7 @@ class TaskHandler:
 
 def print_results(results):
     if results:
-        print()
         print("\n".join(results))
-        print("\n")
 
 
 def emaint_main(myargv):

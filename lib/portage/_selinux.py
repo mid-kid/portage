@@ -1,8 +1,6 @@
 # Copyright 1999-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-# Don't use the unicode-wrapped os and shutil modules here since
-# the whole _selinux module itself will be wrapped.
 import os
 import shutil
 import warnings
@@ -14,15 +12,11 @@ except ImportError:
     selinux = None
 
 import portage
-from portage import _encodings
-from portage import _native_string, _unicode_encode
 from portage.localization import _
 
 
 def copyfile(src, dest):
-    src = _native_string(src, encoding=_encodings["fs"], errors="strict")
-    dest = _native_string(dest, encoding=_encodings["fs"], errors="strict")
-    (rc, ctx) = selinux.lgetfilecon(src)
+    rc, ctx = selinux.lgetfilecon(src)
     if rc < 0:
         raise OSError(_('copyfile: Failed getting context of "%s".') % src)
 
@@ -34,7 +28,7 @@ def copyfile(src, dest):
 
 
 def getcontext():
-    (rc, ctx) = selinux.getcon()
+    rc, ctx = selinux.getcon()
     if rc < 0:
         raise OSError(_("getcontext: Failed getting current process context."))
 
@@ -46,8 +40,7 @@ def is_selinux_enabled():
 
 
 def mkdir(target, refdir):
-    refdir = _native_string(refdir, encoding=_encodings["fs"], errors="strict")
-    (rc, ctx) = selinux.getfilecon(refdir)
+    rc, ctx = selinux.getfilecon(refdir)
     if rc < 0:
         raise OSError(
             _('mkdir: Failed getting context of reference directory "%s".') % refdir
@@ -55,23 +48,19 @@ def mkdir(target, refdir):
 
     setfscreate(ctx)
     try:
-        os.mkdir(_unicode_encode(target, encoding=_encodings["fs"], errors="strict"))
+        os.mkdir(target)
     finally:
         setfscreate()
 
 
 def rename(src, dest):
-    src = _native_string(src, encoding=_encodings["fs"], errors="strict")
-    (rc, ctx) = selinux.lgetfilecon(src)
+    rc, ctx = selinux.lgetfilecon(src)
     if rc < 0:
         raise OSError(_('rename: Failed getting context of "%s".') % src)
 
     setfscreate(ctx)
     try:
-        os.rename(
-            _unicode_encode(src, encoding=_encodings["fs"], errors="strict"),
-            _unicode_encode(dest, encoding=_encodings["fs"], errors="strict"),
-        )
+        os.rename(src, dest)
     finally:
         setfscreate()
 
@@ -87,7 +76,6 @@ def settype(newtype):
 
 
 def setexec(ctx="\n"):
-    ctx = _native_string(ctx, encoding=_encodings["content"], errors="strict")
     rc = 0
     try:
         rc = selinux.setexeccon(ctx)
@@ -111,7 +99,6 @@ def setexec(ctx="\n"):
 
 
 def setfscreate(ctx="\n"):
-    ctx = _native_string(ctx, encoding=_encodings["content"], errors="strict")
     if selinux.setfscreatecon(ctx) < 0:
         raise OSError(_('setfscreate: Failed setting fs create context "%s".') % ctx)
 
@@ -128,9 +115,6 @@ class spawn_wrapper:
 
     def __init__(self, spawn_func, selinux_type):
         self._spawn_func = spawn_func
-        selinux_type = _native_string(
-            selinux_type, encoding=_encodings["content"], errors="strict"
-        )
         self._con = settype(selinux_type)
 
     def __call__(self, *args, **kwargs):
@@ -146,8 +130,7 @@ class spawn_wrapper:
 
 
 def symlink(target, link, reflnk):
-    reflnk = _native_string(reflnk, encoding=_encodings["fs"], errors="strict")
-    (rc, ctx) = selinux.lgetfilecon(reflnk)
+    rc, ctx = selinux.lgetfilecon(reflnk)
     if rc < 0:
         raise OSError(
             _('symlink: Failed getting context of reference symlink "%s".') % reflnk
@@ -155,9 +138,6 @@ def symlink(target, link, reflnk):
 
     setfscreate(ctx)
     try:
-        os.symlink(
-            _unicode_encode(target, encoding=_encodings["fs"], errors="strict"),
-            _unicode_encode(link, encoding=_encodings["fs"], errors="strict"),
-        )
+        os.symlink(target, link)
     finally:
         setfscreate()

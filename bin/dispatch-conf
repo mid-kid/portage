@@ -2,6 +2,18 @@
 # Copyright 1999-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import locale
+import os
+import sys
+
+if (
+    sys.getfilesystemencoding().lower() != "utf-8"
+    or locale.getpreferredencoding(False).lower() != "utf-8"
+):
+    os.environ["PYTHONUTF8"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 #
 # dispatch-conf -- Integrate modified configs, post-emerge
 #
@@ -15,8 +27,8 @@ import atexit
 import errno
 import re
 import shlex
+import shutil
 import subprocess
-import sys
 import termios
 import tty
 
@@ -39,8 +51,6 @@ if osp.isfile(
 import portage
 
 portage._internal_caller = True
-from portage import os, shutil
-from portage import _encodings, _unicode_decode
 from portage.dispatch_conf import (
     diffstatusoutput,
     diff_mixed_wrapper,
@@ -178,8 +188,9 @@ class dispatch:
 
             try:
                 # Find existing configs
-                path_list = _unicode_decode(
-                    subprocess.check_output(["find", path] + find_opts),
+                path_list = subprocess.check_output(
+                    ["find", path] + find_opts,
+                    encoding="utf-8",
                     errors="strict",
                 ).splitlines()
             except subprocess.CalledProcessError:
@@ -467,9 +478,7 @@ class dispatch:
         the diff of what changed into the configured log file."""
         if "log-file" in self.options:
             status, output = diff(curconf, newconf)
-            with open(
-                self.options["log-file"], mode="a", encoding=_encodings["stdio"]
-            ) as f:
+            with open(self.options["log-file"], mode="a", encoding="utf-8") as f:
                 f.write(output + "\n")
 
         perform_conf_update_hooks("pre-update", curconf)
@@ -505,9 +514,7 @@ class dispatch:
         newconfigs.sort()
 
         for nconf in newconfigs:
-            # Use strict mode here, because we want to know if it fails,
-            # and portage only merges files with valid UTF-8 encoding.
-            nconf = _unicode_decode(nconf, errors="strict").rstrip()
+            nconf = nconf.rstrip()
             conf = re.sub(r"\._cfg\d+_", "", nconf)
             dirname = os.path.dirname(nconf)
             conf_map = {
@@ -566,7 +573,7 @@ def clear_screen():
     if curses is not None:
         try:
             curses.setupterm()
-            sys.stdout.write(_unicode_decode(curses.tigetstr("clear")))
+            sys.stdout.write(curses.tigetstr("clear").decode("utf-8", "replace"))
             sys.stdout.flush()
             return
         except curses.error:

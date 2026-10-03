@@ -2,17 +2,18 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import functools
+import os
 import sys
 
-from _emerge.SubProcess import SubProcess
 import portage
-from portage import os
 from portage.const import BASH_BINARY
 from portage.output import EOutput
 from portage.util._async.BuildLogger import BuildLogger
 from portage.util._async.PipeLogger import PipeLogger
 from portage.util._pty import _create_pty_or_pipe
 from portage.util.futures import asyncio
+
+from _emerge.SubProcess import SubProcess
 
 
 class SpawnProcess(SubProcess):
@@ -46,7 +47,6 @@ class SpawnProcess(SubProcess):
         + (
             "_main_task",
             "_main_task_cancel",
-            "_pty_ready",
             "_selinux_type",
         )
     )
@@ -73,8 +73,7 @@ class SpawnProcess(SubProcess):
                     )
                 # When called via process.spawn and ForkProcess._start,
                 # SpawnProcess will have created a pipe earlier, so it
-                # would be redundant to do it here (it could also trigger
-                # spawn recursion via set_term_size as in bug 923750).
+                # would be redundant to do it here.
                 master_fd = None
                 slave_fd = None
                 can_log = False
@@ -191,9 +190,6 @@ class SpawnProcess(SubProcess):
         self._main_task.add_done_callback(self._main_exit)
 
     async def _main(self, build_logger, pipe_logger, loop=None):
-        if isinstance(self._pty_ready, asyncio.Future):
-            await self._pty_ready
-            self._pty_ready = None
         try:
             if pipe_logger is not None and pipe_logger.poll() is None:
                 await pipe_logger.async_wait()
@@ -239,10 +235,8 @@ class SpawnProcess(SubProcess):
         stdout_pipe = None
         if not self.background:
             stdout_pipe = fd_pipes.get(1)
-        self._pty_ready, master_fd, slave_fd = _create_pty_or_pipe(
-            copy_term_size=stdout_pipe
-        )
-        return (master_fd, slave_fd)
+        master_fd, slave_fd = _create_pty_or_pipe(copy_term_size=stdout_pipe)
+        return master_fd, slave_fd
 
     def _spawn(
         self, args: list[str], **kwargs
@@ -261,12 +255,6 @@ class SpawnProcess(SubProcess):
         SubProcess._unregister(self)
         if self._main_task is not None:
             self._main_task.done() or self._main_task.cancel()
-        if isinstance(self._pty_ready, asyncio.Future):
-            (
-                self._pty_ready.done()
-                and (self._pty_ready.cancelled() or self._pty_ready.result() or True)
-            ) or self._pty_ready.cancel()
-            self._pty_ready = None
 
     def _cancel(self):
         if self._main_task is not None:

@@ -3,21 +3,23 @@
 
 import errno
 import logging
-import time
+import os
 import threading
+import time
+
+from _emerge.CompositeTask import CompositeTask
 
 import portage
-from portage import os
 from portage.util._async.TaskScheduler import TaskScheduler
-from _emerge.CompositeTask import CompositeTask
-from .FetchIterator import FetchIterator
+
 from .DeletionIterator import DeletionIterator
+from .FetchIterator import FetchIterator
 
 logger = logging.getLogger(__name__)
 
 
 class MirrorDistTask(CompositeTask):
-    __slots__ = ("_config", "_fetch_iterator", "_term_rlock", "_term_callback_handle")
+    __slots__ = ("_config", "_fetch_iterator", "_term_callback_handle", "_term_rlock")
 
     def __init__(self, config):
         CompositeTask.__init__(self, scheduler=config.event_loop)
@@ -138,13 +140,11 @@ class MirrorDistTask(CompositeTask):
         start_time = self._config.start_time
         dry_run = self._config.options.dry_run
         deletion_delay = self._config.options.deletion_delay
-        distfiles_db = self._config.distfiles_db
 
         date_map = {}
         for filename, timestamp in self._config.deletion_db.items():
             date = timestamp + deletion_delay
-            if date < start_time:
-                date = start_time
+            date = max(date, start_time)
             date = time.strftime("%Y-%m-%d", time.gmtime(date))
             date_files = date_map.get(date)
             if date_files is None:
@@ -167,9 +167,7 @@ class MirrorDistTask(CompositeTask):
                 )
             lines.append(f"{date}\n")
             for filename in date_files:
-                cpv = "unknown"
-                if distfiles_db is not None:
-                    cpv = distfiles_db.get(filename, cpv)
+                cpv = self._config.lookup_cpv(filename)
                 lines.append(f"\t{filename}\t{cpv}\n")
 
         if not dry_run:

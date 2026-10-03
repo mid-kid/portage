@@ -4,24 +4,13 @@
 __all__ = ["MtimeDB"]
 
 import copy
-
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
-
 import errno
-import io
 import json
 
 import portage
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
 from portage.data import portage_gid, uid
 from portage.localization import _
 from portage.util import apply_secpass_permissions, atomic_ofstream, writemsg
-
 
 _MTIMEDBKEYS = {
     "info",
@@ -37,12 +26,8 @@ _MTIMEDBKEYS = {
 class MtimeDB(dict):
     """The MtimeDB class is used to interact with a file storing the
     current resume lists.
-    It is a subclass of ``dict`` and it reads from/writes to JSON, by
-    default, although it can be configured to use ``pickle``.
+    It is a subclass of ``dict`` and it reads from/writes to JSON.
     """
-
-    # JSON read support has been available since portage-2.1.10.49.
-    _json_write = True
 
     _json_write_opts = {"ensure_ascii": False, "indent": "\t", "sort_keys": True}
 
@@ -65,7 +50,7 @@ class MtimeDB(dict):
         f = None
         content = None
         try:
-            f = open(_unicode_encode(filename), "rb")
+            f = open(filename.encode("utf-8", "backslashreplace"), "rb")
             content = f.read()
         except OSError as e:
             if getattr(e, "errno", None) in (errno.ENOENT, errno.EACCES):
@@ -80,25 +65,14 @@ class MtimeDB(dict):
         if content:
             try:
                 d = json.loads(
-                    _unicode_decode(
-                        content, encoding=_encodings["repo.content"], errors="strict"
-                    )
+                    content.decode("utf-8", "strict")
+                    if isinstance(content, bytes)
+                    else content
                 )
             except SystemExit:
                 raise
             except Exception as e:
-                try:
-                    mypickle = pickle.Unpickler(io.BytesIO(content))
-                    try:
-                        mypickle.find_global = None
-                    except AttributeError:
-                        # Python >=3
-                        pass
-                    d = mypickle.load()
-                except SystemExit:
-                    raise
-                except Exception:
-                    writemsg(_(f"!!! Error loading '{filename}': {e}\n"), noiselevel=-1)
+                writemsg(_(f"!!! Error loading '{filename}': {e}\n"), noiselevel=-1)
 
         if "old" in d:
             d["updates"] = d["old"]
@@ -134,16 +108,7 @@ class MtimeDB(dict):
         except OSError:
             pass
         else:
-            if self._json_write:
-                f.write(
-                    _unicode_encode(
-                        json.dumps(d, **self._json_write_opts),
-                        encoding=_encodings["repo.content"],
-                        errors="strict",
-                    )
-                )
-            else:
-                pickle.dump(d, f, protocol=2)
+            f.write(json.dumps(d, **self._json_write_opts).encode("utf-8", "strict"))
             f.close()
             apply_secpass_permissions(
                 self.filename, uid=uid, gid=portage_gid, mode=0o644

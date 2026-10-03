@@ -1,29 +1,28 @@
-# Copyright 2010-2025 Gentoo Authors
+# Copyright 2010-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = [
-    "autouse",
     "best_from_dict",
     "check_config_instance",
     "config",
 ]
 
 import copy
-from itertools import chain
 import grp
 import logging
+import os
 import platform
 import pwd
 import re
 import shlex
 import sys
 import traceback
-import warnings
+from itertools import chain
 
 from _emerge.Package import Package
-import portage
 
-from portage import bsd_chflags, load_mod, os, selinux, _unicode_decode
+import portage
+from portage import bsd_chflags, load_mod, selinux
 from portage.const import (
     CACHE_PATH,
     DEPCACHE_PATH,
@@ -41,66 +40,58 @@ from portage.dbapi import dbapi
 from portage.dep import (
     Atom,
     isvalidatom,
-    match_from_list,
     use_reduce,
-    _repo_separator,
-    _slot_separator,
 )
 from portage.eapi import (
+    _get_eapi_attrs,
     eapi_exports_AA,
     eapi_exports_merge_type,
-    eapi_supports_prefix,
     eapi_exports_replace_vars,
-    _get_eapi_attrs,
+    eapi_supports_prefix,
 )
 from portage.env.loaders import KeyValuePairFileLoader
 from portage.exception import InvalidDependString, PortageException
 from portage.localization import _
 from portage.output import colorize
+from portage.package.ebuild._config import special_env_vars
+from portage.package.ebuild._config.env_var_validation import validate_cmd_var
+from portage.package.ebuild._config.features_set import features_set
+from portage.package.ebuild._config.helper import (
+    ordered_by_atom_specificity,
+    prune_incremental,
+)
+from portage.package.ebuild._config.KeywordsManager import KeywordsManager
+from portage.package.ebuild._config.LicenseManager import LicenseManager
+from portage.package.ebuild._config.LocationsManager import LocationsManager
+from portage.package.ebuild._config.MaskManager import MaskManager
+from portage.package.ebuild._config.UseManager import UseManager
+from portage.package.ebuild._config.UserPatches import UserPatches
+from portage.package.ebuild._config.VirtualsManager import VirtualsManager
 from portage.process import fakeroot_capable, sandbox_capable
 from portage.repository.config import (
     allow_profile_repo_deps,
     load_repository_config,
 )
 from portage.util import (
+    LazyItemsDict,
+    _eapi_cache,
     ensure_dirs,
     getconfig,
     grabdict,
     grabdict_package,
     grabfile,
     grabfile_package,
-    LazyItemsDict,
     normalize_path,
     stack_dictlist,
     stack_dicts,
     stack_lists,
     writemsg,
     writemsg_level,
-    _eapi_cache,
 )
+from portage.util._path import exists_raise_eaccess, isdir_raise_eaccess
 from portage.util.install_mask import _raise_exc
 from portage.util.path import first_existing
-from portage.util._path import exists_raise_eaccess, isdir_raise_eaccess
-from portage.versions import catpkgsplit, catsplit, cpv_getkey, _pkg_str
-
-from portage.package.ebuild._config import special_env_vars
-from portage.package.ebuild._config.env_var_validation import validate_cmd_var
-from portage.package.ebuild._config.features_set import features_set
-from portage.package.ebuild._config.KeywordsManager import KeywordsManager
-from portage.package.ebuild._config.LicenseManager import LicenseManager
-from portage.package.ebuild._config.UseManager import UseManager
-from portage.package.ebuild._config.LocationsManager import LocationsManager
-from portage.package.ebuild._config.MaskManager import MaskManager
-from portage.package.ebuild._config.VirtualsManager import VirtualsManager
-from portage.package.ebuild._config.helper import (
-    ordered_by_atom_specificity,
-    prune_incremental,
-)
-
-
-def autouse(myvartree, use_cache=1, mysettings=None):
-    warnings.warn("portage.autouse() is deprecated", DeprecationWarning, stacklevel=2)
-    return ""
+from portage.versions import _pkg_str, catpkgsplit, catsplit, cpv_getkey
 
 
 def check_config_instance(test):
@@ -328,6 +319,7 @@ class config:
             # that they're not instantiated more than once
             self._keywords_manager_obj = clone._keywords_manager
             self._mask_manager_obj = clone._mask_manager
+            self._user_patches_obj = clone._user_patches
 
             # shared mutable attributes
             self._unknown_features = clone._unknown_features
@@ -381,6 +373,7 @@ class config:
             # lazily instantiated objects
             self._keywords_manager_obj = None
             self._mask_manager_obj = None
+            self._user_patches_obj = None
             self._virtuals_manager_obj = None
 
             locations_manager = LocationsManager(
@@ -556,12 +549,7 @@ class config:
             if env is None:
                 env = os.environ
 
-            # Avoid potential UnicodeDecodeError exceptions later.
-            env_unicode = {
-                _unicode_decode(k): _unicode_decode(v) for k, v in env.items()
-            }
-
-            self.backupenv = env_unicode
+            self.backupenv = env.copy()
 
             if env_d:
                 # Remove duplicate values so they don't override updated
@@ -932,7 +920,7 @@ class config:
 
                 # package.bashrc
                 for profile in profiles_complex:
-                    if not "profile-bashrcs" in profile.profile_formats:
+                    if "profile-bashrcs" not in profile.profile_formats:
                         continue
                     self._pbashrcdict[profile] = portage.dep.ExtendedAtomDict(dict)
                     bashrc = grabdict_package(
@@ -1316,7 +1304,7 @@ class config:
                     _("!!! Directory initialization failed: '%s'\n") % mydir,
                     noiselevel=-1,
                 )
-                writemsg(f"!!! {str(e)}\n", noiselevel=-1)
+                writemsg(f"!!! {e!s}\n", noiselevel=-1)
 
     @property
     def _keywords_manager(self):
@@ -1342,6 +1330,14 @@ class config:
                 strict_umatched_removal=self._unmatched_removal,
             )
         return self._mask_manager_obj
+
+    @property
+    def _user_patches(self):
+        if self._user_patches_obj is None:
+            self._user_patches_obj = UserPatches(
+                self._locations_manager.abs_user_config
+            )
+        return self._user_patches_obj
 
     @property
     def _virtuals_manager(self):
@@ -1382,6 +1378,16 @@ class config:
                 for soname in sonames
             )
         return self._soname_provided
+
+    def userPatchDigest(self, pkg):
+        """Return the digest over all user patches applicable to pkg, where pkg
+        is any suitable type with cp, cpv, and slot attributes."""
+        return self._user_patches.digest(pkg, default="")
+
+    def userPatchFiles(self, pkg):
+        """Return the patch filenames of user patches applicable to pkg, where
+        pkg is any suitable type with cp, cpv, and slot attributes."""
+        return self._user_patches.patches(pkg)
 
     def expandLicenseTokens(self, tokens):
         """Take a token from ACCEPT_LICENSE or package.license and expand it
@@ -1467,9 +1473,10 @@ class config:
 
         abs_user_virtuals = os.path.join(self["PORTAGE_CONFIGROOT"], USER_VIRTUALS_FILE)
         if os.path.exists(abs_user_virtuals):
-            writemsg("\n!!! /etc/portage/virtuals is deprecated in favor of\n")
-            writemsg("!!! /etc/portage/profile/virtuals. Please move it to\n")
-            writemsg("!!! this new location.\n\n")
+            writemsg("\n!!! /etc/portage/virtuals is deprecated and ignored.\n")
+            writemsg("!!! Support for PROVIDE virtuals was removed in\n")
+            writemsg("!!! portage-2.3.25; use GLEP 37 virtual packages\n")
+            writemsg("!!! instead. Please remove this file.\n\n")
 
         if not sandbox_capable and (
             "sandbox" in self.features or "usersandbox" in self.features
@@ -2130,7 +2137,7 @@ class config:
                 allow_test = self.get("ALLOW_TEST", "").split()
                 restrict_test = (
                     "test" in restrict
-                    and not "all" in allow_test
+                    and "all" not in allow_test
                     and not ("test_network" in properties and "network" in allow_test)
                     and not (
                         "test_privileged" in properties and "privileged" in allow_test
@@ -2417,40 +2424,6 @@ class config:
             cpv, metadata["SLOT"], metadata.get("repository")
         )
 
-    def _getProfileMaskAtom(self, cpv, metadata):
-        """
-        Take a package and return a matching profile atom, or None if no
-        such atom exists. Note that a profile atom may or may not have a "*"
-        prefix.
-
-        @param cpv: The package name
-        @type cpv: String
-        @param metadata: A dictionary of raw package metadata
-        @type metadata: dict
-        @rtype: String
-        @return: A matching profile atom string or None if one is not found.
-        """
-
-        warnings.warn(
-            "The config._getProfileMaskAtom() method is deprecated.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-        cp = cpv_getkey(cpv)
-        profile_atoms = self.prevmaskdict.get(cp)
-        if profile_atoms:
-            pkg = "".join((cpv, _slot_separator, metadata["SLOT"]))
-            repo = metadata.get("repository")
-            if repo and repo != Package.UNKNOWN_REPO:
-                pkg = "".join((pkg, _repo_separator, repo))
-            pkg_list = [pkg]
-            for x in profile_atoms:
-                if match_from_list(x, pkg_list):
-                    continue
-                return x
-        return None
-
     def _isStable(self, pkg):
         return self._keywords_manager.isStable(
             pkg,
@@ -2697,7 +2670,6 @@ class config:
     def setinst(self, mycpv, mydbapi):
         """This used to update the preferences for old-style virtuals.
         It is no-op now."""
-        pass
 
     def reload(self):
         """Reload things like /etc/profile.env that can change during runtime."""
@@ -3068,26 +3040,6 @@ class config:
                 elif k in self:
                     self.configlist[-1][k] = ""
 
-    @property
-    def virts_p(self):
-        warnings.warn(
-            "portage config.virts_p attribute "
-            + "is deprecated, use config.get_virts_p()",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_virts_p()
-
-    @property
-    def virtuals(self):
-        warnings.warn(
-            "portage config.virtuals attribute "
-            + "is deprecated, use config.getvirtuals()",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.getvirtuals()
-
     def get_virts_p(self):
         # Ensure that we don't trigger the _treeVirtuals
         # assertion in VirtualsManager._compile_virtuals().
@@ -3258,12 +3210,14 @@ class config:
         "set a value; will be thrown away at reset() time"
         if not isinstance(myvalue, str):
             raise ValueError(
-                f"Invalid type being used as a value: '{str(mykey)}': '{str(myvalue)}'"
+                f"Invalid type being used as a value: '{mykey!s}': '{myvalue!s}'"
             )
 
         # Avoid potential UnicodeDecodeError exceptions later.
-        mykey = _unicode_decode(mykey)
-        myvalue = _unicode_decode(myvalue)
+        if isinstance(mykey, bytes):
+            mykey = mykey.decode("utf-8", "replace")
+        if isinstance(myvalue, bytes):
+            myvalue = myvalue.decode("utf-8", "replace")
 
         self.modifying()
         self.modifiedkeys.append(mykey)

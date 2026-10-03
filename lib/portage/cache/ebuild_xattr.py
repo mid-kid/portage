@@ -5,14 +5,12 @@
 __all__ = ["database"]
 
 import errno
+import os
 
-from portage.cache import fs_template
-from portage.versions import catsplit
 from portage import cpv_getkey
-from portage import os
-from portage import _encodings
-from portage import _unicode_decode
+from portage.cache import fs_template
 from portage.util._xattr import xattr
+from portage.versions import catsplit
 
 
 class NoValueException(Exception):
@@ -36,7 +34,7 @@ class database(fs_template.FsBased):
         path = os.path.join(self.portdir, "profiles/repo_name")
         try:
             return int(self.__get(path, "value_max_len"))
-        except NoValueException as e:
+        except NoValueException:
             maxattrlength = self.__calc_max(path)
             self.__set(path, "value_max_len", str(maxattrlength))
             return maxattrlength
@@ -78,7 +76,7 @@ class database(fs_template.FsBased):
     def __has_cache(self, path):
         try:
             self.__get(path, "_mtime_")
-        except NoValueException as e:
+        except NoValueException:
             return False
 
         return True
@@ -87,7 +85,7 @@ class database(fs_template.FsBased):
         try:
             return xattr.get(path, key, namespace=self.ns)
         except OSError as e:
-            if not default is None and errno.ENODATA == e.errno:
+            if default is not None and errno.ENODATA == e.errno:
                 return default
             raise NoValueException()
 
@@ -102,7 +100,7 @@ class database(fs_template.FsBased):
         path = self.__get_path(cpv)
         attrs = {key: value for key, value in xattr.get_all(path, namespace=self.ns)}
 
-        if not "_mtime_" in all:
+        if "_mtime_" not in all:
             raise KeyError(cpv)
 
         # We default to '' like other caches
@@ -153,9 +151,8 @@ class database(fs_template.FsBased):
         for root, dirs, files in os.walk(self.portdir):
             for file in files:
                 try:
-                    file = _unicode_decode(
-                        file, encoding=_encodings["fs"], errors="strict"
-                    )
+                    if isinstance(file, bytes):
+                        file = file.decode("utf-8", "strict")
                 except UnicodeDecodeError:
                     continue
                 if file[-7:] == ".ebuild":
@@ -163,4 +160,4 @@ class database(fs_template.FsBased):
                     pn_pv = file[:-7]
                     path = os.path.join(root, file)
                     if self.__has_cache(path):
-                        yield f"{cat}/{os.path.basename(root)}/{file[:-7]}"
+                        yield f"{cat}/{os.path.basename(root)}/{pn_pv}"

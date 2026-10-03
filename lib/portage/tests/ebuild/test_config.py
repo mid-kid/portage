@@ -1,20 +1,23 @@
 # Copyright 2010-2020 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
+import shutil
 import tempfile
 
 import portage
-from portage import os, shutil, _encodings
 from portage.const import USER_CONFIG_PATH
 from portage.dep import Atom
-from portage.package.ebuild.config import config
 from portage.package.ebuild._config.LicenseManager import LicenseManager
+from portage.package.ebuild.config import config
 from portage.tests import TestCase
+from portage.tests.ebuild.MockUserPatches import MockUserPatches
 from portage.tests.resolver.ResolverPlayground import (
     ResolverPlayground,
     ResolverPlaygroundTestCase,
 )
 from portage.util import normalize_path
+from portage.versions import _pkg_str
 
 
 class ConfigTestCase(TestCase):
@@ -411,19 +414,15 @@ class ConfigTestCase(TestCase):
             with open(
                 os.path.join(user_config_dir, "package.env"),
                 mode="w",
-                encoding=_encodings["content"],
+                encoding="utf-8",
             ) as f:
-                for line in package_env:
-                    f.write(line + "\n")
+                f.writelines(line + "\n" for line in package_env)
 
             env_dir = os.path.join(user_config_dir, "env")
             os.makedirs(env_dir)
             for k, v in env_files.items():
-                with open(
-                    os.path.join(env_dir, k), mode="w", encoding=_encodings["content"]
-                ) as f:
-                    for line in v:
-                        f.write(line + "\n")
+                with open(os.path.join(env_dir, k), mode="w", encoding="utf-8") as f:
+                    f.writelines(line + "\n" for line in v)
 
             playground = ResolverPlayground(eprefix=eprefix, ebuilds=ebuilds)
             settings = config(clone=playground.settings)
@@ -448,3 +447,193 @@ class ConfigTestCase(TestCase):
                 shutil.rmtree(eprefix)
             else:
                 playground.cleanup()
+
+    # exercise UserPatches.__contains__() directly to detect user patches
+    def testUserPatchesExist(self):
+        # do not care about the content of patche files *or* their hashes
+        files = {"user.patch": b"foo", "random.diff": b"bar"}
+        patches = {
+            "dev-libs/A": files,
+            "dev-libs/B-1": files,
+            "dev-libs/C:1": files,
+            "dev-libs/D-1:2": files,
+            "dev-libs/E": {},
+        }
+
+        playground = ResolverPlayground(patches=patches)
+        user_patches = config(clone=playground.settings)._user_patches
+
+        # patches under ${PN} apply for all versions and slots
+        self.assertIn(_pkg_str("dev-libs/A-1"), user_patches)
+        self.assertIn(_pkg_str("dev-libs/A-1", slot="3"), user_patches)
+        self.assertIn(_pkg_str("dev-libs/A-2"), user_patches)
+        self.assertIn(_pkg_str("dev-libs/A-1", slot="3"), user_patches)
+
+        # patches under ${P} apply to specified version regardless of slot
+        self.assertIn(_pkg_str("dev-libs/B-1"), user_patches)
+        self.assertIn(_pkg_str("dev-libs/B-1", slot="3"), user_patches)
+        self.assertNotIn(_pkg_str("dev-libs/B-2"), user_patches)
+        self.assertNotIn(_pkg_str("dev-libs/B-2", slot="3"), user_patches)
+
+        # ${PN}:${SLOT} apply to all versions of slot
+        self.assertNotIn(_pkg_str("dev-libs/C-1"), user_patches)
+        self.assertNotIn(_pkg_str("dev-libs/C-1", slot="2"), user_patches)
+        self.assertIn(_pkg_str("dev-libs/C-1", slot="1"), user_patches)
+        self.assertIn(_pkg_str("dev-libs/C-2", slot="1"), user_patches)
+
+        # patches under ${P}:${SLOT} apply to specific version and slot
+        self.assertIn(_pkg_str("dev-libs/D-1", slot="2"), user_patches)
+        self.assertNotIn(_pkg_str("dev-libs/D-2", slot="2"), user_patches)
+        self.assertNotIn(_pkg_str("dev-libs/D-2", slot="1"), user_patches)
+        self.assertNotIn(_pkg_str("dev-libs/D-1"), user_patches)
+
+        # empty user patch folder to not be visible
+
+        self.assertNotIn(_pkg_str("dev-libs/E-1"), user_patches)
+
+    # exercise UserPatches.patches() to query applicable user patch files
+    def testUserPatchesFiles(self):
+        patches = {
+            "dev-libs/A": {"user.patch": b"foo", "random.diff": b"bar"},
+            "dev-libs/B": {"user.patch": b"foo"},
+            "dev-libs/B-1": {"random.diff": b"bar"},
+            "dev-libs/C": {"random.diff": b"bar"},
+            "dev-libs/C:3": {"user.patch": b"foo"},
+            # stray files not in a pkg folder should be ignored (see bug #982999)
+            "sys-apps": {"foo.patch": b"foo"},
+        }
+
+        playground = ResolverPlayground(patches=patches)
+        settings = config(clone=playground.settings)
+
+        files = lambda d: {os.path.join(d, f) for f in patches[d]}
+
+        # dev-libs/A has the same patches for all versions and slots
+        self.assertSetEqual(
+            settings.userPatchFiles(_pkg_str("dev-libs/A-1")),
+            files("dev-libs/A"),
+        )
+        self.assertSetEqual(
+            settings.userPatchFiles(_pkg_str("dev-libs/A-1", slot="3")),
+            files("dev-libs/A"),
+        )
+        self.assertSetEqual(
+            settings.userPatchFiles(_pkg_str("dev-libs/A-2")),
+            files("dev-libs/A"),
+        )
+
+        # dev-libs/B has extra patches for that version 1 only (all slots)
+        self.assertSetEqual(
+            settings.userPatchFiles(_pkg_str("dev-libs/B-1")),
+            files("dev-libs/B") | files("dev-libs/B-1"),
+        )
+        self.assertSetEqual(
+            settings.userPatchFiles(_pkg_str("dev-libs/B-1", slot="2")),
+            files("dev-libs/B") | files("dev-libs/B-1"),
+        )
+        self.assertSetEqual(
+            settings.userPatchFiles(_pkg_str("dev-libs/B-2")),
+            files("dev-libs/B"),
+        )
+
+        # dev-libs/C has extra patches for slot 3 only
+        self.assertSetEqual(
+            settings.userPatchFiles(_pkg_str("dev-libs/C-1")),
+            files("dev-libs/C"),
+        )
+        self.assertSetEqual(
+            settings.userPatchFiles(_pkg_str("dev-libs/C-1", slot="3")),
+            files("dev-libs/C") | files("dev-libs/C:3"),
+        )
+        self.assertSetEqual(
+            settings.userPatchFiles(_pkg_str("dev-libs/C-2", slot="3")),
+            files("dev-libs/C") | files("dev-libs/C:3"),
+        )
+
+        # expect empty set where no user patches exists
+        self.assertSetEqual(settings.userPatchFiles(_pkg_str("dev-libs/E-1")), set())
+
+    # exercise UserPatches.__getitem__() via digest()
+    def testUserPatchesMatch(self):
+        patches = {
+            "dev-libs/A": {
+                "A.patch": MockUserPatches.Patch1,
+                "A.diff": MockUserPatches.Patch2,
+            },
+            "dev-libs/A-1": {
+                "A-1.patch": MockUserPatches.Patch3,
+            },
+            "dev-libs/A:13": {
+                "A:13.diff": MockUserPatches.Patch4,
+            },
+            "dev-libs/B": {
+                "B.diff": MockUserPatches.Patch1,
+                "B.patch": MockUserPatches.Patch5,
+            },
+            "dev-libs/B-1": {
+                "B.diff": MockUserPatches.NullPatch,
+            },
+            "dev-libs/B-1:foo": {
+                "B-1:foo.patch": MockUserPatches.Patch6,
+            },
+        }
+
+        playground = ResolverPlayground(patches=patches)
+        settings = config(clone=playground.settings)
+
+        # application of non-versioned patches only (no v2 patches)
+        self.assertEqual(
+            settings.userPatchDigest(_pkg_str("dev-libs/A-2")),
+            MockUserPatches.expected_hash(
+                patches,
+                ["dev-libs/A/A.patch", "dev-libs/A/A.diff"],
+            ),
+        )
+        self.assertEqual(
+            settings.userPatchDigest(_pkg_str("dev-libs/B-2")),
+            MockUserPatches.expected_hash(
+                patches,
+                ["dev-libs/B/B.patch", "dev-libs/B/B.diff"],
+            ),
+        )
+
+        # composition of non-versioned patches and versioned (v1) patches
+        self.assertEqual(
+            settings.userPatchDigest(_pkg_str("dev-libs/A-1")),
+            MockUserPatches.expected_hash(
+                patches,
+                ["dev-libs/A/A.patch", "dev-libs/A/A.diff", "dev-libs/A-1/A-1.patch"],
+            ),
+        )
+        self.assertEqual(
+            settings.userPatchDigest(_pkg_str("dev-libs/A-1", slot="1")),
+            MockUserPatches.expected_hash(
+                patches,
+                ["dev-libs/A/A.patch", "dev-libs/A/A.diff", "dev-libs/A-1/A-1.patch"],
+            ),
+        )
+        self.assertEqual(
+            settings.userPatchDigest(_pkg_str("dev-libs/A-1", slot="13")),
+            MockUserPatches.expected_hash(
+                patches,
+                [
+                    "dev-libs/A/A.patch",
+                    "dev-libs/A/A.diff",
+                    "dev-libs/A-1/A-1.patch",
+                    "dev-libs/A:13/A:13.diff",
+                ],
+            ),
+        )
+        self.assertEqual(
+            settings.userPatchDigest(_pkg_str("dev-libs/B-1", slot="foo")),
+            MockUserPatches.expected_hash(
+                patches,
+                ["dev-libs/B/B.patch", "dev-libs/B-1:foo/B-1:foo.patch"],
+            ),
+        )
+
+        # omission of non-versioned patches for empty versioned patch of matching basename
+        self.assertEqual(
+            settings.userPatchDigest(_pkg_str("dev-libs/B-1")),
+            MockUserPatches.expected_hash(patches, ["dev-libs/B/B.patch"]),
+        )

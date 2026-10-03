@@ -2,15 +2,13 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import io
+import os
 import sys
 import time
 
 import portage
-import portage.util.formatter as formatter
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
 from portage.output import xtermTitle
+from portage.util import formatter
 
 from _emerge.getloadavg import getloadavg
 
@@ -91,9 +89,13 @@ class JobStatusDisplay:
 
     def _write(self, s):
         # avoid potential UnicodeEncodeError
-        s = _unicode_encode(s, encoding=_encodings["stdio"], errors="backslashreplace")
-        out = self.out.buffer
-        out.write(s)
+        if hasattr(self.out, "buffer"):
+            out = self.out.buffer
+            out.write(s.encode("utf-8", "backslashreplace"))
+        else:
+            out = self.out
+            encoding = getattr(out, "encoding", None) or "utf-8"
+            out.write(s.encode(encoding, "backslashreplace").decode(encoding))
         out.flush()
 
     def _init_term(self):
@@ -126,7 +128,7 @@ class JobStatusDisplay:
         term_codes = {}
         for k, capname in self._termcap_name_map.items():
             # Use _native_string for PyPy compat (bug #470258).
-            code = tigetstr(portage._native_string(capname))
+            code = tigetstr(capname)
             if code is None:
                 code = self._default_term_codes[capname]
             term_codes[k] = code
@@ -155,13 +157,14 @@ class JobStatusDisplay:
 
         self._display(self._format_msg(msg))
 
-    def displayMessage(self, msg):
+    def displayMessage(self, msg, raw=False):
         was_displayed = self._displayed
 
         if self._isatty and self._displayed:
             self._erase()
 
-        self._write(self._format_msg(msg) + self._term_codes["newline"])
+        formatted_msg = msg if raw else self._format_msg(msg)
+        self._write(formatted_msg + self._term_codes["newline"])
         self._displayed = False
 
         if was_displayed:

@@ -3,15 +3,16 @@
 
 __all__ = ["getmaskingreason"]
 
+import os
+
 import portage
-from portage import os
 from portage.const import USER_CONFIG_PATH
 from portage.dep import Atom, match_from_list
 from portage.exception import InvalidAtom
 from portage.localization import _
 from portage.repository.config import _gen_valid_repo
 from portage.util import grablines
-from portage.versions import catpkgsplit, _pkg_str
+from portage.versions import _pkg_str, catpkgsplit
 
 
 def getmaskingreason(

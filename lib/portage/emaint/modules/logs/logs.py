@@ -1,10 +1,11 @@
 # Copyright 2005-2012 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
-import portage
-from portage import os
-from portage.util import varexpand
+import os
 import shlex
+
+import portage
+from portage.util import varexpand
 
 # default clean command from make.globals
 ## PORTAGE_LOGDIR_CLEAN = 'find "${PORTAGE_LOGDIR}" -type f ! -name "summary.log*" -mtime +7 -delete'
@@ -63,7 +64,7 @@ class CleanLogs:
                     clean_cmd.remove("-mtime")
                     clean_cmd.pop(i)
                 else:
-                    clean_cmd[clean_cmd.index("-mtime") + 1] = f"+{str(num_of_days)}"
+                    clean_cmd[clean_cmd.index("-mtime") + 1] = f"+{num_of_days!s}"
             if pretend:
                 if "-delete" in clean_cmd:
                     clean_cmd.remove("-delete")

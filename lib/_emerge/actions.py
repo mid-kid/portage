@@ -1,41 +1,42 @@
-# Copyright 1999-2025 Gentoo Authors
+# Copyright 1999-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 import collections
 import logging
 import multiprocessing
 import operator
+import os
 import platform
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
-import warnings
 from itertools import chain
 
 import portage
-
-from portage import os
-from portage import shutil
-from portage import _encodings, _unicode_decode
 from portage.binrepo.config import BinRepoConfigLoader
-from portage.const import BINREPOS_CONF_FILE, _DEPCLEAN_LIB_CHECK_DEFAULT
-from portage.dbapi.dep_expand import dep_expand
+from portage.const import (
+    _DEPCLEAN_LIB_CHECK_DEFAULT,
+    BINREPOS_CONF_FILE,
+    PORTAGE_BASE_PATH,
+)
 from portage.dbapi._expand_new_virt import expand_new_virt
+from portage.dbapi.dep_expand import dep_expand
 from portage.dbapi.IndexedPortdb import IndexedPortdb
 from portage.dbapi.IndexedVardb import IndexedVardb
 from portage.dep import Atom, _repo_separator, _slot_separator
 from portage.dep.libc import find_libc_deps
 from portage.exception import (
+    GPGException,
     InvalidAtom,
+    InvalidBinaryPackageFormat,
     InvalidData,
     ParseError,
-    GPGException,
-    InvalidBinaryPackageFormat,
 )
 from portage.output import (
     colorize,
@@ -48,36 +49,43 @@ from portage.output import (
 good = create_color_func("GOOD")
 bad = create_color_func("BAD")
 warn = create_color_func("WARN")
+from portage._global_updates import _global_updates
+from portage._sets import SETPREFIX, load_default_config
+from portage._sets.base import InternalPackageSet, WildcardPackageSet
+from portage.binpkg import get_binpkg_format
+from portage.emaint.main import print_results
+from portage.gpg import GPG
+from portage.localization import _
+from portage.metadata import action_metadata
 from portage.package.ebuild._ipc.QueryCommand import QueryCommand
 from portage.package.ebuild.fetch import _hide_url_passwd
-from portage._sets import load_default_config, SETPREFIX
-from portage._sets.base import InternalPackageSet
+from portage.sync.old_tree_timestamp import old_tree_timestamp_warn
 from portage.util import (
     cmp_sort_key,
     normalize_path,
-    writemsg,
     varexpand,
+    writemsg,
     writemsg_level,
     writemsg_stdout,
 )
-from portage.util.digraph import digraph
-from portage.util.path import first_existing
-from portage.util.SlotObject import SlotObject
 from portage.util._async.run_main_scheduler import run_main_scheduler
 from portage.util._async.SchedulerInterface import SchedulerInterface
 from portage.util._eventloop.global_event_loop import global_event_loop
-from portage._global_updates import _global_updates
-from portage.sync.old_tree_timestamp import old_tree_timestamp_warn
-from portage.localization import _
-from portage.metadata import action_metadata
-from portage.emaint.main import print_results
-from portage.gpg import GPG
-from portage.binpkg import get_binpkg_format
+from portage.util.digraph import digraph
+from portage.util.path import first_existing
+from portage.util.SlotObject import SlotObject
 
+from _emerge import _depgraph_fork
+from _emerge._run_in_child import ForkFailed, run_in_child
 from _emerge.clear_caches import clear_caches
 from _emerge.create_depgraph_params import create_depgraph_params
 from _emerge.Dependency import Dependency
-from _emerge.depgraph import backtrack_depgraph, depgraph, resume_depgraph
+from _emerge.depgraph import (
+    backtrack_depgraph,
+    depgraph,
+    resume_depgraph,
+    save_nomerge_favorites,
+)
 from _emerge.emergelog import emergelog
 from _emerge.is_valid_package_atom import is_valid_package_atom
 from _emerge.main import profile_check
@@ -94,33 +102,336 @@ from _emerge.UseFlagDisplay import pkg_use_display
 from _emerge.UserQuery import UserQuery
 
 
-def action_build(
-    emerge_config,
-    trees=DeprecationWarning,
-    mtimedb=DeprecationWarning,
-    myopts=DeprecationWarning,
-    myaction=DeprecationWarning,
-    myfiles=DeprecationWarning,
-    spinner=None,
-):
-    from _emerge.chk_updated_cfg_files import chk_updated_cfg_files
+class _resolution:
+    """
+    The result of _resolve(): either an exit code, or everything that the
+    merge needs from the dependency calculation.
+    """
 
-    if not isinstance(emerge_config, _emerge_config):
-        warnings.warn(
-            "_emerge.actions.action_build() now expects "
-            "an _emerge_config instance as the first parameter",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        emerge_config = load_emerge_config(
-            action=myaction, args=myfiles, trees=trees, opts=myopts
-        )
-        adjust_configs(emerge_config.opts, emerge_config.trees)
+    __slots__ = (
+        "depgraph",
+        "exit_code",
+        "favorites",
+        "graph_config",
+        "mergecount",
+        "mergelist_shown",
+        "need_config_reload",
+        "nomerge_favorites",
+    )
 
+    def __init__(self):
+        self.depgraph = None
+        self.exit_code = None
+        self.favorites = []
+        self.graph_config = None
+        self.mergecount = None
+        self.mergelist_shown = False
+        self.need_config_reload = False
+        self.nomerge_favorites = []
+
+
+def _reload_config(emerge_config, quickpkg_direct):
+    """
+    Reload the configuration after the depgraph asked for it, and refresh
+    the binary package databases that the reload discarded.
+
+    @return: True on success, False if a binhost could not be parsed
+    """
+    load_emerge_config(emerge_config=emerge_config)
+    adjust_configs(emerge_config.opts, emerge_config.trees)
+
+    # After config reload, the freshly instantiated binarytree
+    # instances need to load remote metadata if --getbinpkg
+    # is enabled. Use getbinpkg_refresh=False to use cached
+    # metadata, since the cache is already fresh.
+    if emerge_config.opts.get("--getbinpkg") is True or quickpkg_direct:
+        for root_trees in emerge_config.trees.values():
+            kwargs = {}
+            if quickpkg_direct:
+                kwargs["add_repos"] = (
+                    emerge_config.running_config.trees["vartree"].dbapi,
+                )
+            if "--getbinpkg-exclude" in emerge_config.opts:
+                kwargs["getbinpkg_exclude"] = emerge_config.opts["--getbinpkg-exclude"]
+            if "--getbinpkg-include" in emerge_config.opts:
+                kwargs["getbinpkg_include"] = emerge_config.opts["--getbinpkg-include"]
+
+            try:
+                root_trees["bintree"].populate(
+                    getbinpkgs=True, getbinpkg_refresh=False, **kwargs
+                )
+            except ParseError as e:
+                writemsg(
+                    f"\n\n!!!{e}.\nSee make.conf(5) for more info.\n",
+                    noiselevel=-1,
+                )
+                return False
+
+    return True
+
+
+def _resolve(emerge_config, spinner, myparams, quickpkg_direct):
+    """
+    Calculate the dependency graph, in a child process if that is enabled.
+
+    See _depgraph_fork and bug 549906.
+    """
+    if _depgraph_fork.enabled(emerge_config.opts):
+        try:
+            payload = run_in_child(
+                lambda: _resolve_payload(
+                    emerge_config, spinner, myparams, quickpkg_direct
+                )
+            )
+            return _resolve_from_payload(payload, emerge_config, quickpkg_direct)
+        except ForkFailed as e:
+            # The child never reached the calculation, so it showed no
+            # resolution output and asked nothing, and this process can
+            # calculate without repeating any of that.
+            writemsg_level(
+                f"!!! Falling back to an in-process dependency calculation: {e}\n",
+                level=logging.WARNING,
+                noiselevel=-1,
+            )
+        except _depgraph_fork.ChildFailed as e:
+            return _child_failed(e)
+
+    return _resolve_in_process(emerge_config, spinner, myparams, quickpkg_direct)
+
+
+def _child_failed(e):
+    """
+    Report a child which failed after it took over stdio. It may already have
+    displayed the merge list and asked the user to confirm it, so calculating
+    again here would repeat the output and the prompt.
+    """
+    if e.exit_code != 128 + signal.SIGINT:
+        # An interrupt is the user's own doing, and the child has already
+        # been interrupted in front of them.
+        writemsg_level(
+            f"!!! Dependency calculation in a child process failed: {e}\n",
+            level=logging.ERROR,
+            noiselevel=-1,
+        )
+    resolution = _resolution()
+    resolution.exit_code = e.exit_code
+    return resolution
+
+
+def _resolve_payload(emerge_config, spinner, myparams, quickpkg_direct):
+    """
+    Run _resolve_in_process() and reduce the result to plain data, for a
+    calculation which runs in a child process.
+    """
+    resolution = _resolve_in_process(emerge_config, spinner, myparams, quickpkg_direct)
+    graph_config = resolution.graph_config
+    return {
+        "exit_code": resolution.exit_code,
+        "favorites": resolution.favorites,
+        "graph": (
+            None
+            if graph_config is None
+            else _depgraph_fork.encode_scheduler_graph(graph_config)
+        ),
+        "mergecount": resolution.mergecount,
+        "mergelist_shown": resolution.mergelist_shown,
+        "nomerge_favorites": resolution.nomerge_favorites,
+        "need_config_reload": resolution.need_config_reload,
+        # _resolve_in_process() pops --ask once it has asked, and that
+        # happened to the child's copy of the options.
+        "ask_answered": "--ask" not in emerge_config.opts,
+    }
+
+
+def _resolve_from_payload(payload, emerge_config, quickpkg_direct):
+    """
+    Rebuild a _resolution from the data that a child process produced.
+    """
+    resolution = _resolution()
+    resolution.exit_code = payload["exit_code"]
+    if resolution.exit_code is not None:
+        return resolution
+
+    if payload["need_config_reload"]:
+        # The child reloaded its own copy of the configuration, so this
+        # process has to do the same before the graph is rebuilt against
+        # its trees. The child already did this successfully against the
+        # same on-disk config before it displayed the merge list and (with
+        # --ask) got the user's confirmation, so this is only expected to
+        # fail if the config changed on disk in between.
+        if not _reload_config(emerge_config, quickpkg_direct):
+            if payload["mergelist_shown"]:
+                writemsg_level(
+                    "!!! The above merge list was already confirmed, but "
+                    "reloading the configuration in this process failed; "
+                    "see above for the reason.\n",
+                    level=logging.ERROR,
+                    noiselevel=-1,
+                )
+            resolution.exit_code = 1
+            return resolution
+
+    if payload["ask_answered"]:
+        # Otherwise save_nomerge_favorites() would ask a second time, in
+        # this process, about the world favorites.
+        emerge_config.opts.pop("--ask", None)
+
+    resolution.favorites = payload["favorites"]
+    resolution.mergecount = payload["mergecount"]
+    resolution.mergelist_shown = payload["mergelist_shown"]
+    resolution.nomerge_favorites = payload["nomerge_favorites"]
+    if payload["graph"] is not None and resolution.mergecount != 0:
+        # With nothing to merge the scheduler graph is never used, and
+        # rebuilding it is neither free nor small.
+        resolution.graph_config = _depgraph_fork.decode_scheduler_graph(
+            payload["graph"], emerge_config.trees, emerge_config.opts
+        )
+    return resolution
+
+
+def _resolve_in_process(emerge_config, spinner, myparams, quickpkg_direct):
+    """
+    Calculate the dependency graph, display it, and ask for confirmation.
+
+    Everything that needs the depgraph happens here, so that the caller only
+    needs the values which _resolution carries in order to merge.
+    """
     settings, trees, mtimedb = emerge_config
     myopts = emerge_config.opts
     myaction = emerge_config.action
     myfiles = emerge_config.args
+    enter_invalid = "--ask-enter-invalid" in myopts
+    fetchonly = "--fetchonly" in myopts or "--fetch-all-uri" in myopts
+    oneshot = "--oneshot" in myopts or "--onlydeps" in myopts
+    pretend = "--pretend" in myopts
+
+    resolution = _resolution()
+
+    try:
+        success, mydepgraph, favorites = backtrack_depgraph(
+            settings, trees, myopts, myparams, myaction, myfiles, spinner
+        )
+    except portage.exception.CorruptionKeyError:
+        resolution.exit_code = 1
+        return resolution
+    except portage.exception.PackageSetNotFound as e:
+        root_config = trees[settings["EROOT"]]["root_config"]
+        display_missing_pkg_set(root_config, e.value)
+        resolution.exit_code = 1
+        return resolution
+
+    resolution.depgraph = mydepgraph
+    # Reduce the favorites to strings, which is the form that the Scheduler
+    # records in mtimedb and that a --resume reads back, so that the merge
+    # does not depend on the Atom instances which the calculation produced.
+    favorites = [str(x) for x in favorites]
+    resolution.favorites = favorites
+
+    if success and mydepgraph.need_config_reload():
+        resolution.need_config_reload = True
+        if not _reload_config(emerge_config, quickpkg_direct):
+            resolution.exit_code = 1
+            return resolution
+        settings, trees, mtimedb = emerge_config
+
+    if "--autounmask-only" in myopts:
+        mydepgraph.display_problems()
+        resolution.exit_code = 0
+        return resolution
+
+    if not success:
+        mydepgraph.display_problems()
+        resolution.exit_code = 1
+        return resolution
+
+    if (
+        not pretend
+        and ("--ask" in myopts or "--tree" in myopts or "--verbose" in myopts)
+        and not ("--quiet" in myopts and "--ask" not in myopts)
+    ):
+        retval = mydepgraph.display(mydepgraph.altlist(), favorites=favorites)
+        mydepgraph.display_problems()
+        resolution.mergelist_shown = True
+        if retval != os.EX_OK:
+            resolution.exit_code = retval
+            return resolution
+
+        mergecount = 0
+        for x in mydepgraph.altlist():
+            if isinstance(x, Package) and x.operation == "merge":
+                mergecount += 1
+        resolution.mergecount = mergecount
+
+        prompt = None
+        if mergecount == 0:
+            sets = trees[settings["EROOT"]]["root_config"].sets
+            world_candidates = None
+            if "selective" in myparams and not oneshot and favorites:
+                # Sets that are not world candidates are filtered
+                # out here since the favorites list needs to be
+                # complete for depgraph.loadResumeCommand() to
+                # operate correctly.
+                world_candidates = [
+                    x
+                    for x in favorites
+                    if not (x.startswith(SETPREFIX) and not sets[x[1:]].world_candidate)
+                ]
+
+            if "selective" in myparams and not oneshot and world_candidates:
+                # Prompt later, inside save_nomerge_favorites.
+                prompt = None
+            else:
+                print()
+                print("Nothing to merge; quitting.")
+                print()
+                resolution.exit_code = os.EX_OK
+                return resolution
+        elif fetchonly:
+            prompt = "Would you like to fetch the source files for these packages?"
+        else:
+            prompt = "Would you like to merge these packages?"
+        print()
+        uq = UserQuery(myopts)
+        if (
+            prompt is not None
+            and "--ask" in myopts
+            and uq.query(prompt, enter_invalid) == "No"
+        ):
+            print()
+            print("Quitting.")
+            print()
+            resolution.exit_code = 128 + signal.SIGINT
+            return resolution
+        # Don't ask again (e.g. when auto-cleaning packages after merge)
+        if mergecount != 0:
+            myopts.pop("--ask", None)
+
+    if pretend and not fetchonly:
+        # The caller displays the merge list and returns; it still has
+        # the depgraph for that. A fetch is a merge phase of its own, so
+        # --pretend --fetchonly carries on past here as it did before.
+        return resolution
+
+    if not resolution.mergelist_shown:
+        # If we haven't already shown the merge list above, at
+        # least show warnings about missed updates and such.
+        mydepgraph.display_problems()
+
+    resolution.nomerge_favorites = mydepgraph.nomerge_favorites()
+    resolution.graph_config = mydepgraph.schedulerGraph()
+
+    return resolution
+
+
+def action_build(
+    emerge_config,
+    spinner=None,
+):
+    from _emerge.chk_updated_cfg_files import chk_updated_cfg_files
+
+    settings, trees, mtimedb = emerge_config
+    myopts = emerge_config.opts
+    myaction = emerge_config.action
 
     if "--usepkgonly" not in myopts:
         old_tree_timestamp_warn(settings["PORTDIR"], settings)
@@ -141,7 +452,7 @@ def action_build(
         + os.path.sep
     )
     quickpkg_direct = (
-        "--usepkg" in emerge_config.opts
+        emerge_config.opts.get("--usepkg") is True
         and emerge_config.opts.get("--quickpkg-direct", "n") == "y"
         and emerge_config.target_config.settings["ROOT"] != quickpkg_root
     )
@@ -162,8 +473,12 @@ def action_build(
         kwargs["add_repos"] = (quickpkg_vardb,)
         try:
             kwargs["pretend"] = "--pretend" in emerge_config.opts
+            if "--getbinpkg-exclude" in emerge_config.opts:
+                kwargs["getbinpkg_exclude"] = emerge_config.opts["--getbinpkg-exclude"]
+            if "--getbinpkg-include" in emerge_config.opts:
+                kwargs["getbinpkg_include"] = emerge_config.opts["--getbinpkg-include"]
             emerge_config.target_config.trees["bintree"].populate(
-                getbinpkgs="--getbinpkg" in emerge_config.opts, **kwargs
+                getbinpkgs=emerge_config.opts.get("--getbinpkg") is True, **kwargs
             )
         except ParseError as e:
             writemsg(f"\n\n!!!{e}.\nSee make.conf(5) for more info.\n", noiselevel=-1)
@@ -248,7 +563,6 @@ def action_build(
     ask = "--ask" in myopts
     enter_invalid = "--ask-enter-invalid" in myopts
     nodeps = "--nodeps" in myopts
-    oneshot = "--oneshot" in myopts or "--onlydeps" in myopts
     tree = "--tree" in myopts
     if nodeps and tree:
         tree = False
@@ -261,6 +575,10 @@ def action_build(
     quiet = "--quiet" in myopts
     myparams = create_depgraph_params(myopts, myaction)
     mergelist_shown = False
+    mydepgraph = None
+    graph_config = None
+    mergecount = None
+    nomerge_favorites = []
 
     if pretend or fetchonly:
         mtimedb.make_readonly()
@@ -351,7 +669,7 @@ def action_build(
                 for line in textwrap.wrap(msg, 72):
                     out.eerror(line)
             elif isinstance(e, portage.exception.PackageNotFound):
-                out.eerror("An expected package is " + f"not available: {str(e)}")
+                out.eerror("An expected package is " + f"not available: {e!s}")
                 out.eerror("")
                 msg = (
                     "The resume list contains one or more "
@@ -378,12 +696,13 @@ def action_build(
                         )
                     else:
                         writemsg(
-                            f"  {task} requires {', '.join(atoms)}\n",
+                            f"  {task} requires {', '.join(str(a) for a in atoms)}\n",
                             noiselevel=-1,
                         )
 
                 portage.writemsg("\n", noiselevel=-1)
             del dropped_tasks
+            nomerge_favorites = mydepgraph.nomerge_favorites()
         else:
             if mydepgraph is not None:
                 mydepgraph.display_problems()
@@ -400,58 +719,25 @@ def action_build(
             print(darkgreen("emerge: It seems we have nothing to resume..."))
             return os.EX_OK
 
-        try:
-            success, mydepgraph, favorites = backtrack_depgraph(
-                settings, trees, myopts, myparams, myaction, myfiles, spinner
-            )
-        except portage.exception.PackageSetNotFound as e:
-            root_config = trees[settings["EROOT"]]["root_config"]
-            display_missing_pkg_set(root_config, e.value)
-            return 1
+        resolution = _resolve(emerge_config, spinner, myparams, quickpkg_direct)
 
-        if success and mydepgraph.need_config_reload():
-            load_emerge_config(emerge_config=emerge_config)
-            adjust_configs(emerge_config.opts, emerge_config.trees)
-            settings, trees, mtimedb = emerge_config
+        if resolution.exit_code is not None:
+            return resolution.exit_code
 
-            # After config reload, the freshly instantiated binarytree
-            # instances need to load remote metadata if --getbinpkg
-            # is enabled. Use getbinpkg_refresh=False to use cached
-            # metadata, since the cache is already fresh.
-            if "--getbinpkg" in emerge_config.opts or quickpkg_direct:
-                for root_trees in emerge_config.trees.values():
-                    kwargs = {}
-                    if quickpkg_direct:
-                        kwargs["add_repos"] = (
-                            emerge_config.running_config.trees["vartree"].dbapi,
-                        )
+        favorites = resolution.favorites
+        mergecount = resolution.mergecount
+        mergelist_shown = resolution.mergelist_shown
+        graph_config = resolution.graph_config
+        nomerge_favorites = resolution.nomerge_favorites
+        settings, trees, mtimedb = emerge_config
+        mydepgraph = resolution.depgraph
 
-                    try:
-                        root_trees["bintree"].populate(
-                            getbinpkgs=True, getbinpkg_refresh=False, **kwargs
-                        )
-                    except ParseError as e:
-                        writemsg(
-                            f"\n\n!!!{e}.\nSee make.conf(5) for more info.\n",
-                            noiselevel=-1,
-                        )
-                        return 1
-
-        if "--autounmask-only" in myopts:
-            mydepgraph.display_problems()
-            return 0
-
-        if not success:
-            mydepgraph.display_problems()
-            return 1
-
-    mergecount = None
-    if (
-        "--pretend" not in myopts
-        and ("--ask" in myopts or "--tree" in myopts or "--verbose" in myopts)
-        and not ("--quiet" in myopts and "--ask" not in myopts)
-    ):
-        if "--resume" in myopts:
+    if resume:
+        if (
+            "--pretend" not in myopts
+            and ("--ask" in myopts or "--tree" in myopts or "--verbose" in myopts)
+            and not ("--quiet" in myopts and "--ask" not in myopts)
+        ):
             mymergelist = mydepgraph.altlist()
             if len(mymergelist) == 0:
                 print(
@@ -465,59 +751,14 @@ def action_build(
             if retval != os.EX_OK:
                 return retval
             prompt = "Would you like to resume merging these packages?"
-        else:
-            retval = mydepgraph.display(mydepgraph.altlist(), favorites=favorites)
-            mydepgraph.display_problems()
-            mergelist_shown = True
-            if retval != os.EX_OK:
-                return retval
-            mergecount = 0
-            for x in mydepgraph.altlist():
-                if isinstance(x, Package) and x.operation == "merge":
-                    mergecount += 1
-
-            prompt = None
-            if mergecount == 0:
-                sets = trees[settings["EROOT"]]["root_config"].sets
-                world_candidates = None
-                if "selective" in myparams and not oneshot and favorites:
-                    # Sets that are not world candidates are filtered
-                    # out here since the favorites list needs to be
-                    # complete for depgraph.loadResumeCommand() to
-                    # operate correctly.
-                    world_candidates = [
-                        x
-                        for x in favorites
-                        if not (
-                            x.startswith(SETPREFIX) and not sets[x[1:]].world_candidate
-                        )
-                    ]
-
-                if "selective" in myparams and not oneshot and world_candidates:
-                    # Prompt later, inside saveNomergeFavorites.
-                    prompt = None
-                else:
-                    print()
-                    print("Nothing to merge; quitting.")
-                    print()
-                    return os.EX_OK
-            elif "--fetchonly" in myopts or "--fetch-all-uri" in myopts:
-                prompt = "Would you like to fetch the source files for these packages?"
-            else:
-                prompt = "Would you like to merge these packages?"
-        print()
-        uq = UserQuery(myopts)
-        if (
-            prompt is not None
-            and "--ask" in myopts
-            and uq.query(prompt, enter_invalid) == "No"
-        ):
             print()
-            print("Quitting.")
-            print()
-            return 128 + signal.SIGINT
-        # Don't ask again (e.g. when auto-cleaning packages after merge)
-        if mergecount != 0:
+            uq = UserQuery(myopts)
+            if "--ask" in myopts and uq.query(prompt, enter_invalid) == "No":
+                print()
+                print("Quitting.")
+                print()
+                return 128 + signal.SIGINT
+            # Don't ask again (e.g. when auto-cleaning packages after merge)
             myopts.pop("--ask", None)
 
     if ("--pretend" in myopts) and not (
@@ -546,9 +787,11 @@ def action_build(
 
     gpg = None
     try:
-        if not mergelist_shown:
+        if resume and not mergelist_shown:
             # If we haven't already shown the merge list above, at
             # least show warnings about missed updates and such.
+            # For anything but --resume this happens in _resolve(),
+            # which is where the depgraph lives.
             mydepgraph.display_problems()
 
         need_write_vardb = not Scheduler._opts_no_self_update.intersection(myopts)
@@ -570,7 +813,16 @@ def action_build(
         if need_write_bindb or need_write_vardb:
             eroots = set()
             ebuild_eroots = set()
-            for x in mydepgraph.altlist():
+            if graph_config is not None:
+                mergelist = graph_config.mergelist
+            elif mydepgraph is not None:
+                # --resume and --pretend --fetchonly, which reach here with
+                # the depgraph still in scope.
+                mergelist = mydepgraph.altlist()
+            else:
+                # A child calculated, and there is nothing to merge.
+                mergelist = []
+            for x in mergelist:
                 if isinstance(x, Package) and x.operation == "merge":
                     eroots.add(x.root)
                     if x.type_name == "ebuild":
@@ -653,11 +905,16 @@ def action_build(
                 del mtimedb["resume"]
                 mtimedb.commit()
 
-            mydepgraph.saveNomergeFavorites()
+            save_nomerge_favorites(
+                trees[settings["EROOT"]]["root_config"], myopts, nomerge_favorites
+            )
 
         if mergecount == 0:
             retval = os.EX_OK
         else:
+            if graph_config is None:
+                graph_config = mydepgraph.schedulerGraph()
+
             mergetask = Scheduler(
                 settings,
                 trees,
@@ -665,10 +922,10 @@ def action_build(
                 myopts,
                 spinner,
                 favorites=favorites,
-                graph_config=mydepgraph.schedulerGraph(),
+                graph_config=graph_config,
             )
 
-            del mydepgraph
+            del mydepgraph, graph_config
             clear_caches(trees)
 
             retval = mergetask.merge()
@@ -836,8 +1093,8 @@ def action_depclean(
                 matched_packages = True
             else:
                 writemsg_level(
-                    f"--- Couldn't find '{x.replace('null/', '')}' to {action}.\n",
-                    level=logging.WARN,
+                    f"--- Couldn't find '{str(x).replace('null/', '')}' to {action}.\n",
+                    level=logging.WARNING,
                     noiselevel=-1,
                 )
         if not matched_packages:
@@ -994,7 +1251,18 @@ def _calc_depclean(
     if action == "depclean":
         emergelog(xterm_titles, " >>> depclean")
 
-    writemsg_level("\nCalculating dependencies  ")
+    def show_invalid_depstring(pkg, cause):
+        if spinner is not None:
+            # Interrupt the spinner notice before rendering the diagnostic.
+            spinner.interrupt_notice()
+        show_invalid_depstring_notice(pkg, cause)
+        if spinner is not None:
+            # Resume the spinner notice.
+            spinner.resume_notice()
+
+    if spinner is not None and spinner.displays_notice():
+        writemsg_level("\n")
+        spinner.begin_notice("Calculating dependencies")
     resolver_params = create_depgraph_params(myopts, "remove")
     resolver = depgraph(
         settings, trees, myopts, resolver_params, spinner, frozen_config=frozen_config
@@ -1017,15 +1285,12 @@ def _calc_depclean(
             # by an argument atom since we don't want to clean any
             # package if something depends on it.
             for pkg in vardb:
-                if spinner:
-                    spinner.update()
-
                 try:
                     if args_set.findAtomForPackage(pkg) is None:
                         protected_set.add("=" + pkg.cpv)
                         continue
                 except portage.exception.InvalidDependString as e:
-                    show_invalid_depstring_notice(pkg, str(e))
+                    show_invalid_depstring(pkg, str(e))
                     del e
                     protected_set.add("=" + pkg.cpv)
                     continue
@@ -1052,8 +1317,6 @@ def _calc_depclean(
         # that are also matched by argument atoms, but do not remove
         # them if they match the highest installed version.
         for pkg in vardb:
-            if spinner is not None:
-                spinner.update()
             pkgs_for_cp = vardb.match_pkgs(Atom(pkg.cp))
             if not pkgs_for_cp or pkg not in pkgs_for_cp:
                 raise AssertionError(
@@ -1080,7 +1343,7 @@ def _calc_depclean(
                     protected_set.add("=" + pkg.cpv)
                     continue
             except portage.exception.InvalidDependString as e:
-                show_invalid_depstring_notice(pkg, str(e))
+                show_invalid_depstring(pkg, str(e))
                 del e
                 protected_set.add("=" + pkg.cpv)
                 continue
@@ -1090,19 +1353,17 @@ def _calc_depclean(
         required_sets["__excluded__"] = InternalPackageSet()
 
         for pkg in vardb:
-            if spinner:
-                spinner.update()
-
             try:
                 if excluded_set.findAtomForPackage(pkg):
                     required_sets["__excluded__"].add("=" + pkg.cpv)
             except portage.exception.InvalidDependString as e:
-                show_invalid_depstring_notice(pkg, str(e))
+                show_invalid_depstring(pkg, str(e))
                 del e
                 required_sets["__excluded__"].add("=" + pkg.cpv)
 
     success = resolver._complete_graph(required_sets={eroot: required_sets})
-    writemsg_level("\b\b... done!\n")
+    if spinner is not None:
+        spinner.end_notice()
 
     resolver.display_problems()
 
@@ -1167,17 +1428,11 @@ def _calc_depclean(
                 # visible in the unevaluated form of the atom. In this
                 # case, we must display the unevaluated atom, so that
                 # the user can see the conditional USE deps that would
-                # otherwise be invisible. Use Atom(str(atom)) to
-                # test for a package where this case would matter. This
-                # is not necessarily the same as atom.without_use,
-                # since Atom(str(atom)) may still contain some
-                # USE dependencies that remain after evaluation of
+                # otherwise be invisible. This is not necessarily the same as
+                # atom.without_use, since the evaluated atom may still contain
+                # some USE dependencies that remain after evaluation of
                 # conditionals.
-                if (
-                    atom.package
-                    and atom != atom.unevaluated_atom
-                    and vardb.match(Atom(str(atom)))
-                ):
+                if atom.package and atom != atom.unevaluated_atom and vardb.match(atom):
                     msg.append(f"  {atom.unevaluated_atom} ({atom}) pulled in by:")
                 else:
                     msg.append(f"  {atom} pulled in by:")
@@ -1276,6 +1531,52 @@ def _calc_depclean(
         msg.append("\n")
         portage.writemsg_stdout("".join(msg), noiselevel=-1)
 
+    cycle_components = {}
+
+    def cycle_members(pkg):
+        """
+        Return the packages that are in a dependency cycle with pkg,
+        including pkg itself.
+        """
+        if not cycle_components:
+            for component in graph.strongly_connected_components():
+                members = frozenset(component)
+                for node in component:
+                    cycle_components[node] = members
+        return cycle_components.get(pkg, frozenset([pkg]))
+
+    def show_cycle_suggestion(pkg):
+        """
+        A package that is only kept by a dependency cycle can be removed
+        by passing every member of the cycle at once, since --depclean
+        with arguments only considers the given packages (bug 346351).
+        """
+        members = cycle_members(pkg)
+        if len(members) < 2:
+            return
+
+        for member in members:
+            for parent, _atom in resolver._dynamic_config._parent_atoms.get(member, []):
+                if parent in members:
+                    continue
+                if isinstance(parent, SetArg) and parent.name == protected_set_name:
+                    # Only protected because --depclean was given
+                    # arguments, which protects everything else.
+                    continue
+                # Something outside of the cycle needs it.
+                return
+
+        resolver._dynamic_config._depclean_cycle_suggestions[pkg] = frozenset(members)
+
+        msg = [
+            f"  {pkg.cpv} is only required by packages that it requires\n",
+            "  itself. Pass all of them at once in order to remove them:\n",
+            "    emerge --depclean {}\n\n".format(
+                " ".join(sorted("=" + member.cpv for member in members))
+            ),
+        ]
+        portage.writemsg_stdout("".join(msg), noiselevel=-1)
+
     def cmp_pkg_cpv(pkg1, pkg2):
         """Sort Package instances by cpv."""
         if pkg1.cpv > pkg2.cpv:
@@ -1305,8 +1606,10 @@ def _calc_depclean(
                     if arg_atom:
                         if pkg not in graph:
                             pkgs_to_remove.append(pkg)
-                        elif "--verbose" in myopts:
-                            show_parents(pkg)
+                        else:
+                            if "--verbose" in myopts:
+                                show_parents(pkg)
+                            show_cycle_suggestion(pkg)
 
             else:
                 for pkg in sorted(vardb, key=cmp_sort_key(cmp_pkg_cpv)):
@@ -1551,9 +1854,12 @@ def _calc_depclean(
                         resolver.display_problems()
                         return _depclean_result(1, [], False, 0, resolver)
 
-            writemsg_level("\nCalculating dependencies  ")
+            if spinner is not None and spinner.displays_notice():
+                writemsg_level("\n")
+                spinner.begin_notice("Calculating dependencies")
             success = resolver._complete_graph(required_sets={eroot: required_sets})
-            writemsg_level("\b\b... done!\n")
+            if spinner is not None:
+                spinner.end_notice()
             resolver.display_problems()
             if not success:
                 return _depclean_result(1, [], False, 0, resolver)
@@ -1742,8 +2048,8 @@ def action_deselect(settings, trees, opts, atoms):
         expanded_atoms = set(atoms)
 
         for atom in atoms:
-            if not atom.startswith(SETPREFIX):
-                if atom.cp.startswith("null/"):
+            if not str(atom).startswith(SETPREFIX):
+                if atom.category == "null":
                     # try to expand category from world set
                     null_cat, pn = portage.catsplit(atom.cp)
                     for world_atom in world_atoms:
@@ -1751,7 +2057,7 @@ def action_deselect(settings, trees, opts, atoms):
                         if pn == world_pn:
                             expanded_atoms.add(
                                 Atom(
-                                    atom.replace("null", cat, 1),
+                                    str(atom).replace("null", cat, 1),
                                     allow_repo=True,
                                     allow_wildcard=True,
                                 )
@@ -1764,13 +2070,13 @@ def action_deselect(settings, trees, opts, atoms):
         discard_atoms = set()
         for atom in world_set:
             for arg_atom in expanded_atoms:
-                if arg_atom.startswith(SETPREFIX):
-                    if atom.startswith(SETPREFIX) and arg_atom == atom:
+                if str(arg_atom).startswith(SETPREFIX):
+                    if str(atom).startswith(SETPREFIX) and arg_atom == atom:
                         discard_atoms.add(atom)
                         break
                 else:
                     if (
-                        not atom.startswith(SETPREFIX)
+                        not str(atom).startswith(SETPREFIX)
                         and arg_atom.intersects(atom)
                         and not (arg_atom.slot and not atom.slot)
                         and not (arg_atom.repo and not atom.repo)
@@ -1778,13 +2084,13 @@ def action_deselect(settings, trees, opts, atoms):
                         discard_atoms.add(atom)
                         break
         if discard_atoms:
-            for atom in sorted(discard_atoms):
+            for atom in sorted(discard_atoms, key=str):
                 if pretend:
                     action_desc = "Would remove"
                 else:
                     action_desc = "Removing"
 
-                if atom.startswith(SETPREFIX):
+                if str(atom).startswith(SETPREFIX):
                     filename = "world_sets"
                 else:
                     filename = "world"
@@ -1825,11 +2131,9 @@ class _info_pkgs_ver:
     def __lt__(self, other):
         return portage.versions.vercmp(self.ver, other.ver) < 0
 
-    def toString(self):
+    def __str__(self):
         """
         This may return unicode if repo_name contains unicode.
-        Don't use __str__ and str() since unicode triggers compatibility
-        issues between python 2.x and 3.x.
         """
         return self.ver + self.repo_suffix + self.provide_suffix
 
@@ -1901,7 +2205,7 @@ def action_info(settings, trees, myopts, myfiles):
                 dbs = [IndexedVardb(vardb) if search_index else vardb]
                 # if "--usepkgonly" not in myopts:
                 dbs.append(IndexedPortdb(portdb) if search_index else portdb)
-                if "--usepkg" in myopts:
+                if myopts.get("--usepkg") is True:
                     dbs.append(bindb)
 
                 matches = similar_name_search(dbs, x)
@@ -1956,23 +2260,6 @@ def action_info(settings, trees, myopts, myfiles):
             line += f",{vm_info['swap.free'] // 1024:10d} free"
         append(line)
 
-    for repo in repos:
-        last_sync = portage.grabfile(
-            os.path.join(repo.location, "metadata", "timestamp.chk")
-        )
-        head_commit = None
-        if last_sync:
-            append(f"Timestamp of repository {repo.name}: {last_sync[0]}")
-        if repo.sync_type:
-            sync = portage.sync.module_controller.get_class(repo.sync_type)()
-            options = {"repo": repo}
-            try:
-                head_commit = sync.retrieve_head(options=options)
-            except NotImplementedError:
-                head_commit = (1, False)
-        if head_commit and head_commit[0] == os.EX_OK:
-            append(f"Head commit of repository {repo.name}: {head_commit[1]}")
-
     # Searching contents for the /bin/sh provider is somewhat
     # slow. Therefore, use the basename of the symlink target
     # to locate the package. If this fails, then only the
@@ -2007,13 +2294,31 @@ def action_info(settings, trees, myopts, myfiles):
         name = pkg.cp
         version = pkg.version
         # Omit app-shells category from the output.
-        if name.startswith("app-shells/"):
-            name = name[len("app-shells/") :]
+        name = name.removeprefix("app-shells/")
         sh_str = f"{name} {version}"
     else:
         sh_str = basename
 
-    append(f"sh {sh_str}")
+    append(f"sh: {sh_str}")
+
+    try:
+        proc = subprocess.Popen(
+            ["install", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        pass
+    else:
+        output = proc.communicate()[0].splitlines()
+        if proc.wait() == os.EX_OK and output:
+            pos = output[0].find("install ")
+            if pos == -1:
+                append(f"coreutils: {output[0]}")
+            else:
+                append(f"coreutils: {output[0][pos+8:]}")
 
     ld_names = []
     if chost:
@@ -2022,15 +2327,18 @@ def action_info(settings, trees, myopts, myfiles):
     for name in ld_names:
         try:
             proc = subprocess.Popen(
-                [name, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                [name, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                errors="replace",
             )
         except OSError:
             pass
         else:
-            output = _unicode_decode(proc.communicate()[0]).splitlines()
-            proc.wait()
+            output = proc.communicate()[0].splitlines()
             if proc.wait() == os.EX_OK and output:
-                append(f"ld {output[0]}")
+                append(f"ld: {output[0]}")
                 break
 
     try:
@@ -2040,7 +2348,7 @@ def action_info(settings, trees, myopts, myfiles):
     except OSError:
         output = (1, None)
     else:
-        output = _unicode_decode(proc.communicate()[0]).rstrip("\n")
+        output = proc.communicate()[0].decode("utf-8", "replace").rstrip("\n")
         output = (proc.wait(), output)
     if output[0] == os.EX_OK:
         distcc_str = output[1].split("\n", 1)[0]
@@ -2057,7 +2365,7 @@ def action_info(settings, trees, myopts, myfiles):
     except OSError:
         output = (1, None)
     else:
-        output = _unicode_decode(proc.communicate()[0]).rstrip("\n")
+        output = proc.communicate()[0].decode("utf-8", "replace").rstrip("\n")
         output = (proc.wait(), output)
     if output[0] == os.EX_OK:
         ccache_str = output[1].split("\n", 1)[0]
@@ -2087,7 +2395,7 @@ def action_info(settings, trees, myopts, myfiles):
                 if not atom.blocker:
                     atoms.append((x, atom))
 
-    myvars = sorted(set(atoms))
+    myvars = sorted(set(atoms), key=lambda t: str(t[0]))
 
     cp_map = {}
     cp_max_len = 0
@@ -2107,8 +2415,7 @@ def action_info(settings, trees, myopts, myfiles):
                     # additional virtual provider info
                     continue
 
-            if len(matched_cp) > cp_max_len:
-                cp_max_len = len(matched_cp)
+            cp_max_len = max(cp_max_len, len(matched_cp))
             repo = vardb.aux_get(cpv, ["repository"])[0]
             if repo:
                 repo_suffix = _repo_separator + repo
@@ -2124,17 +2431,43 @@ def action_info(settings, trees, myopts, myfiles):
 
     for cp in sorted(cp_map):
         versions = sorted(cp_map[cp].values())
-        versions = ", ".join(ver.toString() for ver in versions)
+        versions = ", ".join(str(ver) for ver in versions)
         append(f"{(cp + ':').ljust(cp_max_len + 1)} {versions}")
 
-    append("Repositories:\n")
+    append("\nRepositories:\n")
     for repo in repos:
-        append(repo.info_string())
+        append(repo.info_string().rstrip())
 
-    binrepos_conf_path = os.path.join(
-        settings["PORTAGE_CONFIGROOT"], BINREPOS_CONF_FILE
+        last_sync = portage.grabfile(
+            os.path.join(repo.location, "metadata", "timestamp.chk")
+        )
+        head_commit = None
+        if last_sync:
+            append(f"    timestamp: {last_sync[0].strip()}")
+        if repo.sync_type:
+            sync = portage.sync.module_controller.get_class(repo.sync_type)()
+            options = {"repo": repo}
+            try:
+                head_commit = sync.retrieve_head(options=options)
+            except NotImplementedError:
+                head_commit = (1, False)
+        if head_commit and head_commit[0] == os.EX_OK:
+            append(f"    head commit: {head_commit[1].strip()}")
+        append("")
+
+    binrepos_config_paths = []
+    if portage._not_installed:
+        binrepos_config_paths.append(
+            os.path.join(PORTAGE_BASE_PATH, "cnf", "binrepos.conf")
+        )
+    else:
+        binrepos_config_paths.append(
+            os.path.join(settings.global_config_path, "binrepos.conf")
+        )
+    binrepos_config_paths.append(
+        os.path.join(settings["PORTAGE_CONFIGROOT"], BINREPOS_CONF_FILE)
     )
-    binrepos_conf = BinRepoConfigLoader((binrepos_conf_path,), settings)
+    binrepos_conf = BinRepoConfigLoader(binrepos_config_paths, settings)
     if binrepos_conf and any(repo.name for repo in binrepos_conf.values()):
         append("Binary Repositories:\n")
         for repo in reversed(list(binrepos_conf.values())):
@@ -2151,33 +2484,28 @@ def action_info(settings, trees, myopts, myfiles):
         sets_line += ", ".join(installed_sets)
         append(sets_line)
 
-    if "--verbose" in myopts:
-        myvars = list(settings)
-    else:
-        myvars = [
-            "GENTOO_MIRRORS",
-            "CONFIG_PROTECT",
-            "CONFIG_PROTECT_MASK",
-            "DISTDIR",
-            "ENV_UNSET",
-            "PKGDIR",
-            "PORTAGE_TMPDIR",
-            "PORTAGE_BINHOST",
-            "PORTAGE_BUNZIP2_COMMAND",
-            "PORTAGE_BZIP2_COMMAND",
-            "USE",
-            "CHOST",
-            "CFLAGS",
-            "CXXFLAGS",
-            "ACCEPT_KEYWORDS",
-            "ACCEPT_LICENSE",
-            "FEATURES",
-            "EMERGE_DEFAULT_OPTS",
-        ]
+    myvars = [
+        "GENTOO_MIRRORS",
+        "CONFIG_PROTECT",
+        "CONFIG_PROTECT_MASK",
+        "DISTDIR",
+        "ENV_UNSET",
+        "PKGDIR",
+        "PORTAGE_TMPDIR",
+        "PORTAGE_BINHOST",
+        "PORTAGE_BUNZIP2_COMMAND",
+        "PORTAGE_BZIP2_COMMAND",
+        "USE",
+        "CHOST",
+        "CFLAGS",
+        "CXXFLAGS",
+        "ACCEPT_KEYWORDS",
+        "ACCEPT_LICENSE",
+        "FEATURES",
+        "EMERGE_DEFAULT_OPTS",
+    ]
 
-        myvars.extend(
-            portage.util.grabfile(settings["PORTDIR"] + "/profiles/info_vars")
-        )
+    myvars.extend(portage.util.grabfile(settings["PORTDIR"] + "/profiles/info_vars"))
 
     myvars_ignore_defaults = {
         "PORTAGE_BZIP2_COMMAND": "bzip2",
@@ -2235,8 +2563,7 @@ def action_info(settings, trees, myopts, myfiles):
         # Get our global settings (we only print stuff if it varies from
         # the current config)
         mydesiredvars = ["CHOST", "CFLAGS", "CXXFLAGS", "FEATURES", "LDFLAGS"]
-        auxkeys = mydesiredvars + list(vardb._aux_cache_keys)
-        auxkeys.append("DEFINED_PHASES")
+        auxkeys = list(vardb._aux_cache_keys)
         pkgsettings = portage.config(clone=settings)
 
         # Loop through each package
@@ -2291,9 +2618,17 @@ def action_info(settings, trees, myopts, myfiles):
 
             append(f"{pkg_use_display(pkg, myopts)}")
             if pkg_type == "installed":
+                unset_var = []
+                env_results = vardb._aux_env_search(cpv, mydesiredvars)
                 for myvar in mydesiredvars:
-                    if metadata[myvar].split() != settings.get(myvar, "").split():
-                        append(f'{myvar}="{metadata[myvar]}"')
+                    myval = env_results.get(myvar)
+                    if myval is None:
+                        unset_var.append(myvar)
+                    elif myval.split() != settings.get(myvar, "").split():
+                        append(f'{myvar}="{myval}"')
+                if len(unset_var) > 0:
+                    unset_var_string = ", ".join(unset_var)
+                    append(f"Unset: {unset_var_string}")
             append("")
             append("")
             writemsg_stdout("\n".join(output_buffer), noiselevel=-1)
@@ -2386,17 +2721,16 @@ def action_regen(settings, portdb, max_jobs, max_load):
     return regen.returncode
 
 
-def action_search(root_config, myopts, myfiles, spinner):
+def action_search(root_config, myopts, myfiles):
     if not myfiles:
         print("emerge: no search terms provided.")
     else:
         searchinstance = search(
             root_config,
-            spinner,
             "--searchdesc" in myopts,
             "--quiet" not in myopts,
-            "--usepkg" in myopts,
-            "--usepkgonly" in myopts,
+            myopts.get("--usepkg") is True,
+            myopts.get("--usepkgonly") is True,
             search_index=myopts.get("--search-index", "y") != "n",
             search_similarity=myopts.get("--search-similarity"),
             fuzzy=myopts.get("--fuzzy-search") != "n",
@@ -2413,23 +2747,8 @@ def action_search(root_config, myopts, myfiles, spinner):
 
 def action_sync(
     emerge_config,
-    trees=DeprecationWarning,
-    mtimedb=DeprecationWarning,
-    opts=DeprecationWarning,
-    action=DeprecationWarning,
 ):
     from portage.emaint.modules.sync.sync import SyncRepos
-
-    if not isinstance(emerge_config, _emerge_config):
-        warnings.warn(
-            "_emerge.actions.action_sync() now expects "
-            "an _emerge_config instance as the first parameter",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        emerge_config = load_emerge_config(
-            action=action, args=[], trees=trees, opts=opts
-        )
 
     syncer = SyncRepos(emerge_config)
     return_messages = "--quiet" not in emerge_config.opts
@@ -2464,7 +2783,7 @@ def action_uninstall(settings, trees, ldpath_mtimes, opts, action, files, spinne
     # For backward compat, leading '=' is not required.
     for x in files:
         if is_valid_package_atom(x, allow_repo=True) or (
-            ignore_missing_eq and is_valid_package_atom("=" + x)
+            ignore_missing_eq and is_valid_package_atom("=" + str(x))
         ):
             try:
                 atom = dep_expand(x, mydb=vardb, settings=settings)
@@ -2665,23 +2984,22 @@ def action_uninstall(settings, trees, ldpath_mtimes, opts, action, files, spinne
 
 def adjust_configs(myopts, trees):
     for myroot, mytrees in trees.items():
-        mysettings = trees[myroot]["vartree"].settings
+        mysettings = mytrees["vartree"].settings
         mysettings.unlock()
 
         # For --usepkgonly mode, propagate settings from the binary package
         # database, so that it's possible to operate without dependence on
         # a local ebuild repository and profile.
-        if "--usepkgonly" in myopts and mytrees["bintree"]._propagate_config(
-            mysettings
-        ):
-            # Also propagate changes to the portdbapi doebuild_settings
-            # attribute which is used by Package instances for USE
-            # calculations (in support of --binpkg-respect-use).
-            mytrees["porttree"].dbapi.doebuild_settings = portage.config(
-                clone=mysettings
-            )
+        if myopts.get("--usepkgonly") is True:
+            mytrees["bintree"]._propagate_config(mysettings)
 
         adjust_config(myopts, mysettings)
+
+        # Propagate additional changes to portdbapi doebuild_settings attribute
+        # used by Package instances to determine whether binary packages should
+        # be built (--buildpkg) and for USE calculations (--binpkg-respect-use).
+        mytrees["porttree"].dbapi.doebuild_settings = portage.config(clone=mysettings)
+
         mysettings.lock()
 
 
@@ -2703,7 +3021,7 @@ def adjust_config(myopts, settings):
     try:
         CLEAN_DELAY = int(settings.get("CLEAN_DELAY", str(CLEAN_DELAY)))
     except ValueError as e:
-        portage.writemsg(f"!!! {str(e)}\n", noiselevel=-1)
+        portage.writemsg(f"!!! {e!s}\n", noiselevel=-1)
         portage.writemsg(
             f"!!! Unable to parse integer: CLEAN_DELAY='{settings['CLEAN_DELAY']}'\n",
             noiselevel=-1,
@@ -2717,7 +3035,7 @@ def adjust_config(myopts, settings):
             settings.get("EMERGE_WARNING_DELAY", str(EMERGE_WARNING_DELAY))
         )
     except ValueError as e:
-        portage.writemsg(f"!!! {str(e)}\n", noiselevel=-1)
+        portage.writemsg(f"!!! {e!s}\n", noiselevel=-1)
         portage.writemsg(
             "!!! Unable to parse integer: "
             f"EMERGE_WARNING_DELAY='{settings['EMERGE_WARNING_DELAY']}'\n",
@@ -2757,7 +3075,7 @@ def adjust_config(myopts, settings):
             portage.writemsg("!!! PORTAGE_DEBUG must be either 0 or 1\n", noiselevel=-1)
             PORTAGE_DEBUG = 0
     except ValueError as e:
-        portage.writemsg(f"!!! {str(e)}\n", noiselevel=-1)
+        portage.writemsg(f"!!! {e!s}\n", noiselevel=-1)
         portage.writemsg(
             f"!!! Unable to parse integer: PORTAGE_DEBUG='{settings['PORTAGE_DEBUG']}'\n",
             noiselevel=-1,
@@ -2784,6 +3102,123 @@ def adjust_config(myopts, settings):
     if "--pkg-format" in myopts:
         settings["PORTAGE_BINPKG_FORMAT"] = myopts["--pkg-format"]
         settings.backup_changes("PORTAGE_BINPKG_FORMAT")
+
+    binpkg_selection_config(myopts, settings)
+
+
+def binpkg_selection_config(opts, settings):
+    atoms = " ".join(opts.pop("--getbinpkg-exclude", [])).split()
+    getbinpkg_exclude = WildcardPackageSet(atoms)
+    atoms = " ".join(opts.pop("--getbinpkg-include", [])).split()
+    getbinpkg_include = WildcardPackageSet(atoms)
+    atoms = " ".join(opts.pop("--usepkg-exclude", [])).split()
+    usepkg_exclude = WildcardPackageSet(atoms)
+    atoms = " ".join(opts.pop("--usepkg-include", [])).split()
+    usepkg_include = WildcardPackageSet(atoms)
+
+    # --usepkg-include and --usepkg-exclude may not overlap
+    conflicted_atoms = usepkg_exclude.getAtoms().intersection(usepkg_include.getAtoms())
+    if conflicted_atoms:
+        writemsg(
+            "\n!!! The following atoms appear in both the --usepkg-exclude "
+            "and --usepkg-include command line arguments:\n"
+            "\n    %s\n" % ("\n    ".join(str(a) for a in conflicted_atoms))
+        )
+        for a in conflicted_atoms:
+            usepkg_exclude.remove(a)
+            usepkg_include.remove(a)
+
+    # --nobindeps ignores all usepkg-include and usepkg-exclude settings
+    if "--nobindeps" in opts:
+        if not usepkg_exclude.isEmpty():
+            writemsg(
+                "\n!!! The following --usepkg-exclude atoms are ignored due "
+                "to use of --nobindeps:\n"
+                "\n    %s\n"
+                % ("\n    ".join(str(a) for a in usepkg_exclude.getAtoms()))
+            )
+            usepkg_exclude.clear()
+        if not usepkg_include.isEmpty():
+            writemsg(
+                "\n!!! The following --usepkg-include atoms are ignored due "
+                "to use of --nobindeps:\n"
+                "\n    %s\n"
+                % ("\n    ".join(str(a) for a in usepkg_include.getAtoms()))
+            )
+            usepkg_include.clear()
+        for repo in settings.repositories:
+            if not repo.usepkg_exclude.isEmpty():
+                writemsg(
+                    "\n!!! The following usepkg-exclude atoms for [%s] are "
+                    "ignored due to use of --nobindeps:\n"
+                    "\n    %s\n"
+                    % (
+                        repo.name,
+                        "\n    ".join(str(a) for a in repo.usepkg_exclude.getAtoms()),
+                    )
+                )
+                repo.usepkg_exclude.clear()
+            if not repo.usepkg_include.isEmpty():
+                writemsg(
+                    "\n!!! The following usepkg-include atoms for [%s] are "
+                    "ignored due to use of --nobindeps:\n"
+                    "\n    %s\n"
+                    % (
+                        repo.name,
+                        "\n    ".join(str(a) for a in repo.usepkg_include.getAtoms()),
+                    )
+                )
+                repo.usepkg_include.clear()
+
+    # --usepkg-exclude and --usepkg-include override repos.conf
+    for repo in settings.repositories:
+        conflicted_exclude = repo.usepkg_exclude.getAtoms().intersection(
+            usepkg_include.getAtoms()
+        )
+        if conflicted_exclude:
+            writemsg(
+                "\n!!! The following usepkg-exclude atoms for [%s] have "
+                "been overridden by the --usepkg-include option:\n"
+                "\n    %s\n"
+                % (repo.name, "\n    ".join(str(a) for a in conflicted_exclude))
+            )
+            for a in conflicted_exclude:
+                repo.usepkg_exclude.remove(a)
+        conflicted_include = repo.usepkg_include.getAtoms().intersection(
+            usepkg_exclude.getAtoms()
+        )
+        if conflicted_include:
+            writemsg(
+                "\n!!! The following usepkg-include atoms for [%s] have "
+                "been overridden by the --usepkg-exclude option:\n"
+                "\n    %s\n"
+                % (repo.name, "\n    ".join(str(a) for a in conflicted_include))
+            )
+            for a in conflicted_include:
+                repo.usepkg_include.remove(a)
+
+    # --getbinpkg-include and --getbinpkg-exclude may not overlap
+    conflicted_atoms = getbinpkg_exclude.getAtoms().intersection(
+        getbinpkg_include.getAtoms()
+    )
+    if conflicted_atoms:
+        writemsg(
+            "\n!!! The following atoms appear in both the --getbinpkg-exclude "
+            "and --getbinpkg-include command line arguments:\n"
+            "\n    %s\n" % ("\n    ".join(str(a) for a in conflicted_atoms))
+        )
+        for a in conflicted_atoms:
+            getbinpkg_exclude.remove(a)
+            getbinpkg_include.remove(a)
+
+    if not getbinpkg_exclude.isEmpty():
+        opts["--getbinpkg-exclude"] = [str(a) for a in getbinpkg_exclude]
+    if not getbinpkg_include.isEmpty():
+        opts["--getbinpkg-include"] = [str(a) for a in getbinpkg_include]
+    if not usepkg_exclude.isEmpty():
+        opts["--usepkg-exclude"] = [str(a) for a in usepkg_exclude]
+    if not usepkg_include.isEmpty():
+        opts["--usepkg-include"] = [str(a) for a in usepkg_include]
 
 
 def display_missing_pkg_set(root_config, set_name):
@@ -2983,7 +3418,7 @@ def getgccversion(chost=None):
             myoutput = None
             mystatus = 1
         else:
-            myoutput = _unicode_decode(proc.communicate()[0]).rstrip("\n")
+            myoutput = proc.communicate()[0].decode("utf-8", "replace").rstrip("\n")
             mystatus = proc.wait()
         if mystatus == os.EX_OK and myoutput.startswith(chost + "-"):
             return myoutput.replace(chost + "-", gcc_ver_prefix, 1)
@@ -2998,7 +3433,7 @@ def getgccversion(chost=None):
             myoutput = None
             mystatus = 1
         else:
-            myoutput = _unicode_decode(proc.communicate()[0]).rstrip("\n")
+            myoutput = proc.communicate()[0].decode("utf-8", "replace").rstrip("\n")
             mystatus = proc.wait()
         if mystatus == os.EX_OK:
             return gcc_ver_prefix + myoutput
@@ -3011,7 +3446,7 @@ def getgccversion(chost=None):
         myoutput = None
         mystatus = 1
     else:
-        myoutput = _unicode_decode(proc.communicate()[0]).rstrip("\n")
+        myoutput = proc.communicate()[0].decode("utf-8", "replace").rstrip("\n")
         mystatus = proc.wait()
     if mystatus == os.EX_OK:
         return gcc_ver_prefix + myoutput
@@ -3068,7 +3503,7 @@ def config_protect_check(trees):
             if settings["ROOT"] != "/":
                 msg += f" for '{root}'"
             msg += "\n"
-            writemsg_level(msg, level=logging.WARN, noiselevel=-1)
+            writemsg_level(msg, level=logging.WARNING, noiselevel=-1)
 
 
 def apply_priorities(settings):
@@ -3113,20 +3548,22 @@ def apply_priorities(settings):
 
 
 def nice(settings, pids):
+    priority = settings.get("PORTAGE_NICENESS")
+    if priority is None:
+        return
 
     for name, pid in pids:
-        cmd = f"renice -n {settings.get('PORTAGE_NICENESS', '0')} {pid}".split()
+        cmd = ["renice", "-n", priority, str(pid)]
         try:
             with open(os.devnull, "wb", 0) as dev_null:
                 rval = portage.process.spawn(
                     cmd, env=os.environ, fd_pipes={1: dev_null.fileno()}
                 )
         except portage.exception.CommandNotFound:
-            if "PORTAGE_NICENESS" in settings:
-                out = portage.output.EOutput()
-                out.eerror(
-                    f"PORTAGE_NICENESS not applied because the renice command was not found"
-                )
+            out = portage.output.EOutput()
+            out.eerror(
+                "PORTAGE_NICENESS not applied because the renice command was not found"
+            )
             return
         if rval != os.EX_OK:
             out = portage.output.EOutput()
@@ -3307,7 +3744,7 @@ def expand_set_arguments(myfiles, myaction, root_config):
     ARG_START = "{"
     ARG_END = "}"
 
-    for i in range(0, len(myfiles)):
+    for i in range(len(myfiles)):
         if myfiles[i].startswith(SETPREFIX):
             start = 0
             end = 0
@@ -3495,10 +3932,11 @@ def repo_name_duplicate_check(trees):
 
 def run_action(emerge_config):
     # skip global updates prior to sync, since it's called after sync
+    from portage.news import count_unread_news, display_news_notifications
+
     from _emerge.help import emerge_help
     from _emerge.post_emerge import display_news_notification, post_emerge
     from _emerge.stdout_spinner import stdout_spinner
-    from portage.news import count_unread_news, display_news_notifications
 
     configs = [emerge_config.target_config]
     if emerge_config.target_config.root != emerge_config.running_config.root:
@@ -3541,18 +3979,19 @@ def run_action(emerge_config):
         emerge_config.opts["--buildpkg"] = True
 
     if "getbinpkg" in emerge_config.target_config.settings.features:
+        if emerge_config.opts.get("--getbinpkg") is not False:
+            emerge_config.opts["--getbinpkg"] = True
+
+    if emerge_config.opts.get("--getbinpkgonly") is True:
         emerge_config.opts["--getbinpkg"] = True
 
-    if "--getbinpkgonly" in emerge_config.opts:
-        emerge_config.opts["--getbinpkg"] = True
-
-    if "--getbinpkgonly" in emerge_config.opts:
+    if emerge_config.opts.get("--getbinpkgonly") is True:
         emerge_config.opts["--usepkgonly"] = True
 
-    if "--getbinpkg" in emerge_config.opts:
+    if emerge_config.opts.get("--getbinpkg") is True:
         emerge_config.opts["--usepkg"] = True
 
-    if "--usepkgonly" in emerge_config.opts:
+    if emerge_config.opts.get("--usepkgonly") is True:
         emerge_config.opts["--usepkg"] = True
 
     # Populate the bintree with current --getbinpkg setting.
@@ -3560,7 +3999,10 @@ def run_action(emerge_config):
     # * expand_set_arguments, in case any sets use the bintree
     # * adjust_configs and profile_check, in order to propagate settings
     #   implicit IUSE and USE_EXPAND settings from the binhost(s)
-    if emerge_config.action in ("search", None) and "--usepkg" in emerge_config.opts:
+    if (
+        emerge_config.action in ("search", None)
+        and emerge_config.opts.get("--usepkg") is True
+    ):
         for mytrees in emerge_config.trees.values():
             kwargs = {}
             if (
@@ -3573,10 +4015,14 @@ def run_action(emerge_config):
                 )
 
             kwargs["pretend"] = "--pretend" in emerge_config.opts
+            if "--getbinpkg-exclude" in emerge_config.opts:
+                kwargs["getbinpkg_exclude"] = emerge_config.opts["--getbinpkg-exclude"]
+            if "--getbinpkg-include" in emerge_config.opts:
+                kwargs["getbinpkg_include"] = emerge_config.opts["--getbinpkg-include"]
 
             try:
                 mytrees["bintree"].populate(
-                    getbinpkgs="--getbinpkg" in emerge_config.opts,
+                    getbinpkgs=emerge_config.opts.get("--getbinpkg") is True,
                     getbinpkg_refresh=True,
                     verbose="--verbose" in emerge_config.opts,
                     **kwargs,
@@ -3608,7 +4054,7 @@ def run_action(emerge_config):
     for fmt in emerge_config.target_config.settings.get(
         "PORTAGE_BINPKG_FORMAT", ""
     ).split():
-        if not fmt in portage.const.SUPPORTED_BINPKG_FORMATS:
+        if fmt not in portage.const.SUPPORTED_BINPKG_FORMATS:
             if "--pkg-format" in emerge_config.opts:
                 problematic = "--pkg-format"
             else:
@@ -3636,7 +4082,7 @@ def run_action(emerge_config):
 
     spinner = stdout_spinner()
     if "candy" in emerge_config.target_config.settings.features:
-        spinner.update = spinner.update_scroll
+        spinner.mode = spinner.SCROLL
 
     if "--quiet" not in emerge_config.opts:
         portage.deprecated_profile_check(settings=emerge_config.target_config.settings)
@@ -3730,7 +4176,7 @@ def run_action(emerge_config):
         return 1
 
     if "--quiet" in emerge_config.opts:
-        spinner.update = spinner.update_quiet
+        spinner.mode = spinner.QUIET
         portage.util.noiselimit = -1
 
     if "--fetch-all-uri" in emerge_config.opts:
@@ -3751,23 +4197,27 @@ def run_action(emerge_config):
         )
         return 1
 
-    if emerge_config.target_config.settings.get("PORTAGE_DEBUG", "") == "1":
-        spinner.update = spinner.update_quiet
+    debug = emerge_config.target_config.settings.get("PORTAGE_DEBUG", "") == "1"
+
+    if debug:
         portage.util.noiselimit = 0
         if "python-trace" in emerge_config.target_config.settings.features:
             portage.debug.set_trace(True)
 
-    if not "--quiet" in emerge_config.opts:
+    if "--quiet" not in emerge_config.opts:
         if (
             "--nospinner" in emerge_config.opts
             or emerge_config.target_config.settings.get("TERM") == "dumb"
             or not sys.stdout.isatty()
         ):
-            spinner.update = spinner.update_basic
+            spinner.mode = spinner.STATIC
 
     if "--debug" in emerge_config.opts:
         print("myaction", emerge_config.action)
         print("myopts", emerge_config.opts)
+
+    if debug:
+        spinner.mode = spinner.QUIET
 
     if (
         not emerge_config.action
@@ -3863,9 +4313,7 @@ def run_action(emerge_config):
                 break
     if disable_emergelog:
         pass
-    elif emerge_config.action in ("search", "info"):
-        disable_emergelog = True
-    elif portage.data.secpass < 1:
+    elif emerge_config.action in ("search", "info") or portage.data.secpass < 1:
         disable_emergelog = True
 
     import _emerge.emergelog
@@ -3891,14 +4339,13 @@ def run_action(emerge_config):
             _emerge.emergelog._emerge_log_dir = default_log_dir
             portage.util.ensure_dirs(_emerge.emergelog._emerge_log_dir)
 
-    if not "--pretend" in emerge_config.opts:
+    if "--pretend" not in emerge_config.opts:
         time_fmt = "%b %d, %Y %H:%M:%S"
         time_str = time.strftime(time_fmt, time.localtime(time.time()))
         # Avoid potential UnicodeDecodeError in Python 2, since strftime
         # returns bytes in Python 2, and %b may contain non-ascii chars.
-        time_str = _unicode_decode(
-            time_str, encoding=_encodings["content"], errors="replace"
-        )
+        if isinstance(time_str, bytes):
+            time_str = time_str.decode("utf-8", "replace")
         emergelog(xterm_titles, f"Started emerge on: {time_str}")
         myelogstr = ""
         if emerge_config.opts:
@@ -3965,7 +4412,7 @@ def run_action(emerge_config):
     elif "search" == emerge_config.action:
         validate_ebuild_environment(emerge_config.trees)
         action_search(
-            emerge_config.target_config, emerge_config.opts, emerge_config.args, spinner
+            emerge_config.target_config, emerge_config.opts, emerge_config.args
         )
 
     elif emerge_config.action in (
@@ -4013,12 +4460,12 @@ def run_action(emerge_config):
                     # look at the ebuilds, since EAPI 4 allows running pkg_info
                     # on non-installed packages
                     valid_atom = dep_expand(x, mydb=vardb)
-                    if valid_atom.cp.split("/")[0] == "null":
+                    if valid_atom.category == "null":
                         valid_atom = dep_expand(x, mydb=portdb)
 
                     if (
-                        valid_atom.cp.split("/")[0] == "null"
-                        and "--usepkg" in emerge_config.opts
+                        valid_atom.category == "null"
+                        and emerge_config.opts.get("--usepkg") is True
                     ):
                         valid_atom = dep_expand(x, mydb=bindb)
 

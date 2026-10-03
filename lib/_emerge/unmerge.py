@@ -2,22 +2,23 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import logging
+import os
 import signal
 import sys
 import textwrap
+
 import portage
-from portage import os
-from portage.dbapi._expand_new_virt import expand_new_virt
-from portage.output import bold, colorize, darkgreen, green
 from portage._sets import SETPREFIX
 from portage._sets.base import EditablePackageSet
-from portage.versions import cpv_sort_key, _pkg_str
+from portage.dbapi._expand_new_virt import expand_new_virt
+from portage.output import bold, colorize, darkgreen, green
+from portage.versions import _pkg_str, cpv_sort_key
 
+from _emerge.countdown import countdown
 from _emerge.emergelog import emergelog
 from _emerge.Package import Package
-from _emerge.UserQuery import UserQuery
 from _emerge.UninstallFailure import UninstallFailure
-from _emerge.countdown import countdown
+from _emerge.UserQuery import UserQuery
 
 
 def _unmerge_display(
@@ -122,8 +123,9 @@ def _unmerge_display(
                 print(f"\nNo packages to {unmerge_action} have been provided.\n")
                 return 1, {}
             for x in unmerge_files:
-                arg_parts = x.split("/")
-                if x[0] not in [".", "/"] and arg_parts[-1][-7:] != ".ebuild":
+                x_str = str(x)  # this could be an Atom, stringify
+                arg_parts = x_str.split("/")
+                if x_str[0] not in [".", "/"] and arg_parts[-1][-7:] != ".ebuild":
                     # possible cat/pkg or dep; treat as such
                     candidate_catpkgs.append(x)
                 elif unmerge_action in ["prune", "clean"]:
@@ -165,7 +167,7 @@ def _unmerge_display(
                         )
                         return 1, {}
 
-                    for idx in range(0, sp_vdb_len):
+                    for idx in range(sp_vdb_len):
                         if idx >= sp_absx_len or sp_vdb[idx] != sp_absx[idx]:
                             print(sp_absx)
                             print(absx)
@@ -206,12 +208,13 @@ def _unmerge_display(
         for x in candidate_catpkgs:
             # cycle through all our candidate deps and determine
             # what will and will not get unmerged
+            x_str = str(x)  # this could be an Atom, stringify
             try:
                 mymatch = vartree.dbapi.match(x)
             except portage.exception.AmbiguousPackageName as errpkgs:
                 print(
                     '\n\n!!! The short ebuild name "'
-                    + x
+                    + x_str
                     + '" is ambiguous.  Please specify'
                 )
                 print(
@@ -223,11 +226,11 @@ def _unmerge_display(
                 print()
                 sys.exit(1)
 
-            if not mymatch and x[0] not in "<>=~":
+            if not mymatch and x_str[0] not in "<>=~":
                 mymatch = vartree.dep_match(x)
             if not mymatch:
                 portage.writemsg(
-                    f"\n--- Couldn't find '{x.replace('null/', '')}' to {unmerge_action}.\n",
+                    f"\n--- Couldn't find '{x_str.replace('null/', '')}' to {unmerge_action}.\n",
                     noiselevel=-1,
                 )
                 continue
@@ -323,7 +326,6 @@ def _unmerge_display(
             return 1, {}
     finally:
         if vdb_lock:
-            vartree.dbapi.flush_cache()
             vartree.dbapi.unlock()
 
     # generate a list of package sets that are directly or indirectly listed in "selected",

@@ -1,4 +1,4 @@
-# Copyright 2005-2024 Gentoo Authors
+# Copyright 2005-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 # Author(s): Brian Harring (ferringb@gentoo.org)
 
@@ -9,12 +9,13 @@ try:
 except ImportError:
     gdbm = None
 
+import errno
+import glob
+import os
 import pickle
+import secrets
 
-from portage import _unicode_encode
-from portage import os
-from portage.cache import fs_template
-from portage.cache import cache_errors
+from portage.cache import cache_errors, fs_template
 
 
 class database(fs_template.FsBased):
@@ -24,6 +25,8 @@ class database(fs_template.FsBased):
     autocommits = True
     cleanse_keys = True
     serialize_eclasses = False
+
+    __db = None
 
     def __init__(self, *args, **config):
         super().__init__(*args, **config)
@@ -36,36 +39,64 @@ class database(fs_template.FsBased):
             self.location, fs_template.gen_label(self.location, self.label) + default_db
         )
         self.__db = None
-        mode = "w"
-        if dbm.whichdb(self._db_path) in ("dbm.gnu", "gdbm"):
-            # Allow multiple concurrent writers (see bug #53607).
-            mode += "u"
         try:
             # dbm.open() will not work with bytes in python-3.1:
             #   TypeError: can't concat bytes to str
-            self.__db = dbm.open(self._db_path, mode, self._perms)
+            self.__db = dbm.open(self._db_path, self._open_mode(), self._perms)
         except dbm.error:
-            # XXX handle this at some point
             try:
                 self._ensure_dirs()
                 self._ensure_dirs(self._db_path)
-            except OSError as e:
-                raise cache_errors.InitializationError(self.__class__, e)
-
-            # try again if failed
-            try:
-                if self.__db is None:
-                    # dbm.open() will not work with bytes in python-3.1:
-                    #   TypeError: can't concat bytes to str
-                    if gdbm is None:
-                        self.__db = dbm.open(self._db_path, "c", self._perms)
-                    else:
-                        # Prefer gdbm type if available, since it allows
-                        # multiple concurrent writers (see bug #53607).
-                        self.__db = gdbm.open(self._db_path, "cu", self._perms)
+                self._create()
+                self.__db = dbm.open(self._db_path, self._open_mode(), self._perms)
             except dbm.error as e:
                 raise cache_errors.InitializationError(self.__class__, e)
         self._ensure_access(self._db_path)
+
+    def _create(self):
+        # Another process may be creating the same database, and a file that
+        # dbm has not finished writing has no recognizable type. Create the
+        # database under a temporary name and link it into place, which is
+        # atomic when the dbm type uses a single file (gdbm, sqlite3). Links
+        # cannot cross filesystems, so the temporary file stays in the same
+        # directory.
+        db_dir, db_name = os.path.split(self._db_path)
+        tmp_path = os.path.join(db_dir, f".{db_name}.{secrets.token_hex(8)}")
+        tmp_glob = glob.escape(tmp_path) + "*"
+        try:
+            self._create_at(tmp_path)
+            # Some dbm types add suffixes to the name, or use several files.
+            for tmp_file in glob.glob(tmp_glob):
+                try:
+                    os.link(tmp_file, self._db_path + tmp_file[len(tmp_path) :])
+                except FileExistsError:
+                    pass
+                except OSError as e:
+                    if e.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP):
+                        raise
+                    # The filesystem has no hard links, so create in place.
+                    self._create_at(self._db_path)
+                    break
+        finally:
+            for tmp_file in glob.glob(tmp_glob):
+                try:
+                    os.unlink(tmp_file)
+                except OSError:
+                    pass
+
+    def _create_at(self, path):
+        if gdbm is None:
+            dbm.open(path, "c", self._perms).close()
+        else:
+            # Prefer gdbm type if available, since it allows
+            # multiple concurrent writers (see bug #53607).
+            gdbm.open(path, "cu", self._perms).close()
+
+    def _open_mode(self):
+        if dbm.whichdb(self._db_path) in ("dbm.gnu", "gdbm"):
+            # Allow multiple concurrent writers (see bug #53607).
+            return "wu"
+        return "w"
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -76,11 +107,7 @@ class database(fs_template.FsBased):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        mode = "w"
-        if dbm.whichdb(self._db_path) in ("dbm.gnu", "gdbm"):
-            # Allow multiple concurrent writers (see bug #53607).
-            mode += "u"
-        self.__db = dbm.open(self._db_path, mode, self._perms)
+        self.__db = dbm.open(self._db_path, self._open_mode(), self._perms)
 
     def iteritems(self):
         # dbm doesn't implement items()
@@ -89,10 +116,12 @@ class database(fs_template.FsBased):
 
     def _getitem(self, cpv):
         # we override getitem because it's just a cpickling of the data handed in.
-        return pickle.loads(self.__db[_unicode_encode(cpv)])
+        return pickle.loads(self.__db[cpv.encode("utf-8", "backslashreplace")])
 
     def _setitem(self, cpv, values):
-        self.__db[_unicode_encode(cpv)] = pickle.dumps(values, pickle.HIGHEST_PROTOCOL)
+        self.__db[cpv.encode("utf-8", "backslashreplace")] = pickle.dumps(
+            values, pickle.HIGHEST_PROTOCOL
+        )
 
     def _delitem(self, cpv):
         del self.__db[cpv]
@@ -103,10 +132,17 @@ class database(fs_template.FsBased):
     def __contains__(self, cpv):
         return cpv in self.__db
 
-    def __del__(self):
-        if "__db" in self.__dict__ and self.__db is not None:
-            self.__db.sync()
-            self.__db.close()
+    def close(self):
+        db, self.__db = self.__db, None
+        if db is None:
+            return
+        try:
+            super().close()
+            # dbm.sqlite3 and dbm.ndbm have no sync().
+            if hasattr(db, "sync"):
+                db.sync()
+        finally:
+            db.close()
 
     # TODO: do we need iteritems()?
     items = iteritems

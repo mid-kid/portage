@@ -9,36 +9,32 @@ import glob
 import itertools
 import json
 import logging
+import os
 import random
 import re
 import shlex
+import shutil
 import stat
 import sys
 import tempfile
 import time
-
 from collections import OrderedDict
-from urllib.parse import urlparse
 from urllib.parse import quote as urlquote
+from urllib.parse import urlparse
 
 import portage
-
 from portage import (
-    os,
-    selinux,
-    shutil,
-    _encodings,
     _movefile,
-    _unicode_encode,
+    selinux,
 )
 from portage.checksum import (
+    _apply_hash_filter,
+    _filter_unaccelarated_hashes,
+    _hash_filter,
+    checksum_str,
     get_valid_checksum_keys,
     perform_md5,
     verify_all,
-    _filter_unaccelarated_hashes,
-    _hash_filter,
-    _apply_hash_filter,
-    checksum_str,
 )
 from portage.const import BASH_BINARY, CUSTOM_MIRRORS_FILE, GLOBAL_CONFIG_PATH
 from portage.data import portage_gid, portage_uid, userpriv_groups
@@ -50,7 +46,8 @@ from portage.exception import (
 )
 from portage.localization import _
 from portage.locks import lockfile, unlockfile
-from portage.output import colorize, EOutput
+from portage.output import EOutput, colorize
+from portage.process import spawn
 from portage.util import (
     apply_recursive_permissions,
     apply_secpass_permissions,
@@ -62,7 +59,6 @@ from portage.util import (
     writemsg_stdout,
 )
 from portage.util.futures import asyncio
-from portage.process import spawn
 
 _download_suffix = ".__download__"
 
@@ -311,25 +307,28 @@ def _checksum_failure_temp_file(settings, distdir, basename):
     size = os.stat(filename).st_size
     checksum = None
     tempfile_re = re.compile(re.escape(normal_basename) + r"\._checksum_failure_\..*")
-    for temp_filename in os.listdir(distdir):
-        if not tempfile_re.match(temp_filename):
-            continue
-        temp_filename = os.path.join(distdir, temp_filename)
-        try:
-            if size != os.stat(temp_filename).st_size:
+    with os.scandir(distdir) as it:
+        for temp_filename in it:
+            if not tempfile_re.match(temp_filename.name):
                 continue
-        except OSError:
-            continue
-        try:
-            temp_checksum = perform_md5(temp_filename)
-        except FileNotFound:
-            # Apparently the temp file disappeared. Let it go.
-            continue
-        if checksum is None:
-            checksum = perform_md5(filename)
-        if checksum == temp_checksum:
-            os.unlink(filename)
-            return temp_filename
+
+            try:
+                if size != temp_filename.stat(follow_symlinks=False).st_size:
+                    continue
+            except OSError:
+                continue
+
+            try:
+                temp_checksum = perform_md5(temp_filename.path)
+            except FileNotFound:
+                # Apparently the temp file disappeared. Let it go.
+                continue
+
+            if checksum is None:
+                checksum = perform_md5(filename)
+            if checksum == temp_checksum:
+                os.unlink(filename)
+                return temp_filename.path
 
     fd, temp_filename = tempfile.mkstemp(
         "", normal_basename + "._checksum_failure_.", distdir
@@ -473,7 +472,11 @@ class FlatLayout:
         for dirpath, dirnames, filenames in os.walk(distdir, onerror=_raise_exc):
             for filename in filenames:
                 try:
-                    yield portage._unicode_decode(filename, errors="strict")
+                    yield (
+                        filename.decode("utf-8", "strict")
+                        if isinstance(filename, bytes)
+                        else filename
+                    )
                 except UnicodeDecodeError:
                     # Ignore it. Distfiles names must have valid UTF8 encoding.
                     pass
@@ -506,11 +509,11 @@ class FilenameHashLayout:
             c = c // 4
             pattern += c * "[0-9a-f]" + "/"
         pattern += "*"
-        for x in glob.iglob(
-            portage._unicode_encode(os.path.join(distdir, pattern), errors="strict")
-        ):
+        for x in glob.iglob(os.path.join(distdir, pattern)):
             try:
-                yield portage._unicode_decode(x, errors="strict").rsplit("/", 1)[1]
+                yield (
+                    x.decode("utf-8", "strict") if isinstance(x, bytes) else x
+                ).rsplit("/", 1)[1]
             except UnicodeDecodeError:
                 # Ignore it. Distfiles names must have valid UTF8 encoding.
                 pass
@@ -634,9 +637,9 @@ class MirrorLayoutConfig:
 
     def read_from_file(self, f):
         from portage.util.configparser import (
+            ConfigParserError,
             SafeConfigParser,
             read_configs,
-            ConfigParserError,
         )
 
         cp = SafeConfigParser()
@@ -1198,7 +1201,7 @@ async def async_fetch(
             await _ensure_distdir(mysettings, mysettings["DISTDIR"])
         except PortageException as e:
             if not os.path.isdir(mysettings["DISTDIR"]):
-                writemsg(f"!!! {str(e)}\n", noiselevel=-1)
+                writemsg(f"!!! {e!s}\n", noiselevel=-1)
                 writemsg(
                     _("!!! Directory Not Found: DISTDIR='%s'\n")
                     % mysettings["DISTDIR"],
@@ -1306,11 +1309,7 @@ async def async_fetch(
                     ):
                         has_space_superuser = False
 
-                    if not has_space_superuser:
-                        has_space = False
-                    elif portage.data.secpass < 2:
-                        has_space = False
-                    elif userfetch:
+                    if not has_space_superuser or portage.data.secpass < 2 or userfetch:
                         has_space = False
 
             if distdir_writable and use_locks:
@@ -1811,8 +1810,16 @@ async def async_fetch(
                         if v is not None:
                             variables[k] = v
 
-                    myfetch = varexpand(locfetch, mydict=variables)
-                    myfetch = shlex.split(myfetch)
+                    fetch_wrapper = mysettings.get("FETCH_WRAPPER")
+                    if fetch_wrapper:
+                        wrapper_args = shlex.split(
+                            varexpand(fetch_wrapper, mydict=variables)
+                        )
+                        fetch_args = shlex.split(varexpand(locfetch, mydict=variables))
+                        myfetch = wrapper_args + [shlex.join(fetch_args)]
+                    else:
+                        myfetch = varexpand(locfetch, mydict=variables)
+                        myfetch = shlex.split(myfetch)
 
                     myret = -1
                     try:
@@ -1909,15 +1916,11 @@ async def async_fetch(
                                 ):
                                     html404 = re.compile(
                                         "<title>.*(not found|404).*</title>",
-                                        re.I | re.M,
+                                        re.IGNORECASE | re.MULTILINE,
                                     )
                                     with open(
-                                        _unicode_encode(
-                                            download_path,
-                                            encoding=_encodings["fs"],
-                                            errors="strict",
-                                        ),
-                                        encoding=_encodings["content"],
+                                        download_path,
+                                        encoding="utf-8",
                                         errors="replace",
                                     ) as f:
                                         if html404.search(f.read()):
@@ -2044,9 +2047,7 @@ async def async_fetch(
                     " the ebuild for more information.\n\n"
                 ) % (mysettings["CATEGORY"], mysettings["PF"])
                 writemsg_level(msg, level=logging.ERROR, noiselevel=-1)
-            elif restrict_fetch:
-                pass
-            elif listonly:
+            elif restrict_fetch or listonly:
                 pass
             elif not filedict[myfile]:
                 writemsg(
@@ -2058,10 +2059,7 @@ async def async_fetch(
                     _("!!! Couldn't download '%s'. Aborting.\n") % myfile, noiselevel=-1
                 )
 
-            if listonly:
-                failed_files.add(myfile)
-                continue
-            elif fetchonly:
+            if listonly or fetchonly:
                 failed_files.add(myfile)
                 continue
             return 0

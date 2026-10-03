@@ -102,7 +102,9 @@ def create_world_atom(pkg, args_set, root_config, before_install=False):
             if len(matched_slots) == 1:
                 new_world_atom = slot_atom
                 if arg_atom.repo:
-                    new_world_atom += _repo_separator + arg_atom.repo
+                    new_world_atom = (
+                        str(new_world_atom) + _repo_separator + arg_atom.repo
+                    )
 
     if new_world_atom == sets["selected"].findAtomForPackage(pkg):
         # Both atoms would be identical, so there's nothing to add.
@@ -113,7 +115,7 @@ def create_world_atom(pkg, args_set, root_config, before_install=False):
         # gcc for example.
         system_atom = sets["system"].findAtomForPackage(pkg)
         if system_atom:
-            if not system_atom.cp.startswith("virtual/"):
+            if system_atom.category != "virtual":
                 return None
             # System virtuals aren't safe to exclude from world since they can
             # match multiple old-style virtuals but only one of them will be

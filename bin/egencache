@@ -2,7 +2,18 @@
 # Copyright 2009-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import locale
 import os
+import sys
+
+if (
+    sys.getfilesystemencoding().lower() != "utf-8"
+    or locale.getpreferredencoding(False).lower() != "utf-8"
+):
+    os.environ["PYTHONUTF8"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 import signal
 
 
@@ -30,7 +41,6 @@ try:
     import argparse
     import shlex
     import stat
-    import sys
     import functools
     import logging
     import subprocess
@@ -51,7 +61,6 @@ try:
     import portage
 
     portage._internal_caller = True
-    from portage import os, _encodings, _unicode_encode, _unicode_decode
     from portage.cache.cache_errors import CacheError, StatCollision
     from portage.cache.index.pkg_desc_index import (
         pkg_desc_index_line_format,
@@ -562,9 +571,7 @@ try:
             new = {}
             if display_updates:
                 try:
-                    with open(
-                        self._output_file, encoding=_encodings["repo.content"]
-                    ) as f:
+                    with open(self._output_file, encoding="utf-8") as f:
                         for line in f:
                             pkg_desc = pkg_desc_index_line_read(line)
                             old[pkg_desc.cp] = pkg_desc
@@ -572,9 +579,7 @@ try:
                     pass
 
             portage.util.ensure_dirs(os.path.dirname(self._output_file))
-            f = portage.util.atomic_ofstream(
-                self._output_file, encoding=_encodings["repo.content"]
-            )
+            f = portage.util.atomic_ofstream(self._output_file, encoding="utf-8")
 
             portdb = self._portdb
             for cp in portdb.cp_all():
@@ -663,18 +668,14 @@ try:
                         # Probe in binary mode, in order to avoid
                         # potential character encoding issues.
                         output = open(
-                            _unicode_encode(
-                                desc_path, encoding=_encodings["fs"], errors="strict"
-                            ),
+                            desc_path,
                             "r+b",
                         )
                     else:
                         output = atomic_ofstream(
-                            _unicode_encode(
-                                desc_path, encoding=_encodings["fs"], errors="strict"
-                            ),
+                            desc_path,
                             mode="w",
-                            encoding=_encodings["repo.content"],
+                            encoding="utf-8",
                             errors="backslashreplace",
                         )
                 except OSError as e:
@@ -699,11 +700,9 @@ try:
                     self._preserve_comments = False
                     try:
                         output = atomic_ofstream(
-                            _unicode_encode(
-                                desc_path, encoding=_encodings["fs"], errors="strict"
-                            ),
+                            desc_path,
                             mode="w",
-                            encoding=_encodings["repo.content"],
+                            encoding="utf-8",
                             errors="backslashreplace",
                         )
                     except OSError as e:
@@ -729,35 +728,27 @@ try:
                 # Finished probing comments in binary mode, now append
                 # in text mode.
                 output = atomic_ofstream(
-                    _unicode_encode(
-                        desc_path, encoding=_encodings["fs"], errors="strict"
-                    ),
+                    desc_path,
                     mode="w",
-                    encoding=_encodings["repo.content"],
+                    encoding="utf-8",
                     errors="backslashreplace",
                 )
                 # Copy previous content in order to simulate "append" with atomic_ofstream.
                 with open(
-                    _unicode_encode(
-                        desc_path, encoding=_encodings["fs"], errors="strict"
-                    ),
-                    encoding=_encodings["repo.content"],
+                    desc_path,
+                    encoding="utf-8",
                     errors="backslashreplace",
                 ) as previous_content:
                     for line in previous_content:
                         output.write(line)
                 output.write("\n")
             else:
-                output.write(
-                    textwrap.dedent(
-                        """\
+                output.write(textwrap.dedent("""\
                     # This file is deprecated as per GLEP 56 in favor of metadata.xml. Please add
                     # your descriptions to your package's metadata.xml ONLY.
                     # * generated automatically using egencache *
 
-                    """
-                    )
-                )
+                    """))
 
             # The cmp function no longer exists in python3, so we'll
             # implement our own here under a slightly different name
@@ -787,9 +778,7 @@ try:
                 metadata_path = os.path.join(repo_path, cp, "metadata.xml")
                 try:
                     metadata = ElementTree.parse(
-                        _unicode_encode(
-                            metadata_path, encoding=_encodings["fs"], errors="strict"
-                        ),
+                        metadata_path,
                         parser=ElementTree.XMLParser(target=_MetadataTreeBuilder()),
                     )
                 except OSError:
@@ -903,9 +892,7 @@ try:
         @staticmethod
         def grab(cmd):
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-            return _unicode_decode(
-                p.communicate()[0], encoding=_encodings["stdio"], errors="strict"
-            )
+            return p.communicate()[0].decode("utf-8", "strict")
 
         def generate_changelog(self, cp):
             os.chdir(os.path.join(self._repo_path, cp))
@@ -932,7 +919,7 @@ try:
                 output = atomic_ofstream(
                     self._changelog_output,
                     mode="w",
-                    encoding=_encodings["repo.content"],
+                    encoding="utf-8",
                     errors="backslashreplace",
                 )
             except OSError as e:
@@ -944,16 +931,12 @@ try:
                 self.returncode |= 2
                 return
 
-            output.write(
-                textwrap.dedent(
-                    f"""\
+            output.write(textwrap.dedent(f"""\
                 # ChangeLog for {cp}
                 # Copyright 1999-{time.strftime("%Y")} Gentoo Foundation; Distributed under the GPL v2
                 # (auto-generated from git log)
 
-                """
-                )
-            )
+                """))
 
             # now grab all the commits
             revlist_cmd = ["git", self._work_tree, "rev-list"]
@@ -1031,7 +1014,7 @@ try:
                 if not changed:
                     continue
 
-                (ts, author) = cinfo[0].split(" ", 1)
+                ts, author = cinfo[0].split(" ", 1)
                 date = time.strftime("%d %b %Y", time.gmtime(float(ts)))
 
                 changed = [str(x) for x in sorted(changed)]

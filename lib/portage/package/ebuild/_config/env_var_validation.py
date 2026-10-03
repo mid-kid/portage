@@ -1,9 +1,10 @@
 # Copyright 2010 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
-from portage import os
-from portage.process import find_binary
+import os
 import shlex
+
+from portage.process import find_binary
 
 
 def validate_cmd_var(v):

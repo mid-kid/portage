@@ -177,6 +177,22 @@ class digraph:
                     children.append(child)
         return children
 
+    def child_nodes_iter(self, node, ignore_priority=None):
+        """Yield all children of the specified node, in child_nodes() order"""
+        children = self.nodes[node][0]
+        if ignore_priority is None:
+            yield from children
+        elif hasattr(ignore_priority, "__call__"):
+            for child, priorities in children.items():
+                for priority in reversed(priorities):
+                    if not ignore_priority(priority):
+                        yield child
+                        break
+        else:
+            for child, priorities in children.items():
+                if ignore_priority < priorities[-1]:
+                    yield child
+
     def parent_nodes(self, node, ignore_priority=None):
         """Return all parents of the specified node"""
         if ignore_priority is None:
@@ -269,6 +285,29 @@ class digraph:
         """Checks if the digraph is empty"""
         return len(self.nodes) == 0
 
+    def induced_subgraph(self, nodes):
+        """Return a new digraph containing only the given nodes, and the
+        edges of this graph whose endpoints are both in nodes.
+
+        Node order is this graph's insertion order restricted to nodes."""
+        if not isinstance(nodes, (set, frozenset, dict)):
+            nodes = frozenset(nodes)
+        sub = digraph()
+        sub_nodes = sub.nodes
+        order = [node for node in self.order if node in nodes]
+        for node in order:
+            sub_nodes[node] = ({}, {}, node)
+        for node in order:
+            for child, priorities in self.nodes[node][0].items():
+                if child in nodes:
+                    # Share one fresh priorities list between the child and
+                    # parent views of the edge, as add()/clone() do.
+                    priorities = priorities[:]
+                    sub_nodes[node][0][child] = priorities
+                    sub_nodes[child][1][node] = priorities
+        sub.order = order
+        return sub
+
     def clone(self):
         clone = digraph()
         clone.nodes = {}
@@ -328,7 +367,7 @@ class digraph:
         while queue:
             parent, n = queue.popleft()
             yield parent, n
-            new = set(self.child_nodes(n, ignore_priority)) - enqueued
+            new = set(self.child_nodes_iter(n, ignore_priority)) - enqueued
             enqueued |= new
             queue.extend([(n, child) for child in new])
 
@@ -344,6 +383,63 @@ class digraph:
             if child == end:
                 return paths[child]
         return None
+
+    def strongly_connected_components(self, ignore_priority=None):
+        """
+        Return the strongly connected components of the graph, computed
+        with an iterative Tarjan pass, in reverse topological order.
+        Components of a single node that has no edge to itself are
+        included as well.
+        """
+        index_counter = 0
+        indices = {}
+        lowlink = {}
+        stack = []
+        on_stack = set()
+        components = []
+
+        for root in self.order:
+            if root in indices:
+                continue
+
+            work = [(root, None)]
+            while work:
+                node, children = work[-1]
+                if children is None:
+                    indices[node] = index_counter
+                    lowlink[node] = index_counter
+                    index_counter += 1
+                    stack.append(node)
+                    on_stack.add(node)
+                    children = list(
+                        self.child_nodes_iter(node, ignore_priority=ignore_priority)
+                    )
+                    work[-1] = (node, children)
+
+                if children:
+                    child = children.pop()
+                    if child not in indices:
+                        work.append((child, None))
+                    elif child in on_stack:
+                        lowlink[node] = min(lowlink[node], indices[child])
+                    continue
+
+                if lowlink[node] == indices[node]:
+                    component = []
+                    while True:
+                        member = stack.pop()
+                        on_stack.discard(member)
+                        component.append(member)
+                        if member == node:
+                            break
+                    components.append(component)
+
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    lowlink[parent] = min(lowlink[parent], lowlink[node])
+
+        return components
 
     def get_cycles(self, ignore_priority=None, max_length=None):
         """

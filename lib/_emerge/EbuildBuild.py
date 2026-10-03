@@ -2,28 +2,28 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import functools
-
-import _emerge.emergelog
-from _emerge.AsynchronousTask import AsynchronousTask
-from _emerge.EbuildExecuter import EbuildExecuter
-from _emerge.EbuildPhase import EbuildPhase
-from _emerge.EbuildBinpkg import EbuildBinpkg
-from _emerge.EbuildFetcher import EbuildFetcher
-from _emerge.CompositeTask import CompositeTask
-from _emerge.EbuildMerge import EbuildMerge
-from _emerge.EbuildFetchonly import EbuildFetchonly
-from _emerge.EbuildBuildDir import EbuildBuildDir
-from _emerge.MiscFunctionsProcess import MiscFunctionsProcess
-from _emerge.TaskSequence import TaskSequence
+import os
 
 import portage
-from portage import _encodings, _unicode_encode, os
+from portage.package.ebuild._spawn_nofetch import SpawnNofetchWithoutBuilddir
 from portage.package.ebuild.digestcheck import digestcheck
 from portage.package.ebuild.doebuild import _check_temp_dir
-from portage.package.ebuild._spawn_nofetch import SpawnNofetchWithoutBuilddir
 from portage.util._async.AsyncTaskFuture import AsyncTaskFuture
 from portage.util.futures.executor.fork import ForkExecutor
 from portage.util.path import first_existing
+
+import _emerge.emergelog
+from _emerge.AsynchronousTask import AsynchronousTask
+from _emerge.CompositeTask import CompositeTask
+from _emerge.EbuildBinpkg import EbuildBinpkg
+from _emerge.EbuildBuildDir import EbuildBuildDir
+from _emerge.EbuildExecuter import EbuildExecuter
+from _emerge.EbuildFetcher import EbuildFetcher
+from _emerge.EbuildFetchonly import EbuildFetchonly
+from _emerge.EbuildMerge import EbuildMerge
+from _emerge.EbuildPhase import EbuildPhase
+from _emerge.MiscFunctionsProcess import MiscFunctionsProcess
+from _emerge.TaskSequence import TaskSequence
 
 
 class EbuildBuild(CompositeTask):
@@ -216,17 +216,8 @@ class EbuildBuild(CompositeTask):
         lock_task.future.result()
         # Cleaning needs to happen before fetch, since the build dir
         # is used for log handling.
-        msg = " === ({} of {}) Cleaning ({}::{})".format(
-            self.pkg_count.curval,
-            self.pkg_count.maxval,
-            self.pkg.cpv,
-            self._ebuild_path,
-        )
-        short_msg = "emerge: ({} of {}) {} Clean".format(
-            self.pkg_count.curval,
-            self.pkg_count.maxval,
-            self.pkg.cpv,
-        )
+        msg = f" === ({self.pkg_count.curval} of {self.pkg_count.maxval}) Cleaning ({self.pkg.cpv}::{self._ebuild_path})"
+        short_msg = f"emerge: ({self.pkg_count.curval} of {self.pkg_count.maxval}) {self.pkg.cpv} Clean"
         self.logger.log(msg, short_msg=short_msg)
 
         pre_clean_phase = EbuildPhase(
@@ -327,66 +318,27 @@ class EbuildBuild(CompositeTask):
         self._build_dir.clean_log()
         pkg = self.pkg
         logger = self.logger
-        opts = self.opts
         pkg_count = self.pkg_count
         scheduler = self.scheduler
         settings = self.settings
-        features = settings.features
         ebuild_path = self._ebuild_path
-        system_set = pkg.root_config.sets["system"]
 
         # buildsyspkg: Check if we need to _force_ binary package creation
-        self._issyspkg = (
-            "buildsyspkg" in features
-            and system_set.findAtomForPackage(pkg)
-            and "buildpkg" not in features
-            and opts.buildpkg != "n"
-        )
+        self._issyspkg = pkg.syspkg_wanted()
 
-        # Do not build binary cache for packages from volatile sources.
-        # For volatile sources (eg., git), the PROPERTIES parameter in
-        # the ebuild is set to 'live'.
-
-        # The default behavior is to build binary cache for all pkgs.
-        # "buildpkg-live" is a FEATURE that is enabled by default.
-        # To not build binary cache for live pkgs, we disable it by
-        # specifying FEATURES="-buildpkg-live"
-
-        buildpkg_live = "buildpkg-live" in features
-        live_ebuild = "live" in self.settings.get("PROPERTIES", "").split()
-        buildpkg_live_disabled = live_ebuild and not buildpkg_live
-
-        if (
-            ("buildpkg" in features or self._issyspkg)
-            and not buildpkg_live_disabled
-            and not self.opts.buildpkg_exclude.findAtomForPackage(pkg)
-        ):
+        if pkg.binpkg_wanted(self.opts.buildpkg_exclude):
             self._buildpkg = True
 
-            msg = " === ({} of {}) Compiling/Packaging ({}::{})".format(
-                pkg_count.curval,
-                pkg_count.maxval,
-                pkg.cpv,
-                ebuild_path,
-            )
-            short_msg = "emerge: ({} of {}) {} Compile".format(
-                pkg_count.curval,
-                pkg_count.maxval,
-                pkg.cpv,
+            msg = f" === ({pkg_count.curval} of {pkg_count.maxval}) Compiling/Packaging ({pkg.cpv}::{ebuild_path})"
+            short_msg = (
+                f"emerge: ({pkg_count.curval} of {pkg_count.maxval}) {pkg.cpv} Compile"
             )
             logger.log(msg, short_msg=short_msg)
 
         else:
-            msg = " === ({} of {}) Compiling/Merging ({}::{})".format(
-                pkg_count.curval,
-                pkg_count.maxval,
-                pkg.cpv,
-                ebuild_path,
-            )
-            short_msg = "emerge: ({} of {}) {} Compile".format(
-                pkg_count.curval,
-                pkg_count.maxval,
-                pkg.cpv,
+            msg = f" === ({pkg_count.curval} of {pkg_count.maxval}) Compiling/Merging ({pkg.cpv}::{ebuild_path})"
+            short_msg = (
+                f"emerge: ({pkg_count.curval} of {pkg_count.maxval}) {pkg.cpv} Compile"
             )
             logger.log(msg, short_msg=short_msg)
 
@@ -563,11 +515,9 @@ class EbuildBuild(CompositeTask):
             info["BUILD_ID"] = f"{pkg.build_id}\n"
         for k, v in info.items():
             with open(
-                _unicode_encode(
-                    os.path.join(infoloc, k), encoding=_encodings["fs"], errors="strict"
-                ),
+                os.path.join(infoloc, k),
                 mode="w",
-                encoding=_encodings["repo.content"],
+                encoding="utf-8",
                 errors="strict",
             ) as f:
                 f.write(v)
@@ -622,16 +572,9 @@ class EbuildBuild(CompositeTask):
             world_atom=world_atom,
         )
 
-        msg = " === ({} of {}) Merging ({}::{})".format(
-            pkg_count.curval,
-            pkg_count.maxval,
-            pkg.cpv,
-            ebuild_path,
-        )
-        short_msg = "emerge: ({} of {}) {} Merge".format(
-            pkg_count.curval,
-            pkg_count.maxval,
-            pkg.cpv,
+        msg = f" === ({pkg_count.curval} of {pkg_count.maxval}) Merging ({pkg.cpv}::{ebuild_path})"
+        short_msg = (
+            f"emerge: ({pkg_count.curval} of {pkg_count.maxval}) {pkg.cpv} Merge"
         )
         logger.log(msg, short_msg=short_msg)
 

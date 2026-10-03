@@ -1,30 +1,30 @@
 # Copyright 1999-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import io
-import sys
 import functools
-import _emerge.emergelog
-from _emerge.EbuildPhase import EbuildPhase
-from _emerge.BinpkgFetcher import BinpkgFetcher
-from _emerge.BinpkgEnvExtractor import BinpkgEnvExtractor
-from _emerge.CompositeTask import CompositeTask
-from _emerge.BinpkgVerifier import BinpkgVerifier
-from _emerge.EbuildMerge import EbuildMerge
-from _emerge.EbuildBuildDir import EbuildBuildDir
-from _emerge.SpawnProcess import SpawnProcess
+import io
+import logging
+import os
+import re
+import shutil
+import sys
+
+import portage
 from portage.eapi import eapi_exports_replace_vars
-from portage.output import colorize
+from portage.output import colorize, renderPath
 from portage.util import ensure_dirs
 from portage.util._async.AsyncTaskFuture import AsyncTaskFuture
 from portage.util._dyn_libs.dyn_libs import check_dyn_libs_inconsistent
-import portage
-from portage import os
-from portage import shutil
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
-import logging
+
+import _emerge.emergelog
+from _emerge.BinpkgEnvExtractor import BinpkgEnvExtractor
+from _emerge.BinpkgFetcher import BinpkgFetcher
+from _emerge.BinpkgVerifier import BinpkgVerifier
+from _emerge.CompositeTask import CompositeTask
+from _emerge.EbuildBuildDir import EbuildBuildDir
+from _emerge.EbuildMerge import EbuildMerge
+from _emerge.EbuildPhase import EbuildPhase
+from _emerge.SpawnProcess import SpawnProcess
 
 
 class Binpkg(CompositeTask):
@@ -179,16 +179,9 @@ class Binpkg(CompositeTask):
                 scheduler=self.scheduler,
             )
 
-            msg = " --- ({} of {}) Fetching Binary ({}::{})".format(
-                pkg_count.curval,
-                pkg_count.maxval,
-                pkg.cpv,
-                fetcher.pkg_path,
-            )
-            short_msg = "emerge: ({} of {}) {} Fetch".format(
-                pkg_count.curval,
-                pkg_count.maxval,
-                pkg.cpv,
+            msg = f" --- ({pkg_count.curval} of {pkg_count.maxval}) Fetching Binary ({pkg.cpv}::{fetcher.pkg_path})"
+            short_msg = (
+                f"emerge: ({pkg_count.curval} of {pkg_count.maxval}) {pkg.cpv} Fetch"
             )
             self.logger.log(msg, short_msg=short_msg)
 
@@ -304,16 +297,9 @@ class Binpkg(CompositeTask):
             self.wait()
             return
 
-        msg = " === ({} of {}) Merging Binary ({}::{})".format(
-            pkg_count.curval,
-            pkg_count.maxval,
-            pkg.cpv,
-            pkg_path,
-        )
-        short_msg = "emerge: ({} of {}) {} Merge Binary".format(
-            pkg_count.curval,
-            pkg_count.maxval,
-            pkg.cpv,
+        msg = f" === ({pkg_count.curval} of {pkg_count.maxval}) Merging Binary ({pkg.cpv}::{pkg_path})"
+        short_msg = (
+            f"emerge: ({pkg_count.curval} of {pkg_count.maxval}) {pkg.cpv} Merge Binary"
         )
         logger.log(msg, short_msg=short_msg)
 
@@ -376,17 +362,75 @@ class Binpkg(CompositeTask):
                 continue
 
             f = open(
-                _unicode_encode(
-                    os.path.join(infloc, k), encoding=_encodings["fs"], errors="strict"
-                ),
+                os.path.join(infloc, k),
                 mode="w",
-                encoding=_encodings["content"],
+                encoding="utf-8",
                 errors="backslashreplace",
             )
             try:
-                f.write(_unicode_decode(v + "\n"))
+                f.write(v + "\n")
             finally:
                 f.close()
+
+        # report any user patches applied when binary was built
+        user_patch_digests = os.path.join(infloc, "user_patch.digests")
+        if os.path.exists(user_patch_digests):
+            with open(user_patch_digests, "rb") as f:
+                tokens = f.read().strip(b"\0").split(b"\0")
+            hashes = tokens[0::2]
+            basenames = tokens[1::2]
+            hashes_ok = all(re.match(rb"^[0-9A-Fa-f]{64}$", h) for h in hashes)
+            basenames_ok = all(re.match(rb"[^/]+\.(patch|diff)$", b) for b in basenames)
+            count_ok = len(hashes) == len(basenames) == len(tokens) / 2
+
+            out = portage.output.EOutput()
+            if count_ok and hashes_ok and basenames_ok:
+                digests = {
+                    h.decode().lower(): os.fsdecode(f)
+                    for h, f in zip(hashes, basenames)
+                }
+
+                horiz_term_bar = lambda: out.ebinfo(
+                    colorize("PKG_BINARY_MERGE", (out.term_columns - 3) * "=")
+                )
+                min_digest = 8
+                min_basename = 25
+                max_basename = max(out.term_columns - min_digest - 6, min_basename)
+
+                out.ebinfo("This binary package was built with user patches applied:")
+                horiz_term_bar()
+                for digest, basename in digests.items():
+                    basename = renderPath(basename)
+                    max_digest = max(out.term_columns - len(basename) - 6, min_digest)
+                    basename = basename[:max_basename]
+                    digest = digest[:max_digest]
+                    out.ebinfo(
+                        "%s%*s%s"
+                        % (
+                            basename,
+                            out.term_columns - len(basename) - len(digest) - 4,
+                            "",
+                            digest,
+                        )
+                    )
+                horiz_term_bar()
+
+                if (
+                    self.pkg not in self.settings._user_patches
+                    or self.settings._user_patches[self.pkg] != pkg.user_patches
+                ):
+                    out.ewarn("")
+                    out.ewarn(
+                        "User patches in binary package different than configured for ebuild!!!"
+                    )
+                    out.ewarn("")
+                out.ebinfo("")
+            else:
+                out.ewarn("")
+                out.ewarn(
+                    "This binary package has invalid user patch digest metadata!!!"
+                )
+                out.ewarn("")
 
         # Store the md5sum in the vdb.
         if pkg_path is not None:
@@ -394,16 +438,12 @@ class Binpkg(CompositeTask):
             if not md5sum:
                 md5sum = portage.checksum.perform_md5(pkg_path)
             with open(
-                _unicode_encode(
-                    os.path.join(infloc, "BINPKGMD5"),
-                    encoding=_encodings["fs"],
-                    errors="strict",
-                ),
+                os.path.join(infloc, "BINPKGMD5"),
                 mode="w",
-                encoding=_encodings["content"],
+                encoding="utf-8",
                 errors="strict",
             ) as f:
-                f.write(_unicode_decode(f"{md5sum}\n"))
+                f.write(f"{md5sum}\n")
 
         env_extractor = BinpkgEnvExtractor(
             background=self.background, scheduler=self.scheduler, settings=self.settings
@@ -487,12 +527,8 @@ class Binpkg(CompositeTask):
 
         try:
             with open(
-                _unicode_encode(
-                    os.path.join(self._infloc, "EPREFIX"),
-                    encoding=_encodings["fs"],
-                    errors="strict",
-                ),
-                encoding=_encodings["repo.content"],
+                os.path.join(self._infloc, "EPREFIX"),
+                encoding="utf-8",
                 errors="replace",
             ) as f:
                 self._build_prefix = f.read().rstrip("\n")
@@ -536,13 +572,9 @@ class Binpkg(CompositeTask):
 
         # We want to install in "our" prefix, not the binary one
         with open(
-            _unicode_encode(
-                os.path.join(self._infloc, "EPREFIX"),
-                encoding=_encodings["fs"],
-                errors="strict",
-            ),
+            os.path.join(self._infloc, "EPREFIX"),
             mode="w",
-            encoding=_encodings["repo.content"],
+            encoding="utf-8",
             errors="strict",
         ) as f:
             f.write(self.settings["EPREFIX"] + "\n")

@@ -2,19 +2,19 @@
 # Portage Unit Testing Functionality
 
 import io
+import os
+import shutil
 import tarfile
 import tempfile
+from concurrent.futures import Future
 from functools import partial
 from os import urandom
-from concurrent.futures import Future
 
-from portage.gpkg import gpkg
-from portage import os
-from portage import shutil
-from portage.tests import TestCase
-from portage.tests.resolver.ResolverPlayground import ResolverPlayground
 from portage.exception import InvalidSignature
 from portage.gpg import GPG
+from portage.gpkg import gpkg
+from portage.tests import TestCase
+from portage.tests.resolver.ResolverPlayground import ResolverPlayground
 
 
 class test_gpkg_metadata_url_case(TestCase):
@@ -23,7 +23,7 @@ class test_gpkg_metadata_url_case(TestCase):
             import http.server
             import socketserver
         except ImportError:
-            self.skipTest("http server not exits")
+            self.skipTest("http server does not exist")
 
         Handler = partial(http.server.SimpleHTTPRequestHandler, directory=directory)
 
@@ -35,7 +35,7 @@ class test_gpkg_metadata_url_case(TestCase):
         try:
             import threading
         except ImportError:
-            self.skipTest("threading module not exists")
+            self.skipTest("threading module does not exist")
 
         httpd_future = Future()
         server = threading.Thread(

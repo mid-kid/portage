@@ -2,6 +2,7 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import logging
+
 from portage import installation
 from portage.util import writemsg_level
 
@@ -186,7 +187,7 @@ def create_depgraph_params(myopts, myaction):
     if (
         rebuilt_binaries is True
         or rebuilt_binaries != "n"
-        and "--usepkgonly" in myopts
+        and myopts.get("--usepkgonly") is True
         and myopts.get("--deep") is True
         and "--update" in myopts
     ):

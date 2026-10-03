@@ -1,21 +1,24 @@
-# Copyright 1999-2020 Gentoo Authors
+# Copyright 1999-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import warnings
-
-from _emerge.Package import Package
-from _emerge.PackageVirtualDbapi import PackageVirtualDbapi
-from _emerge.resolver.DbapiProvidesIndex import PackageDbapiProvidesIndex
+import functools
+import os
 
 import portage
-from portage import os
 from portage.const import VDB_PATH
 from portage.dbapi.vartree import vartree
 from portage.dep._slot_operator import find_built_slot_operator_atoms
 from portage.eapi import _get_eapi_attrs
 from portage.exception import InvalidData, InvalidDependString
 from portage.update import grab_updates, parse_updates, update_dbentries
+from portage.util._async.TaskScheduler import TaskScheduler
 from portage.versions import _pkg_str
+
+from _emerge.create_depgraph_params import create_depgraph_params
+from _emerge.EbuildMetadataPhase import EbuildMetadataPhase
+from _emerge.Package import Package
+from _emerge.PackageVirtualDbapi import PackageVirtualDbapi
+from _emerge.resolver.DbapiProvidesIndex import PackageDbapiProvidesIndex
 
 
 class FakeVardbGetPath:
@@ -36,6 +39,23 @@ class FakeVardbGetPath:
 
 class _DynamicDepsNotApplicable(Exception):
     pass
+
+
+def fake_vartree_options(myopts):
+    """
+    Return the FakeVartree keyword arguments which are derived from the
+    emerge options.
+
+    The Scheduler builds a FakeVartree of its own when the depgraph did not
+    hand it one, and _depgraph_fork rebuilds the one the depgraph did hand
+    it, so the two have to agree on these.
+    """
+    return {
+        "dynamic_deps": "dynamic_deps" in create_depgraph_params(myopts, None),
+        "ignore_built_slot_operator_deps": (
+            myopts.get("--ignore-built-slot-operator-deps", "n") == "y"
+        ),
+    }
 
 
 class FakeVartree(vartree):
@@ -95,18 +115,6 @@ class FakeVartree(vartree):
         self._portdb = portdb
         self._global_updates = None
 
-    @property
-    def root(self):
-        warnings.warn(
-            "The root attribute of "
-            "_emerge.FakeVartree.FakeVartree"
-            " is deprecated. Use "
-            "settings['ROOT'] instead.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return self.settings["ROOT"]
-
     def _match_wrapper(self, cpv, use_cache=1):
         """
         Make sure the metadata in Package instances gets updated for any
@@ -128,6 +136,13 @@ class FakeVartree(vartree):
 
         # This raises a KeyError to the caller if appropriate.
         pkg = self.dbapi._cpv_map[cpv]
+
+        if self._portdb._event_loop.is_running():
+            # The synchronous portdb.aux_get() below drives the loop (bug
+            # 982753). Fall back to the vdb dependencies; the instance stays
+            # marked applied, so it keeps them for the rest of the run.
+            self._apply_dynamic_deps(pkg, None)
+            return self._aux_get(cpv, wants)
 
         try:
             live_metadata = dict(
@@ -190,7 +205,85 @@ class FakeVartree(vartree):
             aux_dict = dict(zip(aux_keys, self._aux_get(pkg.cpv, aux_keys)))
             perform_global_updates(pkg.cpv, aux_dict, self.dbapi, self._global_updates)
 
-    def dynamic_deps_preload(self, pkg, metadata):
+    def dynamic_deps_applied(self, pkg):
+        """True if the dynamic-deps apply has already run for ``pkg`` on this
+        instance.
+
+        depgraph._load_vdb() runs once per depgraph, but the FakeVartree lives
+        in frozen_config and is therefore shared by every backtracking depgraph.
+        The preload must not run twice over the same instance: the first pass
+        rewrites Package._metadata via aux_update(), so a second pass would be
+        deriving live dependencies for metadata that is no longer the vdb's."""
+        return pkg.cpv in self._aux_get_history
+
+    def apply_dynamic_deps(self, myopts, notice=None):
+        """Apply the live ebuild dependencies to every instance the apply has
+        not run for yet, spawning a metadata phase for each instance the
+        ebuild cache cannot answer for, with the concurrency --jobs and
+        --load-average ask for.
+
+        ``notice``, if given, is called first, and only if there is anything
+        to do. Returns immediately unless this FakeVartree was built with
+        dynamic deps."""
+        if not self._dynamic_deps:
+            return
+
+        pkgs = [pkg for pkg in self.dbapi if not self.dynamic_deps_applied(pkg)]
+        if not pkgs:
+            return
+
+        if notice is not None:
+            notice()
+
+        scheduler = TaskScheduler(
+            self._dynamic_deps_tasks(pkgs),
+            max_jobs=myopts.get("--jobs"),
+            max_load=myopts.get("--load-average"),
+            event_loop=self._portdb._event_loop,
+        )
+        scheduler.start()
+        scheduler.wait()
+
+    def _dynamic_deps_tasks(self, pkgs):
+        portdb = self._portdb
+        config_pool = []
+        for pkg in pkgs:
+            ebuild_path, repo_path = portdb.findname2(pkg.cpv, myrepo=pkg.repo)
+            if ebuild_path is None:
+                self._dynamic_deps_preload(pkg, None)
+                continue
+            metadata, ebuild_hash = portdb._pull_valid_cache(
+                pkg.cpv, ebuild_path, repo_path
+            )
+            if metadata is not None:
+                self._dynamic_deps_preload(pkg, metadata)
+                continue
+
+            if config_pool:
+                settings = config_pool.pop()
+            else:
+                settings = portage.config(clone=portdb.settings)
+
+            deallocate_config = portdb._event_loop.create_future()
+            deallocate_config.add_done_callback(
+                lambda future: config_pool.append(future.result())
+            )
+            proc = EbuildMetadataPhase(
+                cpv=pkg.cpv,
+                ebuild_hash=ebuild_hash,
+                portdb=portdb,
+                repo_path=repo_path,
+                settings=settings,
+                deallocate_config=deallocate_config,
+            )
+            proc.addExitListener(functools.partial(self._dynamic_deps_exit, pkg))
+            yield proc
+
+    def _dynamic_deps_exit(self, pkg, proc):
+        metadata = proc.metadata if proc.returncode == os.EX_OK else None
+        self._dynamic_deps_preload(pkg, metadata)
+
+    def _dynamic_deps_preload(self, pkg, metadata):
         if metadata is not None:
             metadata = {k: metadata.get(k, "") for k in self._portdb_keys}
         self._apply_dynamic_deps(pkg, metadata)
@@ -272,8 +365,6 @@ class FakeVartree(vartree):
 
             slot_counters[pkg.slot_atom] = pkg.counter
             pkg_vardb.cpv_inject(pkg)
-
-        real_vardb.flush_cache()
 
     def _pkg(self, cpv):
         """

@@ -2,11 +2,14 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import errno
-from portage.util import writemsg
-from portage.data import secpass
-import portage
-from portage import os
+import os
 import pickle
+
+import portage
+from portage.data import secpass
+from portage.dep import Atom
+from portage.util import writemsg
+from portage.util.pickle import NoGlobalsUnpickler
 
 
 class BlockerCache(portage.cache.mappings.MutableMapping):
@@ -42,13 +45,7 @@ class BlockerCache(portage.cache.mappings.MutableMapping):
     def _load(self):
         try:
             f = open(self._cache_filename, mode="rb")
-            mypickle = pickle.Unpickler(f)
-            try:
-                mypickle.find_global = None
-            except AttributeError:
-                # TODO: If py3k, override Unpickler.find_class().
-                pass
-            self._cache_data = mypickle.load()
+            self._cache_data = NoGlobalsUnpickler(f).load()
             f.close()
             del f
         except (SystemExit, KeyboardInterrupt):
@@ -61,7 +58,7 @@ class BlockerCache(portage.cache.mappings.MutableMapping):
                 pass
             else:
                 writemsg(
-                    f"!!! Error loading '{self._cache_filename}': {str(e)}\n",
+                    f"!!! Error loading '{self._cache_filename}': {e!s}\n",
                     noiselevel=-1,
                 )
             del e
@@ -99,10 +96,10 @@ class BlockerCache(portage.cache.mappings.MutableMapping):
                     continue
                 invalid_atom = False
                 for atom in atoms:
-                    if not isinstance(atom, str):
+                    if not isinstance(atom, (str, Atom)):
                         invalid_atom = True
                         break
-                    if atom[:1] != "!" or not portage.isvalidatom(
+                    if str(atom)[:1] != "!" or not portage.isvalidatom(
                         atom, allow_blockers=True
                     ):
                         invalid_atom = True

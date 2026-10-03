@@ -5,29 +5,22 @@ __docformat__ = "epytext"
 
 import errno
 import itertools
+import os
 import re
 import socket
 import subprocess
 import sys
-from asyncio import Future
-from typing import Optional
 
 import portage
-import portage.util.formatter as formatter
-
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
-from portage import _unicode_decode
 from portage.const import COLOR_MAP_FILE
 from portage.exception import (
-    CommandNotFound,
     FileNotFound,
     ParseError,
     PermissionDenied,
     PortageException,
 )
 from portage.localization import _
+from portage.util import formatter
 
 havecolor = 1
 dotitles = 1
@@ -75,7 +68,6 @@ def color(fg, bg="default", attr=["normal"]):
 
 
 ansi_codes = [y for x in range(30, 38) for y in (f"{x}m", f"{x};01m")]
-
 
 rgb_ansi_colors = [
     "0x000000",
@@ -129,7 +121,6 @@ codes["darkteal"] = codes["turquoise"]
 # Some terminals have darkyellow instead of brown.
 codes["0xAAAA00"] = codes["brown"]
 codes["darkyellow"] = codes["0xAAAA00"]
-
 
 # Colors from /lib/gentoo/functions.sh
 _styles["BAD"] = ("red",)
@@ -186,8 +177,8 @@ def _parse_color_map(config_root="/", onerror=None):
 
     try:
         with open(
-            _unicode_encode(myfile, encoding=_encodings["fs"], errors="strict"),
-            encoding=_encodings["content"],
+            myfile,
+            encoding="utf-8",
             errors="replace",
         ) as f:
             lines = f.readlines()
@@ -213,7 +204,7 @@ def _parse_color_map(config_root="/", onerror=None):
 
             k = strip_quotes(split_line[0].strip())
             v = strip_quotes(split_line[1].strip())
-            if not k in _styles and not k in codes:
+            if k not in _styles and k not in codes:
                 e = ParseError(
                     _("'%s', line %s: Unknown variable: '%s'") % (myfile, lineno, k)
                 )
@@ -288,9 +279,7 @@ def xtermTitle(mystr, raw=False):
             mystr = f"\x1b]0;{mystr}\x07"
 
         # avoid potential UnicodeEncodeError
-        mystr = _unicode_encode(
-            mystr, encoding=_encodings["stdio"], errors="backslashreplace"
-        )
+        mystr = mystr.encode("utf-8", "backslashreplace")
         f = sys.stderr.buffer
         f.write(mystr)
         f.flush()
@@ -352,6 +341,20 @@ def nocolor():
     "turn off colorization"
     global havecolor
     havecolor = 0
+
+
+def renderPath(path):
+    """
+    @param path: Path string to be shown to a user
+    @type path: String
+    @rtype: String
+    @return: A string which is safe to print, e.g. using EOutput, with
+             non-printables and non-utf8 replaced with '?'
+    """
+    if isinstance(path, (bytes, bytearray)):
+        path = os.fsdecode(path)
+    utf8 = path.encode(errors="replace").decode()
+    return re.sub("[\x01-\x1f\x7f]", "?", utf8)
 
 
 def resetColor():
@@ -456,7 +459,8 @@ class ConsoleStyleFile:
         # non-unicode '\n' which fails with TypeError if self._file
         # is a text stream such as io.StringIO. Therefore, make sure
         # input is converted to unicode when necessary.
-        s = _unicode_decode(s)
+        if isinstance(s, bytes):
+            s = s.decode("utf-8", "replace")
         global havecolor
         if havecolor and self._styles:
             styled_s = []
@@ -473,9 +477,7 @@ class ConsoleStyleFile:
     def _write(self, f, s):
         # avoid potential UnicodeEncodeError
         if f in (sys.stdout, sys.stderr):
-            s = _unicode_encode(
-                s, encoding=_encodings["stdio"], errors="backslashreplace"
-            )
+            s = s.encode("utf-8", "backslashreplace")
             f = f.buffer
         f.write(s)
 
@@ -546,7 +548,7 @@ def get_term_size(fd=None):
         # stty command not found
         return (0, 0)
 
-    out = _unicode_decode(proc.communicate()[0])
+    out = proc.communicate()[0].decode("utf-8", "replace")
     if proc.wait() == os.EX_OK:
         out = out.split()
         if len(out) == 2:
@@ -558,34 +560,6 @@ def get_term_size(fd=None):
                 if val[0] >= 0 and val[1] >= 0:
                     return val
     return (0, 0)
-
-
-def set_term_size(lines: int, columns: int, fd: int) -> Optional[Future]:
-    """
-    Set the number of lines and columns for the tty that is connected to fd.
-    For portability, this simply calls `stty rows $lines columns $columns`.
-
-    If spawn succeeds and the event loop is running then an instance of
-    asyncio.Future is returned and the caller should wait for it in order
-    to prevent possible error messages like this:
-
-    [ERROR] Task was destroyed but it is pending!
-    """
-    from portage.process import spawn
-    from portage.util import writemsg
-    from portage.util.futures import asyncio
-
-    cmd = ["stty", "rows", str(lines), "columns", str(columns)]
-    try:
-        proc = spawn(cmd, env=os.environ, fd_pipes={0: fd}, returnproc=True)
-    except CommandNotFound:
-        writemsg(_("portage: stty: command not found\n"), noiselevel=-1)
-    else:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            return asyncio.ensure_future(proc.wait(), loop=loop)
-        else:
-            loop.run_until_complete(proc.wait())
 
 
 class EOutput:
@@ -655,6 +629,20 @@ class EOutput:
                 "%*s%s\n"
                 % ((self.term_columns - self.__last_e_len - 7), "", status_brackets),
             )
+
+    def ebinfo(self, msg):
+        """
+        Shows an informative message about a binary package operation
+
+        @param msg: A very brief (shorter than one line) informative message.
+        @type msg: StringType
+        """
+        out = sys.stdout
+        if not self.quiet:
+            if self.__last_e_cmd == "ebegin":
+                self._write(out, "\n")
+            self._write(out, colorize("PKG_BINARY_MERGE", " * ") + msg + "\n")
+        self.__last_e_cmd = "einfo"
 
     def ebegin(self, msg):
         """
@@ -888,8 +876,7 @@ class TermProgressBar(ProgressBar):
 
     def _create_image(self):
         cols = self.term_columns
-        if cols > self._max_columns:
-            cols = self._max_columns
+        cols = min(cols, self._max_columns)
         min_columns = self._min_columns
         curval = self._curval
         maxval = self._maxval
@@ -973,15 +960,15 @@ def _init(config_root="/"):
     _styles = object.__getattribute__(_styles, "_attr")
 
     for k, v in codes.items():
-        codes[k] = _unicode_decode(v)
+        codes[k] = v.decode("utf-8", "replace") if isinstance(v, bytes) else v
 
     for k, v in _styles.items():
-        _styles[k] = _unicode_decode(v)
+        _styles[k] = v.decode("utf-8", "replace") if isinstance(v, bytes) else v
 
     try:
         _parse_color_map(
             config_root=config_root,
-            onerror=lambda e: writemsg(f"{str(e)}\n", noiselevel=-1),
+            onerror=lambda e: writemsg(f"{e!s}\n", noiselevel=-1),
         )
     except FileNotFound:
         pass
@@ -989,7 +976,7 @@ def _init(config_root="/"):
         writemsg(_("Permission denied: '%s'\n") % str(e), noiselevel=-1)
         del e
     except PortageException as e:
-        writemsg(f"{str(e)}\n", noiselevel=-1)
+        writemsg(f"{e!s}\n", noiselevel=-1)
         del e
 
 

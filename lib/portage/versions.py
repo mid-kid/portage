@@ -1,5 +1,5 @@
 # versions.py -- core Portage functionality
-# Copyright 1998-2025 Gentoo Authors
+# Copyright 1998-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = [
@@ -11,18 +11,19 @@ __all__ = [
     "cpv_sort_key",
     "pkgcmp",
     "pkgsplit",
-    "ververify",
     "vercmp",
+    "ververify",
 ]
 
 import re
 import typing
-import warnings
-from functools import lru_cache
-from typing import Any, Optional, Union
 from collections.abc import Sequence
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Optional, Union
 
-from portage import _unicode_decode
+if TYPE_CHECKING:
+    from portage.dep import Atom
+
 from portage.eapi import _eapi_attrs, _get_eapi_attrs
 from portage.exception import InvalidData
 from portage.localization import _
@@ -160,7 +161,7 @@ def vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
         vlist1 = match1.group(2)[1:].split(".")
         vlist2 = match2.group(2)[1:].split(".")
 
-        for i in range(0, max(len(vlist1), len(vlist2))):
+        for i in range(max(len(vlist1), len(vlist2))):
             # Implcit .0 is given a value of -1, so that 1.0.0 > 1.0, since it
             # would be ambiguous if two versions that aren't literally equal
             # are given the same value (in sorting, for example).
@@ -199,7 +200,7 @@ def vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
     if len(match2.group(4)):
         list2.append(ord(match2.group(4)))
 
-    for i in range(0, max(len(list1), len(list2))):
+    for i in range(max(len(list1), len(list2))):
         if len(list1) <= i:
             return -1
         if len(list2) <= i:
@@ -214,7 +215,7 @@ def vercmp(ver1: str, ver2: str, silent: int = 1) -> Optional[int]:
     list1 = match1.group(5).split("_")[1:]
     list2 = match2.group(5).split("_")[1:]
 
-    for i in range(0, max(len(list1), len(list2))):
+    for i in range(max(len(list1), len(list2))):
         # Implicit _p0 is given a value of -1, so that 1 < 1_p0
         if len(list1) <= i:
             s1 = ("p", "-1")
@@ -401,7 +402,7 @@ class _pkg_str(str):
 
         if not isinstance(cpv, str):
             # Avoid TypeError from str.__init__ with PyPy.
-            cpv = _unicode_decode(cpv)
+            cpv = cpv
         str.__init__(cpv)
         if metadata is not None:
             self.__dict__["_metadata"] = metadata
@@ -526,21 +527,6 @@ def cpv_getkey(mycpv: Union[_pkg_str, str], eapi: Any = None) -> Optional[str]:
     if mysplit is not None:
         return mysplit[0] + "/" + mysplit[1]
 
-    warnings.warn(
-        "portage.versions.cpv_getkey() " + f"called with invalid cpv: '{mycpv}'",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-    myslash = mycpv.split("/", 1)
-    mysplit = _pkgsplit(myslash[-1], eapi=eapi)
-    if mysplit is None:
-        return None
-    mylen = len(myslash)
-    if mylen == 2:
-        return myslash[0] + "/" + mysplit[0]
-    return mysplit[0]
-
 
 def cpv_getversion(mycpv: Union[str, _pkg_str], eapi: Any = None) -> Optional[str]:
     """Returns the v (including revision) from an cpv."""
@@ -603,8 +589,11 @@ def cpv_sort_key(eapi: Any = None) -> Any:
     return cmp_sort_key(cmp_cpv)
 
 
-def catsplit(mydep: str) -> list[str]:
-    return mydep.split("/", 1)
+# it would be better to fix the call sites,
+# but most of them are completely untyped,
+# and themselves use something like `str | Atom | OtherMonstrosity`
+def catsplit(mydep: "Union[str, Atom]") -> list[str]:
+    return str(mydep).split("/", 1)
 
 
 def best(mymatches: Sequence[Any], eapi: Any = None) -> Any:

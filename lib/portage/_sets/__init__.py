@@ -3,28 +3,28 @@
 
 __all__ = [
     "SETPREFIX",
-    "get_boolean",
-    "SetConfigError",
     "SetConfig",
+    "SetConfigError",
+    "get_boolean",
     "load_default_config",
 ]
 
+import os
+
 import portage
-from portage import os
 from portage import load_mod
-from portage import _unicode_decode
-from portage import _unicode_encode
-from portage import _encodings
-from portage.const import USER_CONFIG_PATH, GLOBAL_CONFIG_PATH
-from portage.const import VCS_DIRS
-from portage.const import _ENABLE_SET_CONFIG
+from portage.const import (
+    _ENABLE_SET_CONFIG,
+    GLOBAL_CONFIG_PATH,
+    USER_CONFIG_PATH,
+    VCS_DIRS,
+)
 from portage.exception import PackageSetNotFound
 from portage.localization import _
-from portage.util import writemsg_level
 from portage.util.configparser import (
-    SafeConfigParser,
     NoOptionError,
     ParsingError,
+    SafeConfigParser,
     read_configs,
 )
 
@@ -32,7 +32,7 @@ SETPREFIX = "@"
 
 
 def get_boolean(options, name, default):
-    if not name in options:
+    if name not in options:
         return default
     if options[name].lower() in ("1", "yes", "on", "true"):
         return True
@@ -170,7 +170,7 @@ class SetConfig:
     def update(self, setname, options):
         parser = self._parser
         self.errors = []
-        if not setname in self.psets:
+        if setname not in self.psets:
             options["name"] = setname
             options["world-candidate"] = "False"
 
@@ -347,7 +347,7 @@ def load_default_config(settings, trees):
         global_config_path = os.path.join(
             portage.const.EPREFIX, GLOBAL_CONFIG_PATH.lstrip(os.sep)
         )
-    vcs_dirs = [_unicode_encode(x, encoding=_encodings["fs"]) for x in VCS_DIRS]
+    vcs_dirs = [x.encode("utf-8", "backslashreplace") for x in VCS_DIRS]
 
     def _getfiles():
         sets_config_paths = [
@@ -361,9 +361,6 @@ def load_default_config(settings, trees):
 
         dot = "."
         tilde = "~"
-        if not portage.utf8_mode:
-            dot = _unicode_encode(dot)
-            tilde = _unicode_encode(tilde)
 
         for sets_config_path in sets_config_paths:
             if os.path.isdir(sets_config_path):

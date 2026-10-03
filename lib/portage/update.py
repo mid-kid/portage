@@ -1,28 +1,26 @@
-# Copyright 1999-2025 Gentoo Authors
+# Copyright 1999-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import errno
+import os
 import re
 import stat
 import sys
-import warnings
-
-from portage import os
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
 
 from portage.const import USER_CONFIG_PATH, VCS_DIRS
+from portage.dep import (
+    Atom,
+    dep_getkey,
+    isvalidatom,
+    match_from_list,
+)
 from portage.eapi import _get_eapi_attrs
-from portage.exception import DirectoryNotFound, InvalidAtom, PortageException
+from portage.exception import InvalidAtom, PortageException
 from portage.localization import _
-
 
 ignored_dbentries = ("CONTENTS", "environment.bz2")
 
 
 def update_dbentry(update_cmd, mycontent, eapi=None, parent=None):
-    from portage.dep import Atom, isvalidatom, match_from_list
 
     if parent is not None:
         eapi = parent.eapi
@@ -97,7 +95,7 @@ def update_dbentry(update_cmd, mycontent, eapi=None, parent=None):
                 if atom.slot_operator is not None:
                     slot_part += atom.slot_operator
 
-                split_content[i] = atom.with_slot(slot_part)
+                split_content[i] = str(atom.with_slot(slot_part))
                 modified = True
 
             if modified:
@@ -111,14 +109,11 @@ def update_dbentries(update_iter, mydata, eapi=None, parent=None):
     dict containing only the updated items."""
     updated_items = {}
     for k, mycontent in mydata.items():
-        k_unicode = _unicode_decode(
-            k, encoding=_encodings["repo.content"], errors="replace"
-        )
+        k_unicode = k.decode("utf-8", "replace") if isinstance(k, bytes) else k
         if k_unicode not in ignored_dbentries:
             orig_content = mycontent
-            mycontent = _unicode_decode(
-                mycontent, encoding=_encodings["repo.content"], errors="replace"
-            )
+            if isinstance(mycontent, bytes):
+                mycontent = mycontent.decode("utf-8", "replace")
             is_encoded = mycontent is not orig_content
             orig_content = mycontent
             for update_cmd in update_iter:
@@ -127,39 +122,9 @@ def update_dbentries(update_iter, mydata, eapi=None, parent=None):
                 )
             if mycontent != orig_content:
                 if is_encoded:
-                    mycontent = _unicode_encode(
-                        mycontent,
-                        encoding=_encodings["repo.content"],
-                        errors="backslashreplace",
-                    )
+                    mycontent = mycontent.encode("utf-8", "backslashreplace")
                 updated_items[k] = mycontent
     return updated_items
-
-
-def fixdbentries(update_iter, dbdir, eapi=None, parent=None):
-    """Performs update commands which result in search and replace operations
-    for each of the files in dbdir (excluding CONTENTS and environment.bz2).
-    Returns True when actual modifications are necessary and False otherwise."""
-    from portage.util import write_atomic
-
-    warnings.warn(
-        "portage.update.fixdbentries() is deprecated", DeprecationWarning, stacklevel=2
-    )
-
-    mydata = {}
-    for myfile in [f for f in os.listdir(dbdir) if f not in ignored_dbentries]:
-        file_path = os.path.join(dbdir, myfile)
-        with open(
-            _unicode_encode(file_path, encoding=_encodings["fs"], errors="strict"),
-            encoding=_encodings["repo.content"],
-            errors="replace",
-        ) as f:
-            mydata[myfile] = f.read()
-    updated_items = update_dbentries(update_iter, mydata, eapi=eapi, parent=parent)
-    for myfile, mycontent in updated_items.items():
-        file_path = os.path.join(dbdir, myfile)
-        write_atomic(file_path, mycontent, encoding=_encodings["repo.content"])
-    return len(updated_items) > 0
 
 
 def grab_updates(updpath, prev_mtimes=None):
@@ -173,38 +138,32 @@ def grab_updates(updpath, prev_mtimes=None):
     the source package of a move that comes somewhere later in the entire
     sequence of files.
     """
-    try:
-        mylist = os.listdir(updpath)
-    except OSError as oe:
-        if oe.errno == errno.ENOENT:
-            raise DirectoryNotFound(updpath)
-        raise
     if prev_mtimes is None:
         prev_mtimes = {}
 
     update_data = []
-    for myfile in mylist:
-        if myfile.startswith("."):
-            continue
-        file_path = os.path.join(updpath, myfile)
-        mystat = os.stat(file_path)
-        if not stat.S_ISREG(mystat.st_mode):
-            continue
-        if int(prev_mtimes.get(file_path, -1)) != mystat[stat.ST_MTIME]:
-            f = open(
-                _unicode_encode(file_path, encoding=_encodings["fs"], errors="strict"),
-                encoding=_encodings["repo.content"],
-                errors="replace",
-            )
-            content = f.read()
-            f.close()
-            update_data.append((file_path, mystat, content))
+    with os.scandir(updpath) as mylist:
+        for myfile in mylist:
+            if myfile.name.startswith("."):
+                continue
+            if not myfile.is_file():
+                continue
+
+            mystat = myfile.stat()
+            if int(prev_mtimes.get(myfile.path, -1)) != mystat[stat.ST_MTIME]:
+                f = open(
+                    myfile.path,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                content = f.read()
+                f.close()
+                update_data.append((myfile.path, mystat, content))
     return update_data
 
 
 def parse_updates(mycontent):
     """Valid updates are returned as a list of split update commands."""
-    from portage.dep import Atom
     from portage.versions import _get_slot_re
 
     eapi_attrs = _get_eapi_attrs(None)
@@ -297,7 +256,6 @@ def update_config_files(
     match_callback - a callback which will be called with three arguments:
             match_callback(repo_name, old_atom, new_atom)
     and should return boolean value determining whether to perform the update"""
-    from portage.dep import isvalidatom
     from portage.util import (
         ConfigProtect,
         new_protect_filename,
@@ -350,15 +308,16 @@ def update_config_files(
         if os.path.isdir(config_file):
             for parent, dirs, files in os.walk(config_file):
                 try:
-                    parent = _unicode_decode(
-                        parent, encoding=_encodings["fs"], errors="strict"
-                    )
+                    if isinstance(parent, bytes):
+                        parent = parent.decode("utf-8", "strict")
                 except UnicodeDecodeError:
                     continue
                 for y_enc in list(dirs):
                     try:
-                        y = _unicode_decode(
-                            y_enc, encoding=_encodings["fs"], errors="strict"
+                        y = (
+                            y_enc.decode("utf-8", "strict")
+                            if isinstance(y_enc, bytes)
+                            else y_enc
                         )
                     except UnicodeDecodeError:
                         dirs.remove(y_enc)
@@ -367,9 +326,8 @@ def update_config_files(
                         dirs.remove(y_enc)
                 for y in files:
                     try:
-                        y = _unicode_decode(
-                            y, encoding=_encodings["fs"], errors="strict"
-                        )
+                        if isinstance(y, bytes):
+                            y = y.decode("utf-8", "strict")
                     except UnicodeDecodeError:
                         continue
                     if y.startswith("."):
@@ -384,12 +342,8 @@ def update_config_files(
         f = None
         try:
             f = open(
-                _unicode_encode(
-                    os.path.join(abs_user_config, x),
-                    encoding=_encodings["fs"],
-                    errors="strict",
-                ),
-                encoding=_encodings["content"],
+                os.path.join(abs_user_config, x),
+                encoding="utf-8",
                 errors="replace",
             )
             file_contents[x] = f.readlines()
@@ -452,7 +406,7 @@ def update_config_files(
         try:
             write_atomic(updating_file, "".join(file_contents[x]))
         except PortageException as e:
-            writemsg(f"\n!!! {str(e)}\n", noiselevel=-1)
+            writemsg(f"\n!!! {e!s}\n", noiselevel=-1)
             writemsg(
                 _("!!! An error occurred while updating a config file:")
                 + f" '{updating_file}'\n",
@@ -462,7 +416,6 @@ def update_config_files(
 
 
 def dep_transform(mydep, oldkey, newkey):
-    from portage.dep import dep_getkey
 
     if dep_getkey(mydep) == oldkey:
         return mydep.replace(oldkey, newkey, 1)

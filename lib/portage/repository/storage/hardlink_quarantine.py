@@ -1,14 +1,15 @@
 # Copyright 2018-2021 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-from portage import os
+import os
+
+from _emerge.SpawnProcess import SpawnProcess
+
 from portage.repository.storage.interface import (
     RepoStorageException,
     RepoStorageInterface,
 )
 from portage.util.futures import asyncio
-
-from _emerge.SpawnProcess import SpawnProcess
 
 
 class HardlinkQuarantineRepoStorage(RepoStorageInterface):

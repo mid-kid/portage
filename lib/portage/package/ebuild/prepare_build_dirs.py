@@ -5,12 +5,13 @@ __all__ = ["prepare_build_dirs"]
 
 import errno
 import gzip
+import os
+import pwd
+import shutil
 import stat
 import time
-import pwd
 
 import portage
-from portage import os, shutil, _encodings, _unicode_encode, _unicode_decode
 from portage.data import portage_gid, portage_uid, secpass
 from portage.exception import (
     DirectoryNotFound,
@@ -169,7 +170,7 @@ def _adjust_perms_msg(settings, msg):
     if background and log_path is not None:
         try:
             log_file = open(
-                _unicode_encode(log_path, encoding=_encodings["fs"], errors="strict"),
+                log_path,
                 mode="ab",
             )
             log_file_real = log_file
@@ -183,7 +184,7 @@ def _adjust_perms_msg(settings, msg):
                 log_file = gzip.GzipFile(filename="", mode="ab", fileobj=log_file)
 
             def write(msg):
-                log_file.write(_unicode_encode(msg))
+                log_file.write(msg.encode("utf-8", "backslashreplace"))
                 log_file.flush()
 
     try:
@@ -312,7 +313,7 @@ def _prepare_features_dirs(mysettings):
 
             except PortageException as e:
                 failure = True
-                writemsg(f"\n!!! {str(e)}\n", noiselevel=-1)
+                writemsg(f"\n!!! {e!s}\n", noiselevel=-1)
                 writemsg(
                     _("!!! Failed resetting perms on %s='%s'\n")
                     % (kwargs["basedir_var"], basedir),
@@ -339,7 +340,7 @@ def _prepare_workdir(mysettings):
             raise ValueError(f"Invalid file mode: {mode}")
         else:
             workdir_mode = parsed_mode
-    except KeyError as e:
+    except KeyError:
         writemsg(
             _("!!! PORTAGE_WORKDIR_MODE is unset, using %s.\n") % oct(workdir_mode)
         )
@@ -383,7 +384,7 @@ def _prepare_workdir(mysettings):
                     mode=0o2770,
                 )
         except PortageException as e:
-            writemsg(f"!!! {str(e)}\n", noiselevel=-1)
+            writemsg(f"!!! {e!s}\n", noiselevel=-1)
             writemsg(
                 _("!!! Permission issues with PORTAGE_LOGDIR='%s'\n")
                 % mysettings["PORTAGE_LOGDIR"],
@@ -404,11 +405,9 @@ def _prepare_workdir(mysettings):
         logdir = normalize_path(mysettings["PORTAGE_LOGDIR"])
         logid_path = os.path.join(mysettings["PORTAGE_BUILDDIR"], ".logid")
         if not os.path.exists(logid_path):
-            open(_unicode_encode(logid_path), "w").close()
-        logid_time = _unicode_decode(
-            time.strftime("%Y%m%d-%H%M%S", time.gmtime(os.stat(logid_path).st_mtime)),
-            encoding=_encodings["content"],
-            errors="replace",
+            open(logid_path.encode("utf-8", "backslashreplace"), "w").close()
+        logid_time = time.strftime(
+            "%Y%m%d-%H%M%S", time.gmtime(os.stat(logid_path).st_mtime)
         )
 
         # The separator used between the individual name components of the log file.

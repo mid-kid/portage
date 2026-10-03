@@ -2,10 +2,20 @@
 # Copyright 2010-2014 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
-import argparse
+import locale
 import os
-import subprocess
 import sys
+
+if (
+    sys.getfilesystemencoding().lower() != "utf-8"
+    or locale.getpreferredencoding(False).lower() != "utf-8"
+):
+    os.environ["PYTHONUTF8"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+import argparse
+import subprocess
 import textwrap
 
 from urllib.parse import urlparse
@@ -123,16 +133,14 @@ def main(argv):
         return 1
 
     infile = open(
-        portage._unicode_encode(
-            src_pkgs_index, encoding=portage._encodings["fs"], errors="strict"
-        ),
-        encoding=portage._encodings["repo.content"],
+        src_pkgs_index,
+        encoding="utf-8",
         errors="strict",
     )
 
     outfile = portage.util.atomic_ofstream(
         os.path.join(binhost_dir, "Packages"),
-        encoding=portage._encodings["repo.content"],
+        encoding="utf-8",
         errors="strict",
     )
 

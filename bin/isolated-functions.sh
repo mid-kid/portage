@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright 1999-2025 Gentoo Authors
+# Copyright 1999-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 # shellcheck disable=2128,2185,2219
 
@@ -11,7 +11,7 @@ fi
 
 if [[ -v PORTAGE_EBUILD_EXTRA_SOURCE ]]; then
 	source "${PORTAGE_EBUILD_EXTRA_SOURCE}" || exit 1
-	# We deliberately do not unset PORTABE_EBUILD_EXTRA_SOURCE, so
+	# We deliberately do not unset PORTAGE_EBUILD_EXTRA_SOURCE, so
 	# that it keeps being exported in the environment of this
 	# process and its child processes. There, for example portage
 	# helper like doins, can pick it up and set the PMS variables
@@ -32,6 +32,24 @@ __pipestatus() {
 }
 
 shopt -s extdebug
+
+# The client imports nothing from portage, so it needs neither PYTHONPATH
+# nor a wrapper to set one up. It runs with -E so that a PYTHONPATH the
+# ebuild exports cannot shadow the standard library, and with -X utf8 so
+# that it does not re-exec itself for UTF-8 mode, which would drop -E.
+__ebuild_ipc() {
+	"${PORTAGE_PYTHON:-/usr/bin/python}" -E -S -X utf8 "${PORTAGE_BIN_PATH:?}/ebuild-ipc.py" "$@"
+}
+
+# Report the exit status of the phase to portage, on the pipe that it
+# passes in, or with ebuild-ipc if it did not pass one.
+__ebuild_exit() {
+	if [[ -n ${PORTAGE_EBUILD_EXIT_FD} ]]; then
+		printf '%s\n' "$1" >&${PORTAGE_EBUILD_EXIT_FD}
+	else
+		__ebuild_ipc exit "$1"
+	fi
+}
 
 # __dump_trace([number of funcs on stack to skip],
 #            [whitespacing for filenames],
@@ -58,7 +76,8 @@ __dump_trace() {
 	eerror "Call stack:"
 	while (( n > ${strip} )) ; do
 		funcname=${FUNCNAME[${n} - 1]}
-		sourcefile=$(basename "${BASH_SOURCE[${n}]}")
+		sourcefile="${BASH_SOURCE[${n}]}"
+		sourcefile="${sourcefile##*/}"
 		lineno=${BASH_LINENO[${n} - 1]}
 		# Display function arguments
 		args=
@@ -92,14 +111,12 @@ __helpers_die() {
 		die "$@"
 	else
 		echo -e "$@" >&2
-		return "$(( retval || 1 ))"
+		return "$(( retval ? retval : 1 ))"
 	fi
 }
 
 die() {
-	# restore PATH since die calls basename & sed
-	# TODO: make it pure bash
-	[[ -n ${_PORTAGE_ORIG_PATH} ]] && PATH=${_PORTAGE_ORIG_PATH}
+	local retval=$?
 
 	set +x # tracing only produces useless noise here
 	local IFS=$' \t\n'
@@ -107,18 +124,12 @@ die() {
 	if ___eapi_die_can_respect_nonfatal && [[ $1 == -n ]]; then
 		shift
 		if [[ ${PORTAGE_NONFATAL} == 1 ]]; then
-			[[ $# -gt 0 ]] && eerror "$*"
-			return 1
+			[[ $# -gt 0 ]] && echo -e "$@" >&2
+			return "$(( retval ? retval : 1 ))"
 		fi
 	fi
 
 	set +e
-	if [[ -n "${QA_INTERCEPTORS}" ]]; then
-		# die was called from inside inherit. We need to clean up
-		# QA_INTERCEPTORS since sed is called below.
-		unset -f ${QA_INTERCEPTORS}
-		unset QA_INTERCEPTORS
-	fi
 	local n filespacing=0 linespacing=0
 	# setup spacing to make output easier to read
 	(( n = ${#FUNCNAME[@]} - 1 ))
@@ -153,25 +164,14 @@ die() {
 	# ended in the call to die.  This really only handles lines that end
 	# with '|| die' and any preceding lines with line continuations (\).
 	# This tends to be the most common usage though, so let's do it.
-	# Due to the usage of appending to the hold space (even when empty),
-	# we always end up with the first line being a blank (thus the 2nd sed).
-	local -a sed_args=(
-		# When we get to the line that failed, append it to the hold
-		# space, move the hold space to the pattern space, then print
-		# out the pattern space and quit immediately.
-		-n -e "${BASH_LINENO[0]}{H;g;p;q}"
-		# If this line ends with a line continuation, append it to the
-		# hold space.
-		-e '/\\$/H'
-		# If this line does not end with a line continuation, erase the
-		# line and set the hold buffer to it (thus erasing the hold
-		# buffer in the process).
-		-e '/[^\]$/{s:^.*$::;h}'
-	)
-	sed "${sed_args[@]}" "${BASH_SOURCE[1]}" \
-	| sed -e '1d' -e 's:^:RETAIN-LEADING-SPACE:' \
-	| while read -r n; do
-		eerror "  ${n#RETAIN-LEADING-SPACE}"
+	local -a lines
+	mapfile -t -n "${BASH_LINENO[0]}" lines <"${BASH_SOURCE[1]}"
+	# Loop backwards starting at the line preceding the target line,
+	# until we encounter a line without continuation.
+	(( n = ${#lines[@]} - 1 ))
+	while (( --n >= 0 )) && [[ ${lines[n]} == *\\ ]]; do :; done
+	while (( ++n < ${#lines[@]} )); do
+		eerror "  ${lines[n]}"
 	done
 	eerror
 	fi
@@ -215,13 +215,13 @@ die() {
 	[[ -n ${S} ]] && eerror "S: '${S}'"
 
 	[[ -n ${PORTAGE_EBUILD_EXIT_FILE} ]] && : > "${PORTAGE_EBUILD_EXIT_FILE}"
-	[[ -n ${PORTAGE_IPC_DAEMON} ]] && "${PORTAGE_BIN_PATH}"/ebuild-ipc exit 1
+	[[ -n ${PORTAGE_IPC_DAEMON} ]] && __ebuild_exit 1
 
 	# subshell die support
 	if [[ -n ${EBUILD_MASTER_PID} && ${BASHPID} != "${EBUILD_MASTER_PID}" ]] ; then
 		kill -s SIGTERM "${EBUILD_MASTER_PID}"
 	fi
-	exit 1
+	exit "$(( retval ? retval : 1 ))"
 }
 
 __quiet_mode() {
@@ -293,7 +293,7 @@ ewarn() {
 	__elog_base WARN "$*"
 	[[ ${RC_ENDCOL} != "yes" && ${LAST_E_CMD} == "ebegin" ]] && echo >&2
 	echo -e "$@" | while read -r ; do
-		echo " ${PORTAGE_COLOR_WARN}*${PORTAGE_COLOR_NORMAL} ${RC_INDENTATION}${REPLY}"
+		echo " ${PORTAGE_COLOR_WARN}*${PORTAGE_COLOR_NORMAL} ${REPLY}"
 	done >&2
 	LAST_E_CMD="ewarn"
 	return 0
@@ -303,24 +303,19 @@ eerror() {
 	__elog_base ERROR "$*"
 	[[ ${RC_ENDCOL} != "yes" && ${LAST_E_CMD} == "ebegin" ]] && echo >&2
 	echo -e "$@" | while read -r ; do
-		echo " ${PORTAGE_COLOR_ERR}*${PORTAGE_COLOR_NORMAL} ${RC_INDENTATION}${REPLY}"
+		echo " ${PORTAGE_COLOR_ERR}*${PORTAGE_COLOR_NORMAL} ${REPLY}"
 	done >&2
 	LAST_E_CMD="eerror"
 	return 0
 }
 
 ebegin() {
-	local msg="$*" dots spaces=${RC_DOT_PATTERN//?/ }
-	if [[ -n ${RC_DOT_PATTERN} ]] ; then
-		printf -v dots "%$(( COLS - 3 - ${#RC_INDENTATION} - ${#msg} - 7 ))s" ''
-		dots=${dots//${spaces}/${RC_DOT_PATTERN}}
-		msg="${msg}${dots}"
-	else
-		msg="${msg} ..."
-	fi
+	local msg
+
+	msg="$* ..."
 	einfon "${msg}"
 	[[ ${RC_ENDCOL} == "yes" ]] && echo >&2
-	LAST_E_LEN=$(( 3 + ${#RC_INDENTATION} + ${#msg} ))
+	LAST_E_LEN=$(( 3 + ${#msg} ))
 	LAST_E_CMD="ebegin"
 	(( ++__EBEGIN_EEND_COUNT ))
 	return 0
@@ -416,10 +411,6 @@ __set_colors() {
 }
 
 RC_ENDCOL="yes"
-RC_INDENTATION=''
-RC_DOT_PATTERN=''
-
-
 
 if [[ -z ${NO_COLOR} ]] ; then
 	case ${NOCOLOR:-false} in

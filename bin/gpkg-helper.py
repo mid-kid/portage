@@ -2,12 +2,24 @@
 # Copyright 2020 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import argparse
+import locale
+import os
 import sys
+
+if (
+    sys.getfilesystemencoding().lower() != "utf-8"
+    or locale.getpreferredencoding(False).lower() != "utf-8"
+):
+    os.environ["PYTHONUTF8"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+import argparse
+
 import portage
 
 portage._internal_caller = True
-from portage import os
+
 from portage.output import EOutput
 
 
@@ -46,7 +58,7 @@ def command_compose(args):
 def main(argv):
     if argv and isinstance(argv[0], bytes):
         for i, x in enumerate(argv):
-            argv[i] = portage._unicode_decode(x, errors="strict")
+            argv[i] = x.decode("utf-8", "strict")
 
     valid_commands = ("compress",)
     description = "Perform metadata operations on a binary package."

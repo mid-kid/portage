@@ -53,6 +53,10 @@ WORLD_SETS_FILE = f"{PRIVATE_PATH}/world_sets"
 CONFIG_MEMORY_FILE = f"{PRIVATE_PATH}/config"
 REPO_REVISIONS = f"{PRIVATE_PATH}/repo_revisions"
 NEWS_LIB_PATH = "var/lib/gentoo"
+# Runtime (volatile) state directory where a running emerge publishes its
+# machine-readable observability status file(s).  This lives on a tmpfs
+# (e.g. /run) rather than under EPREFIX cache, so it is kept separate.
+PORTAGE_RUN_PATH = "/run/portage"
 
 # these variables get EPREFIX prepended automagically when they are
 # translated into their lowercase variants
@@ -103,7 +107,6 @@ SANDBOX_BINARY = f"{BINARY_PREFIX}/usr/bin/sandbox"
 FAKEROOT_BINARY = f"{BINARY_PREFIX}/usr/bin/fakeroot"
 BASH_BINARY = f"{BINARY_PREFIX}/bin/bash"
 MOVE_BINARY = f"{BINARY_PREFIX}/bin/mv"
-PRELINK_BINARY = f"{BINARY_PREFIX}/usr/sbin/prelink"
 
 INVALID_ENV_FILE = "/etc/spork/is/not/valid/profile.env"
 MERGING_IDENTIFIER = "-MERGING-"
@@ -126,8 +129,6 @@ INCREMENTALS = (
     "ENV_UNSET",
     "FEATURES",
     "IUSE_IMPLICIT",
-    "PRELINK_PATH",
-    "PRELINK_PATH_MASK",
     "PROFILE_ONLY_VARIABLES",
     "USE",
     "USE_EXPAND",
@@ -167,10 +168,12 @@ SUPPORTED_FEATURES = frozenset(
         "binpkg-signing",
         "buildpkg",
         "buildpkg-live",
+        "buildpkg-proactive",
         "buildsyspkg",
         "candy",
         "case-insensitive-fs",
         "ccache",
+        "cgroup",
         "chflags",
         "clean-logs",
         "collision-protect",
@@ -199,6 +202,7 @@ SUPPORTED_FEATURES = frozenset(
         "keepwork",
         "lmirror",
         "merge-sync",
+        "merge-use-vdb",
         "merge-wait",
         "metadata-transfer",
         "mirror",
@@ -214,12 +218,12 @@ SUPPORTED_FEATURES = frozenset(
         "noman",
         "nostrip",
         "notitles",
+        "observability",
         "packdebug",
         "parallel-fetch",
         "parallel-install",
         "pid-sandbox",
         "pkgdir-index-trusted",
-        "prelink-checksums",
         "preserve-libs",
         "protect-owned",
         "python-trace",

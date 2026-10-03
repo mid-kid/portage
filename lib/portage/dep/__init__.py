@@ -1,18 +1,20 @@
-# Copyright 2003-2025 Gentoo Authors
+# Copyright 2003-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 """deps.py -- Portage dependency resolution functions"""
 
 __all__ = [
     "Atom",
+    "_build_id_separator",
+    "_repo_name_re",
+    "_repo_separator",
+    "_slot_separator",
     "best_match_to_list",
     "cpvequal",
     "dep_getcpv",
     "dep_getkey",
     "dep_getslot",
     "dep_getusedeps",
-    "dep_opconvert",
-    "flatten",
     "get_operator",
     "isjustname",
     "isspecific",
@@ -20,22 +22,19 @@ __all__ = [
     "match_from_list",
     "match_to_list",
     "paren_enclose",
-    "paren_normalize",
     "paren_reduce",
     "remove_slot",
-    "strip_empty",
     "use_reduce",
-    "_repo_name_re",
-    "_repo_separator",
-    "_slot_separator",
 ]
 
+import os
 import re
 import warnings
-
+import weakref
 from functools import lru_cache
+from typing import TYPE_CHECKING, Optional, Union
 
-from portage import _unicode_decode
+import portage.cache.mappings
 from portage.eapi import _eapi_attrs, _get_eapi_attrs
 from portage.exception import InvalidAtom, InvalidData, InvalidDependString
 from portage.localization import _
@@ -47,14 +46,193 @@ from portage.versions import (
     _unknown_repo,
     _vr,
     catpkgsplit,
+    cpv_getversion,
     vercmp,
     ververify,
 )
-import portage.cache.mappings
-from typing import TYPE_CHECKING
+
+try:
+    # Not "from . import _parser": pylint reports import-self for that when the
+    # extension has not been built, as in the lint-only CI job.
+    import portage.dep._parser as _c_dep_parser
+except ImportError:
+    _c_dep_parser = None
+
+# PORTAGE_NATIVE_DEP_PARSER=0 forces the pure-Python path.  See emerge(1).
+if os.environ.get("PORTAGE_NATIVE_DEP_PARSER") == "0":
+    _c_dep_parser = None
 
 if TYPE_CHECKING:
-    import _emerge.Package
+    from _emerge.Package import Package
+
+
+def _c_fill_atom_fields(atom, catom, eapi):
+    """Copy the scalar fields of a _parser.Atom onto a portage.dep.Atom.
+
+    Everything except _string, _use and _unevaluated_atom, which the two
+    callers set differently.  The C scanner reports the "=*" glob as operator
+    "=" with a trailing "*" on the version, so undo that here.
+    """
+    op = catom.operator
+    ver = catom.version
+    cpv = catom.cpv
+    if op == "=" and ver is not None and ver.endswith("*"):
+        op = "=*"
+        ver = ver[:-1]
+        cpv = cpv[:-1]
+    atom._cp = catom.cp
+    atom._cpv = cpv
+    atom._version = ver
+    atom._operator = op
+    atom._slot = catom.slot
+    atom._sub_slot = catom.sub_slot
+    atom._slot_operator = catom.slot_operator
+    atom._repo = None
+    atom._eapi = eapi
+    atom._extended_syntax = False
+    atom._build_id = None
+    atom._orig_atom = None
+    blocker_str = catom.blocker
+    atom._blocker_obj = (
+        Atom._blocker(forbid_overlap=blocker_str == "!!")
+        if blocker_str is not None
+        else None
+    )
+
+
+def _c_atom_from_c(catom, eapi, eapi_attrs, uselist, matchall):
+    """Construct a portage.dep.Atom from a _parser.Atom, bypassing __init__ regex."""
+    a = Atom.__new__(Atom)
+    a._string = str(catom)
+    _c_fill_atom_fields(a, catom, eapi)
+    a._unevaluated_atom = a
+    use_tokens = catom.use
+    if use_tokens is not None:
+        en, dis, miss_en, miss_dis, cond, req = _c_dep_parser.classify_use_deps(
+            use_tokens
+        )
+        a._use = _intern_use_dep(
+            _use_dep(
+                use_tokens,
+                eapi_attrs,
+                enabled_flags=en,
+                disabled_flags=dis,
+                missing_enabled=miss_en,
+                missing_disabled=miss_dis,
+                conditional=cond,
+                required=req,
+            )
+        )
+        if not matchall and a._use.conditional:
+            a = a.evaluate_conditionals(uselist)
+    else:
+        a._use = None
+    return _intern_atom(a)
+
+
+def _c_convert_result(items, eapi, eapi_attrs, uselist, matchall):
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, list):
+            result.append(_c_convert_result(item, eapi, eapi_attrs, uselist, matchall))
+        else:
+            result.append(_c_atom_from_c(item, eapi, eapi_attrs, uselist, matchall))
+    return result
+
+
+def _c_normalize_alts(group, empty_always_true):
+    """Reduce the alternatives of one || group to use_reduce's non-flat form."""
+    alts = []
+    i = 0
+    n = len(group)
+    while i < n:
+        item = group[i]
+        if isinstance(item, str):  # a nested '||'
+            i += 1
+            nested = _c_normalize_alts(group[i], empty_always_true)
+            if nested:
+                alts.extend(nested)
+            elif not empty_always_true:
+                # empty nested || -> placeholder atom (EAPI 7+)
+                alts.append([Atom("__const__/empty-any-of")])
+        elif isinstance(item, list):
+            # conjunction: normalize under_anyof to suppress bracket removal
+            sub = _c_normalize_seq(item, empty_always_true, under_anyof=True)
+            if len(sub) == 1:
+                # ( X ) alternative -> X
+                alts.append(sub[0])
+            elif len(sub) == 2 and sub[0] == "||":
+                # ( || ( ... ) ) alternative -> its alternatives flatten into
+                # the enclosing any-of.
+                alts.extend(sub[1])
+            elif sub:
+                alts.append(sub)
+        else:
+            alts.append(item)
+        i += 1
+    return alts
+
+
+def _c_normalize_seq(seq, empty_always_true, under_anyof=False):
+    """Reduce a C parse (sub)tree to use_reduce's non-flat form.
+
+    under_anyof: this sequence is an alternative of an enclosing || group;
+    use_reduce keeps redundant brackets there, suppressing conjunction inlining."""
+    out = []
+    i = 0
+    n = len(seq)
+    while i < n:
+        item = seq[i]
+        if isinstance(item, str):  # '||'
+            i += 1
+            alts = _c_normalize_alts(seq[i], empty_always_true)
+            if not alts:
+                # || ( ) -> dropped (EAPI < 7) or a const placeholder (EAPI 7+).
+                if not empty_always_true:
+                    out.append(Atom("__const__/empty-any-of"))
+            elif len(alts) == 1:
+                # || ( X ) -> X
+                alt = alts[0]
+                if isinstance(alt, list) and not under_anyof:
+                    out.extend(alt)
+                else:
+                    out.append(alt)
+            else:
+                out.append("||")
+                out.append(alts)
+        elif isinstance(item, list):
+            out.extend(
+                _c_normalize_seq(item, empty_always_true, under_anyof=under_anyof)
+            )
+        else:
+            out.append(item)
+        i += 1
+    return out
+
+
+def _c_flatten_result(items, out, eapi, eapi_attrs, uselist, matchall):
+    """Recursively flatten the C parse tree into use_reduce(flat=True) form.
+    Nested || groups produce repeated '||' tokens, matching the Python path."""
+    for item in items:
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, list):
+            _c_flatten_result(item, out, eapi, eapi_attrs, uselist, matchall)
+        else:
+            out.append(_c_atom_from_c(item, eapi, eapi_attrs, uselist, matchall))
+    return out
+
+
+def _c_fast_use_reduce(depstr, uselist, matchall, eapi, flat):
+    raw = _c_dep_parser.parse(depstr, uselist=uselist, matchall=matchall)
+    eapi_attrs = _get_eapi_attrs(eapi)
+    if flat:
+        return _c_flatten_result(raw, [], eapi, eapi_attrs, uselist, matchall)
+    result = _c_convert_result(raw, eapi, eapi_attrs, uselist, matchall)
+    return _c_normalize_seq(result, eapi_attrs.empty_groups_always_true)
+
 
 # \w is [a-zA-Z0-9_]
 
@@ -74,6 +252,8 @@ _repo_name_re = re.compile(rf"^{_repo_name}\Z", re.ASCII)
 _extended_cat = r"[\w+*][\w+.*-]*"
 
 _slot_dep_re_cache = {}
+
+_build_id_separator = "-"
 
 
 def _get_slot_dep_re(eapi_attrs: _eapi_attrs) -> re.Pattern:
@@ -100,11 +280,7 @@ def _get_slot_dep_re(eapi_attrs: _eapi_attrs) -> re.Pattern:
     return slot_re
 
 
-def _match_slot(atom, pkg) -> bool:
-    """
-    @type atom: portage.dep.Atom
-    @type pkg: _emerge.Package.Package
-    """
+def _match_slot(atom: "Atom", pkg: "Package") -> bool:
     if pkg.slot == atom.slot:
         if not atom.sub_slot:
             return True
@@ -242,7 +418,7 @@ def _get_useflag_re(eapi):
     return _useflag_re
 
 
-def cpvequal(cpv1, cpv2):
+def cpvequal(cpv1: Union[str, _pkg_str], cpv2: Union[str, _pkg_str]) -> bool:
     """
     Example Usage:
             >>> from portage.dep import cpvequal
@@ -250,10 +426,7 @@ def cpvequal(cpv1, cpv2):
             >>> True
 
     @param cpv1: CategoryPackageVersion (no operators) Example: "sys-apps/portage-2.1"
-    @type cpv1: String
     @param cpv2: CategoryPackageVersion (no operators) Example: "sys-apps/portage-2.1"
-    @type cpv2: String
-    @rtype: Boolean
     @return:
             1.  True if cpv1 = cpv2
             2.  False Otherwise
@@ -282,24 +455,6 @@ def cpvequal(cpv1, cpv2):
         return False
 
     return vercmp(cpv1.version, cpv2.version) == 0
-
-
-def strip_empty(myarr):
-    """
-    Strip all empty elements from an array
-
-    @param myarr: The list of elements
-    @type myarr: List
-    @rtype: Array
-    @return: The array with empty elements removed
-    """
-    warnings.warn(
-        _("%s is deprecated and will be removed without replacement.")
-        % ("portage.dep.strip_empty",),
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return [x for x in myarr if x]
 
 
 def paren_reduce(mystr, _deprecation_warn=True):
@@ -420,58 +575,16 @@ def paren_reduce(mystr, _deprecation_warn=True):
     return stack[0]
 
 
-class paren_normalize(list):
-    """Take a dependency structure as returned by paren_reduce or use_reduce
-    and generate an equivalent structure that has no redundant lists."""
-
-    def __init__(self, src):
-        if portage._internal_caller:
-            warnings.warn(
-                _("%s is deprecated and will be removed without replacement.")
-                % ("portage.dep.paren_normalize",),
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        list.__init__(self)
-        self._zap_parens(src, self)
-
-    def _zap_parens(self, src, dest, disjunction=False):
-        if not src:
-            return dest
-        i = iter(src)
-        for x in i:
-            if isinstance(x, str):
-                if x in ("||", "^^"):
-                    y = self._zap_parens(next(i), [], disjunction=True)
-                    if len(y) == 1:
-                        dest.append(y[0])
-                    else:
-                        dest.append(x)
-                        dest.append(y)
-                elif x.endswith("?"):
-                    dest.append(x)
-                    dest.append(self._zap_parens(next(i), []))
-                else:
-                    dest.append(x)
-            else:
-                if disjunction:
-                    x = self._zap_parens(x, [])
-                    if len(x) == 1:
-                        dest.append(x[0])
-                    else:
-                        dest.append(x)
-                else:
-                    self._zap_parens(x, dest)
-        return dest
+_ParenEncloseType = list[Union[str, "Atom", "_ParenEncloseType"]]
 
 
-def paren_enclose(mylist, unevaluated_atom=False, opconvert=False):
+def paren_enclose(
+    mylist: _ParenEncloseType, unevaluated_atom: bool = False, opconvert: bool = False
+) -> str:
     """
     Convert a list to a string with sublists enclosed with parens.
 
     @param mylist: The list
-    @type mylist: List
-    @rtype: String
     @return: The paren enclosed string
 
     Example usage:
@@ -487,26 +600,26 @@ def paren_enclose(mylist, unevaluated_atom=False, opconvert=False):
             else:
                 mystrparts.append(f"( {paren_enclose(x)} )")
         else:
-            if unevaluated_atom:
-                x = getattr(x, "unevaluated_atom", x)
-            mystrparts.append(x)
+            if unevaluated_atom and isinstance(x, Atom):
+                x = x.unevaluated_atom
+            mystrparts.append(str(x))
     return " ".join(mystrparts)
 
 
 @lru_cache(1024)
 def _use_reduce_cached(
-    depstr,
+    depstr: str,
     uselist,
     masklist,
-    matchall,
+    matchall: bool,
     excludeall,
-    is_src_uri,
-    eapi,
-    opconvert,
-    flat,
+    is_src_uri: bool,
+    eapi: Optional[str],
+    opconvert: bool,
+    flat: bool,
     is_valid_flag,
     token_class,
-    matchnone,
+    matchnone: bool,
     subset,
 ):
     if opconvert and flat:
@@ -522,7 +635,7 @@ def _use_reduce_cached(
     eapi_attrs = _get_eapi_attrs(eapi)
     useflag_re = _get_useflag_re(eapi)
 
-    def is_active(conditional):
+    def is_active(conditional: str):
         """
         Decides if a given use conditional is active.
         """
@@ -535,15 +648,13 @@ def _use_reduce_cached(
 
         if is_valid_flag:
             if not is_valid_flag(flag):
-                msg = _(
-                    "USE flag '%s' referenced in " + "conditional '%s' is not in IUSE"
-                ) % (flag, conditional)
+                msg = f"USE flag '{flag}' referenced in conditional '{conditional}' is not in IUSE"
                 e = InvalidData(msg, category="IUSE.missing")
                 raise InvalidDependString(msg, errors=(e,))
         else:
             if useflag_re.match(flag) is None:
                 raise InvalidDependString(
-                    _("invalid use flag '%s' in conditional '%s'") % (flag, conditional)
+                    f"invalid use flag '{flag}' in conditional '{conditional}'"
                 )
 
         if is_negated and flag in excludeall:
@@ -672,7 +783,11 @@ def _use_reduce_cached(
 
                 if flat:
                     # In 'flat' mode, we simply merge all lists into a single large one.
-                    if stack[level] and stack[level][-1][-1] == "?":
+                    if (
+                        stack[level]
+                        and isinstance(stack[level][-1], str)
+                        and stack[level][-1][-1] == "?"
+                    ):
                         # The last token before the '(' that matches the current ')'
                         # was a use conditional. The conditional is removed in any case.
                         # Merge the current list if needed.
@@ -860,7 +975,7 @@ def _use_reduce_cached(
                         )
                     except SystemExit:
                         raise
-                    except Exception as e:
+                    except Exception:
                         missing_white_space_check(token, pos)
                         raise InvalidDependString(
                             _("Invalid token '%s', token %s") % (token, pos + 1)
@@ -868,6 +983,13 @@ def _use_reduce_cached(
 
                     if not matchall and hasattr(token, "evaluate_conditionals"):
                         token = token.evaluate_conditionals(uselist)
+
+                    if type(token) is Atom:
+                        # The is_valid_flag check above is the only part of
+                        # construction which is not a pure function of the
+                        # constructor arguments, so interning has to happen
+                        # here rather than in Atom.__new__.
+                        token = _intern_atom(token)
 
             stack[level].append(token)
 
@@ -884,18 +1006,18 @@ def _use_reduce_cached(
 
 
 def use_reduce(
-    depstr,
+    depstr: str,
     uselist=(),
     masklist=(),
-    matchall=False,
+    matchall: bool = False,
     excludeall=(),
-    is_src_uri=False,
-    eapi=None,
-    opconvert=False,
-    flat=False,
+    is_src_uri: bool = False,
+    eapi: Optional[str] = None,
+    opconvert: bool = False,
+    flat: bool = False,
     is_valid_flag=None,
     token_class=None,
-    matchnone=False,
+    matchnone: bool = False,
     subset=None,
 ):
     """
@@ -953,6 +1075,26 @@ def use_reduce(
     if subset is not None:
         subset = frozenset(subset)
 
+    if (
+        _c_dep_parser is not None
+        # The fast path builds portage.dep.Atom directly, so it cannot serve
+        # a caller that asked for some other token class.
+        and token_class is Atom
+        and not is_src_uri
+        and not opconvert
+        and is_valid_flag is None
+        and subset is None
+        and not matchnone
+        and not masklist
+        and not excludeall
+        # C grammar is EAPI 5+ only; eapi=None is permissive.
+        and (eapi is None or _get_eapi_attrs(eapi).slot_operator)
+    ):
+        try:
+            return _c_fast_use_reduce(depstr, uselist, matchall, eapi, flat)
+        except ValueError as e:
+            raise InvalidDependString(str(e)) from e
+
     result = _use_reduce_cached(
         depstr,
         uselist,
@@ -973,92 +1115,21 @@ def use_reduce(
     return result[:]
 
 
-def dep_opconvert(deplist):
-    """
-    Iterate recursively through a list of deps, if the
-    dep is a '||' or '&&' operator, combine it with the
-    list of deps that follows..
-
-    Example usage:
-            >>> test = ["blah", "||", ["foo", "bar", "baz"]]
-            >>> dep_opconvert(test)
-            ['blah', ['||', 'foo', 'bar', 'baz']]
-
-    @param deplist: A list of deps to format
-    @type deplist: List
-    @rtype: List
-    @return:
-            The new list with the new ordering
-    """
-    if portage._internal_caller:
-        warnings.warn(
-            _(
-                "%s is deprecated. Use %s with the opconvert parameter set to True instead."
-            )
-            % ("portage.dep.dep_opconvert", "portage.dep.use_reduce"),
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-    retlist = []
-    x = 0
-    while x != len(deplist):
-        if isinstance(deplist[x], list):
-            retlist.append(dep_opconvert(deplist[x]))
-        elif deplist[x] == "||":
-            retlist.append([deplist[x]] + dep_opconvert(deplist[x + 1]))
-            x += 1
-        else:
-            retlist.append(deplist[x])
-        x += 1
-    return retlist
-
-
-def flatten(mylist):
-    """
-    Recursively traverse nested lists and return a single list containing
-    all non-list elements that are found.
-
-    @param mylist: A list containing nested lists and non-list elements.
-    @type mylist: List
-    @rtype: List
-    @return: A single list containing only non-list elements.
-
-    Example usage:
-            >>> flatten([1, [2, 3, [4]]])
-            [1, 2, 3, 4]
-    """
-    if portage._internal_caller:
-        warnings.warn(
-            _("%s is deprecated and will be removed without replacement.")
-            % ("portage.dep.flatten",),
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-    newlist = []
-    for x in mylist:
-        if isinstance(x, list):
-            newlist.extend(flatten(x))
-        else:
-            newlist.append(x)
-    return newlist
-
-
 class _use_dep:
     __slots__ = (
+        "__weakref__",
         "_eapi_attrs",
         "conditional",
-        "missing_enabled",
-        "missing_disabled",
         "disabled",
         "enabled",
-        "tokens",
+        "missing_disabled",
+        "missing_enabled",
         "required",
+        "tokens",
     )
 
     class _conditionals_class:
-        __slots__ = ("enabled", "disabled", "equal", "not_equal")
+        __slots__ = ("disabled", "enabled", "equal", "not_equal")
 
         def items(self):
             for k in self.__slots__:
@@ -1186,7 +1257,7 @@ class _use_dep:
         return f"[{','.join(self.tokens)}]"
 
     def __repr__(self):
-        return f"portage.dep._use_dep({repr(self.tokens)})"
+        return f"portage.dep._use_dep({self.tokens!r})"
 
     def evaluate_conditionals(self, use):
         """
@@ -1256,14 +1327,16 @@ class _use_dep:
             else:
                 tokens.append(x)
 
-        return _use_dep(
-            tokens,
-            self._eapi_attrs,
-            enabled_flags=enabled_flags,
-            disabled_flags=disabled_flags,
-            missing_enabled=self.missing_enabled,
-            missing_disabled=self.missing_disabled,
-            required=self.required,
+        return _intern_use_dep(
+            _use_dep(
+                tokens,
+                self._eapi_attrs,
+                enabled_flags=enabled_flags,
+                disabled_flags=disabled_flags,
+                missing_enabled=self.missing_enabled,
+                missing_disabled=self.missing_disabled,
+                required=self.required,
+            )
         )
 
     def violated_conditionals(self, other_use, is_valid_flag, parent_use=None):
@@ -1379,15 +1452,17 @@ class _use_dep:
                         tokens.append(x)
                         conditional.setdefault("disabled", set()).add(flag)
 
-        return _use_dep(
-            tokens,
-            self._eapi_attrs,
-            enabled_flags=enabled_flags,
-            disabled_flags=disabled_flags,
-            missing_enabled=self.missing_enabled,
-            missing_disabled=self.missing_disabled,
-            conditional=conditional,
-            required=self.required,
+        return _intern_use_dep(
+            _use_dep(
+                tokens,
+                self._eapi_attrs,
+                enabled_flags=enabled_flags,
+                disabled_flags=disabled_flags,
+                missing_enabled=self.missing_enabled,
+                missing_disabled=self.missing_disabled,
+                conditional=conditional,
+                required=self.required,
+            )
         )
 
     def _eval_qa_conditionals(self, use_mask, use_force):
@@ -1442,28 +1517,299 @@ class _use_dep:
             else:
                 tokens.append(x)
 
-        return _use_dep(
-            tokens,
-            self._eapi_attrs,
-            enabled_flags=enabled_flags,
-            disabled_flags=disabled_flags,
-            missing_enabled=missing_enabled,
-            missing_disabled=missing_disabled,
-            required=self.required,
+        return _intern_use_dep(
+            _use_dep(
+                tokens,
+                self._eapi_attrs,
+                enabled_flags=enabled_flags,
+                disabled_flags=disabled_flags,
+                missing_enabled=missing_enabled,
+                missing_disabled=missing_disabled,
+                required=self.required,
+            )
         )
 
 
-class Atom(str):
-    """
-    For compatibility with existing atom string manipulation code, this
-    class emulates most of the str methods that are useful with atoms.
-    """
+# Weak references, so that an entry is released together with the last user
+# of the value that it holds.
+_use_dep_intern_cache = weakref.WeakValueDictionary()
 
-    # Distiguishes package atoms from other atom types
-    package = True
 
-    # Distiguishes soname atoms from other atom types
-    soname = False
+def _intern_use_dep(use_dep):
+    """
+    Return a canonical instance which is equal by value to the given
+    _use_dep instance (possibly the given instance itself).
+    """
+    conditional = use_dep.conditional
+    key = (
+        use_dep.tokens,
+        use_dep._eapi_attrs,
+        use_dep.required,
+        use_dep.enabled,
+        use_dep.disabled,
+        use_dep.missing_enabled,
+        use_dep.missing_disabled,
+        (
+            None
+            if conditional is None
+            else tuple(
+                getattr(conditional, k, None)
+                for k in _use_dep._conditionals_class.__slots__
+            )
+        ),
+    )
+    cached = _use_dep_intern_cache.get(key)
+    if cached is not None:
+        return cached
+    _use_dep_intern_cache[key] = use_dep
+    return use_dep
+
+
+# Atom instances are immutable, apart from the lazily computed without_use
+# cache. There are two caches because there are two ways to reach a canonical
+# instance: by the parsed state of an instance which already exists, and by
+# the arguments which would construct one. Their keys are not interchangeable,
+# so they must not share a dict.
+_atom_intern_cache = weakref.WeakValueDictionary()
+_atom_ctor_cache = weakref.WeakValueDictionary()
+
+
+def _atom_intern_key(atom):
+    unevaluated_atom = atom._unevaluated_atom
+    orig_atom = atom._orig_atom
+    blocker = atom._blocker_obj
+    return (
+        atom._string,
+        atom._eapi,
+        atom._extended_syntax,
+        atom._repo,
+        atom._build_id,
+        atom._use,
+        (
+            None
+            if unevaluated_atom is atom
+            else (unevaluated_atom._string, unevaluated_atom._eapi)
+        ),
+        None if orig_atom is None else (orig_atom._string, orig_atom._eapi),
+        None if blocker is None else blocker.overlap.forbid,
+    )
+
+
+def _intern_atom(atom):
+    """
+    Return a canonical instance which is equal by value to the given Atom
+    instance (possibly the given instance itself).
+    """
+    key = _atom_intern_key(atom)
+    cached = _atom_intern_cache.get(key)
+    if cached is not None:
+        return cached
+    _atom_intern_cache[key] = atom
+    return atom
+
+
+def _atom_ctor_key(
+    cls, s, unevaluated_atom, allow_wildcard, allow_repo, _use, eapi, allow_build_id
+):
+    """
+    Cache key for Atom instances created via the Atom constructor. The
+    parsed state of an Atom is fully determined by these arguments, so
+    instances that share a key are interchangeable. Atom instances hash by
+    string alone, so they are reduced to (string, eapi) pairs here in order
+    to avoid conflating atoms which differ in EAPI.
+
+    cls is included so that a subclass's constructor can never be handed
+    back a plain Atom (or another subclass's instance) found under the same
+    key; the cache stays partitioned per class.
+
+    Return None for an argument which the constructor accepts but which
+    cannot be part of a key. Everything else it accepts is a string, a flag,
+    a class or a _use_dep, all of which are hashable.
+    """
+    if type(s) is not str:
+        return None
+    if unevaluated_atom is not None:
+        if not isinstance(unevaluated_atom, Atom):
+            return None
+        unevaluated_atom = (unevaluated_atom._string, unevaluated_atom._eapi)
+    return (
+        cls,
+        s,
+        unevaluated_atom,
+        allow_wildcard,
+        allow_repo,
+        _use,
+        eapi,
+        allow_build_id,
+    )
+
+
+class Atom:
+    __slots__ = (
+        "__weakref__",
+        "_blocker_obj",
+        "_build_id",
+        "_cp",
+        "_cpv",
+        "_eapi",
+        "_extended_syntax",
+        "_intern_key",
+        "_operator",
+        "_orig_atom",
+        "_repo",
+        "_slot",
+        "_slot_operator",
+        "_string",
+        "_sub_slot",
+        "_unevaluated_atom",
+        "_use",
+        "_version",
+        "_without_use",
+    )
+
+    def __str__(self) -> str:
+        return self._string
+
+    def __repr__(self) -> str:
+        return f"Atom({self._string!r})"
+
+    def __eq__(self, value: object) -> bool:
+        if isinstance(value, Atom):
+            return self._string == value._string
+        if isinstance(value, str):
+            return self._string == value
+        return super().__eq__(value)
+
+    def __hash__(self) -> int:
+        return hash(self._string)
+
+    @property
+    def category(self) -> str:
+        """Return the category part of the atom (e.g., 'dev-libs' from 'dev-libs/foo')."""
+        return self._cp.partition("/")[0]
+
+    @property
+    def package_name(self) -> str:
+        """Return the package name part of the atom (e.g., 'foo' from 'dev-libs/foo')."""
+        return self._cp.split("/")[1]
+
+    @property
+    def cp(self) -> str:
+        """Category/Package string."""
+        return self._cp
+
+    @property
+    def cpv(self) -> str:
+        """Category/Package-Version string."""
+        return self._cpv
+
+    @property
+    def is_versioned(self) -> bool:
+        """True if atom specifies a version."""
+        return self._version is not None
+
+    @property
+    def version(self) -> Optional[str]:
+        """Version string."""
+        return self._version
+
+    @property
+    def repo(self) -> Optional[str]:
+        """Repository name."""
+        return self._repo
+
+    @property
+    def slot(self) -> Optional[str]:
+        """Slot name."""
+        return self._slot
+
+    @property
+    def sub_slot(self) -> Optional[str]:
+        """Sub-slot name."""
+        return self._sub_slot
+
+    @property
+    def slot_operator(self) -> Optional[str]:
+        """Slot operator (= or *)."""
+        return self._slot_operator
+
+    @property
+    def operator(self) -> Optional[str]:
+        """Version operator (=, >=, <, etc.)."""
+        return self._operator
+
+    @property
+    def blocker(self) -> Optional["_blocker"]:
+        """Blocker information."""
+        return self._blocker_obj
+
+    @property
+    def eapi(self) -> Optional[str]:
+        """EAPI version."""
+        return self._eapi
+
+    @property
+    def extended_syntax(self) -> bool:
+        """Whether this atom uses extended syntax."""
+        return self._extended_syntax
+
+    @property
+    def build_id(self) -> Optional[int]:
+        """Build ID."""
+        return self._build_id
+
+    @property
+    def use(self) -> Optional["_use_dep"]:
+        """USE dependencies."""
+        return self._use
+
+    @property
+    def without_use(self) -> "Atom":
+        """Atom without USE dependencies."""
+        try:
+            return self._without_use
+        except AttributeError:
+            pass
+        if self._use is None:
+            if (
+                self._unevaluated_atom is not self
+                and self._unevaluated_atom.use is not None
+                # unevaluated_atom.use is used for IUSE checks when matching
+                # packages, so it must not propagate to without_use
+            ):
+                result = Atom(
+                    str(self),
+                    allow_wildcard=self._extended_syntax,
+                    allow_repo=self.repo is not None,
+                )
+            else:
+                result = self
+        else:
+            s = str(self)
+            result = Atom(s[: s.index("[")], allow_repo=self.repo is not None)
+        self._without_use = result
+        return result
+
+    @property
+    def unevaluated_atom(self) -> "Atom":
+        """The original unevaluated atom."""
+        return self._unevaluated_atom
+
+    @property
+    def orig_atom(self) -> Optional["Atom"]:
+        """For virtual-expanded atoms, the original pre-expansion atom."""
+        return self._orig_atom
+
+    # Type discrimination properties
+    @property
+    def package(self) -> bool:
+        """Distinguishes package atoms from other atom types (like soname atoms)."""
+        return True
+
+    @property
+    def soname(self) -> bool:
+        """Distinguishes soname atoms from other atom types."""
+        return False
 
     class _blocker:
         __slots__ = ("overlap",)
@@ -1477,8 +1823,130 @@ class Atom(str):
         def __init__(self, forbid_overlap=False):
             self.overlap = self._overlap(forbid=forbid_overlap)
 
-    def __new__(cls, s, *args, **kwargs):
-        return str.__new__(cls, s)
+    def _validate_conditional_flags(self, is_valid_flag):
+        """Raise if a USE-conditional flag in this atom is not in IUSE.
+
+        Mirrors the check the regex path performs in __init__.
+        """
+        for conditional_type, flags in self._use.conditional.items():
+            for flag in flags:
+                if is_valid_flag(flag):
+                    continue
+                conditional_str = _use_dep._conditional_strings[conditional_type]
+                raise InvalidAtom(
+                    f"USE flag '{flag}' referenced in conditional "
+                    f"'{conditional_str % flag}' in atom '{self}' is not in IUSE",
+                    category="IUSE.missing",
+                )
+
+    def _c_fast_init(self, catom, eapi, eapi_attrs, is_valid_flag, unevaluated_atom):
+        """Populate this Atom from a C scan_atom result.
+
+        Raises InvalidAtom/TypeError for the same cases as the regex path.
+        """
+        use_tokens = catom.use
+        if use_tokens is not None:
+            # _use_dep validates conflicting flags, same as the regex path.
+            self._use = _intern_use_dep(_use_dep(list(use_tokens), eapi_attrs))
+        else:
+            self._use = None
+
+        _c_fill_atom_fields(self, catom, eapi)
+        self._unevaluated_atom = unevaluated_atom if unevaluated_atom else self
+
+        if eapi is None:
+            return
+
+        if not isinstance(eapi, str):
+            raise TypeError(
+                f"expected eapi argument of {str}, got {type(eapi)}: {eapi}"
+            )
+
+        if self._slot and not eapi_attrs.slot_deps:
+            raise InvalidAtom(
+                f"Slot deps are not allowed in EAPI {eapi}: '{self}'",
+                category="EAPI.incompatible",
+            )
+
+        if self._use:
+            if not eapi_attrs.use_deps:
+                raise InvalidAtom(
+                    f"Use deps are not allowed in EAPI {eapi}: '{self}'",
+                    category="EAPI.incompatible",
+                )
+            if not eapi_attrs.use_dep_defaults and (
+                self._use.missing_enabled or self._use.missing_disabled
+            ):
+                raise InvalidAtom(
+                    f"Use dep defaults are not allowed in EAPI {eapi}: '{self}'",
+                    category="EAPI.incompatible",
+                )
+            if is_valid_flag is not None and self._use.conditional:
+                self._validate_conditional_flags(is_valid_flag)
+
+        if (
+            self._blocker_obj
+            and self._blocker_obj.overlap.forbid
+            and not eapi_attrs.strong_blocks
+        ):
+            raise InvalidAtom(
+                f"Strong blocks are not allowed in EAPI {eapi}: '{self}'",
+                category="EAPI.incompatible",
+            )
+
+    def __new__(
+        cls,
+        s=None,
+        unevaluated_atom=None,
+        allow_wildcard=False,
+        allow_repo=None,
+        _use=None,
+        eapi=None,
+        is_valid_flag=None,
+        allow_build_id=None,
+        orig_atom=None,
+    ):
+        # An is_valid_flag callable makes the constructor raise for USE
+        # conditionals which are not in IUSE, so those instances are not
+        # interchangeable with the ones that skip the check.
+        if s is None or is_valid_flag is not None or orig_atom is not None:
+            return object.__new__(cls)
+
+        key = _atom_ctor_key(
+            cls,
+            s,
+            unevaluated_atom,
+            allow_wildcard,
+            allow_repo,
+            _use,
+            eapi,
+            allow_build_id,
+        )
+        if key is None:
+            return object.__new__(cls)
+
+        cached = _atom_ctor_cache.get(key)
+        if cached is not None:
+            return cached
+
+        instance = object.__new__(cls)
+        # Remember the key, so that __init__ can add the fully initialized
+        # instance to the cache.
+        instance._intern_key = key
+        return instance
+
+    def _finish_intern(self):
+        """
+        Add a newly initialized instance to the intern cache, if __new__
+        found it eligible.
+        """
+        try:
+            key = self._intern_key
+        except AttributeError:
+            return
+        # The cache holds the only reference to the key from here on.
+        del self._intern_key
+        _atom_ctor_cache[key] = self
 
     def __init__(
         self,
@@ -1490,22 +1958,29 @@ class Atom(str):
         eapi=None,
         is_valid_flag=None,
         allow_build_id=None,
+        orig_atom=None,
     ):
+        if getattr(self, "_string", None) is not None:
+            # __new__ returned an instance from the intern cache, which is
+            # already initialized with an identical set of arguments. Only
+            # an initialized instance has _string, and only a fully
+            # initialized one reaches the cache.
+            return
+
         if isinstance(s, Atom):
             # This is an efficiency assertion, to ensure that the Atom
             # constructor is not called redundantly.
             raise TypeError(_("Expected %s, got %s") % (str, type(s)))
 
-        if not isinstance(s, str):
-            # Avoid TypeError from str.__init__ with PyPy.
-            s = _unicode_decode(s)
+        if isinstance(s, bytes):
+            s = s.decode("utf-8", "replace")
 
-        str.__init__(s)
+        self._string = s
 
         eapi_attrs = _get_eapi_attrs(eapi)
         atom_re = _get_atom_re(eapi_attrs)
 
-        self.__dict__["eapi"] = eapi
+        self._eapi = eapi
         if eapi is not None:
             # If allow_repo is not set, use default from eapi
             if allow_repo is None:
@@ -1519,18 +1994,36 @@ class Atom(str):
             if allow_build_id is None:
                 allow_build_id = True
 
-        blocker_prefix = ""
+        # Try the C fast path. scan_atom raises ValueError for anything it
+        # can't handle (wildcards, repo specs, build-ids); we fall through to
+        # the regex path. allow_wildcard is safe: __init__ tries strict regex
+        # first, so actual wildcard atoms fail scan_atom and fall back naturally.
+        if (
+            _c_dep_parser is not None
+            and _use is None
+            and orig_atom is None
+            and (eapi is None or eapi_attrs.slot_operator)
+        ):
+            try:
+                catom = _c_dep_parser.scan_atom(s)
+            except ValueError:
+                catom = None
+            if catom is not None:
+                self._c_fast_init(
+                    catom, eapi, eapi_attrs, is_valid_flag, unevaluated_atom
+                )
+                self._finish_intern()
+                return
+
         if s[:1] == "!":
             blocker = self._blocker(forbid_overlap=s[1:2] == "!")
             if blocker.overlap.forbid:
-                blocker_prefix = s[:2]
                 s = s[2:]
             else:
-                blocker_prefix = s[:1]
                 s = s[1:]
         else:
-            blocker = False
-        self.__dict__["blocker"] = blocker
+            blocker = None
+        self._blocker_obj = blocker
         m = atom_re.match(s)
         build_id = None
         extended_syntax = False
@@ -1540,7 +2033,7 @@ class Atom(str):
                 atom_re = _get_atom_wildcard_re(eapi_attrs)
                 m = atom_re.match(s)
                 if m is None:
-                    raise InvalidAtom(self)
+                    raise InvalidAtom(self._string)
                 m_group = m.group
                 if m_group("star") is not None:
                     op = "=*"
@@ -1552,15 +2045,15 @@ class Atom(str):
                     op = None
                     cpv = cp = m_group("simple")
                     if m_group(atom_re.groupindex["simple"] + 3) is not None:
-                        raise InvalidAtom(self)
+                        raise InvalidAtom(self._string)
                 if cpv.find("**") != -1:
-                    raise InvalidAtom(self)
+                    raise InvalidAtom(self._string)
                 slot = m_group("slot")
                 repo = m_group("repo")
                 use_str = None
                 extended_syntax = True
             else:
-                raise InvalidAtom(self)
+                raise InvalidAtom(self._string)
         elif m.group("op") is not None:
             m_group = m.group
             base = atom_re.groupindex["op"]
@@ -1579,13 +2072,13 @@ class Atom(str):
                     build_id = cpv_build_id[len(cpv) + 1 :]
                     if len(build_id) > 1 and build_id[:1] == "0":
                         # Leading zeros are not allowed.
-                        raise InvalidAtom(self)
+                        raise InvalidAtom(self._string)
                     try:
                         build_id = int(build_id)
                     except ValueError:
-                        raise InvalidAtom(self)
+                        raise InvalidAtom(self._string)
                 else:
-                    raise InvalidAtom(self)
+                    raise InvalidAtom(self._string)
         elif m.group("star") is not None:
             base = atom_re.groupindex["star"]
             op = "=*"
@@ -1596,7 +2089,7 @@ class Atom(str):
             repo = m_group("repo")
             use_str = m_group("usedeps")
             if m_group(base + 3) is not None:
-                raise InvalidAtom(self)
+                raise InvalidAtom(self._string)
         elif m.group("simple") is not None:
             op = None
             m_group = m.group
@@ -1605,77 +2098,64 @@ class Atom(str):
             repo = m_group("repo")
             use_str = m_group("usedeps")
             if m_group(atom_re.groupindex["simple"] + 2) is not None:
-                raise InvalidAtom(self)
+                raise InvalidAtom(self._string)
 
         else:
             raise AssertionError(_("required group not found in atom: '%s'") % self)
-        self.__dict__["cp"] = cp
-        try:
-            self.__dict__["cpv"] = _pkg_str(cpv)
-            self.__dict__["version"] = self.cpv.version
-        except InvalidData:
-            # plain cp, wildcard, or something
-            self.__dict__["cpv"] = cpv
-            self.__dict__["version"] = extended_version
-        self.__dict__["repo"] = repo
+        self._cp = cp
+        self._cpv = cpv
+        if cpv == cp:
+            # unversioned: simple cp or extended-syntax wildcard
+            self._version = extended_version
+        else:
+            # versioned: strip "cp-" prefix to get the version string
+            self._version = cpv[len(cp) + 1 :]
+        self._repo = repo
         if slot is None:
-            self.__dict__["slot"] = None
-            self.__dict__["sub_slot"] = None
-            self.__dict__["slot_operator"] = None
+            self._slot = None
+            self._sub_slot = None
+            self._slot_operator = None
         else:
             slot_re = _get_slot_dep_re(eapi_attrs)
             slot_match = slot_re.match(slot)
             if slot_match is None:
-                raise InvalidAtom(self)
+                raise InvalidAtom(self._string)
             if eapi_attrs.slot_operator:
-                self.__dict__["slot"] = slot_match.group("main_slot")
-                self.__dict__["sub_slot"] = slot_match.group("sub_slot")
-                self.__dict__["slot_operator"] = slot_match.group("slot_operator")
+                self._slot = slot_match.group("main_slot")
+                self._sub_slot = slot_match.group("sub_slot")
+                self._slot_operator = slot_match.group("slot_operator")
                 if self.slot is not None and self.slot_operator == "*":
-                    raise InvalidAtom(self)
+                    raise InvalidAtom(self._string)
                 # since both parts are optional, we could theoretically match on nothing
                 if self.slot is None and self.slot_operator is None:
-                    raise InvalidAtom(self)
+                    raise InvalidAtom(self._string)
             else:
-                self.__dict__["slot"] = slot
-                self.__dict__["sub_slot"] = None
-                self.__dict__["slot_operator"] = None
-        self.__dict__["operator"] = op
-        self.__dict__["extended_syntax"] = extended_syntax
-        self.__dict__["build_id"] = build_id
+                self._slot = slot
+                self._sub_slot = None
+                self._slot_operator = None
+        self._operator = op
+        self._extended_syntax = extended_syntax
+        self._build_id = build_id
 
         if not (repo is None or allow_repo):
-            raise InvalidAtom(self)
+            raise InvalidAtom(self._string)
 
         if use_str is not None:
             if _use is not None:
                 use = _use
             else:
-                use = _use_dep(use_str[1:-1].split(","), eapi_attrs)
-            without_use = Atom(
-                blocker_prefix + m.group("without_use"), allow_repo=allow_repo
-            )
+                use = _intern_use_dep(_use_dep(use_str[1:-1].split(","), eapi_attrs))
         else:
             use = None
-            if unevaluated_atom is not None and unevaluated_atom.use is not None:
-                # unevaluated_atom.use is used for IUSE checks when matching
-                # packages, so it must not propagate to without_use
-                without_use = Atom(
-                    str(self),
-                    allow_wildcard=allow_wildcard,
-                    allow_repo=allow_repo,
-                    eapi=eapi,
-                )
-            else:
-                without_use = self
 
-        self.__dict__["use"] = use
-        self.__dict__["without_use"] = without_use
+        self._use = use
 
         if unevaluated_atom:
-            self.__dict__["unevaluated_atom"] = unevaluated_atom
+            self._unevaluated_atom = unevaluated_atom
         else:
-            self.__dict__["unevaluated_atom"] = self
+            self._unevaluated_atom = self
+
+        self._orig_atom = orig_atom
 
         if eapi is not None:
             if not isinstance(eapi, str):
@@ -1731,6 +2211,8 @@ class Atom(str):
                     category="EAPI.incompatible",
                 )
 
+        self._finish_intern()
+
     @property
     def slot_operator_built(self) -> bool:
         """
@@ -1740,19 +2222,26 @@ class Atom(str):
         """
         return self.slot_operator == "=" and self.sub_slot is not None
 
+    def with_cp(self, cp: str) -> "Atom":
+        return Atom(
+            str(self).replace(self.cp, cp, 1),
+            allow_wildcard=True,
+            allow_repo=self.repo is not None,
+        )
+
     @property
     def without_repo(self) -> "Atom":
         if self.repo is None:
             return self
         return Atom(
-            self.replace(_repo_separator + self.repo, "", 1), allow_wildcard=True
+            str(self).replace(_repo_separator + self.repo, "", 1), allow_wildcard=True
         )
 
     @property
     def without_slot(self) -> "Atom":
         if self.slot is None and self.slot_operator is None:
             return self
-        atom = remove_slot(self)
+        atom = remove_slot(str(self))
         if self.repo is not None:
             atom += _repo_separator + self.repo
         if self.use is not None:
@@ -1760,7 +2249,7 @@ class Atom(str):
         return Atom(atom, allow_repo=True, allow_wildcard=True)
 
     def with_repo(self, repo) -> "Atom":
-        atom = remove_slot(self)
+        atom = remove_slot(str(self))
         if self.slot is not None or self.slot_operator is not None:
             atom += _slot_separator
             if self.slot is not None:
@@ -1775,17 +2264,12 @@ class Atom(str):
         return Atom(atom, allow_repo=True, allow_wildcard=True)
 
     def with_slot(self, slot) -> "Atom":
-        atom = remove_slot(self) + _slot_separator + slot
+        atom = remove_slot(str(self)) + _slot_separator + slot
         if self.repo is not None:
             atom += _repo_separator + self.repo
         if self.use is not None:
             atom += str(self.use)
         return Atom(atom, allow_repo=True, allow_wildcard=True)
-
-    def __setattr__(self, name, value):
-        raise AttributeError(
-            "Atom instances are immutable", self.__class__, name, value
-        )
 
     def intersects(self, other: "Atom") -> bool:
         """
@@ -1827,7 +2311,7 @@ class Atom(str):
         """
         if not (self.use and self.use.conditional):
             return self
-        atom = remove_slot(self)
+        atom = remove_slot(str(self))
         if self.slot is not None or self.slot_operator is not None:
             atom += _slot_separator
             if self.slot is not None:
@@ -1843,6 +2327,7 @@ class Atom(str):
             unevaluated_atom=self,
             allow_repo=(self.repo is not None),
             _use=use_dep,
+            orig_atom=self._orig_atom,
         )
 
     def violated_conditionals(
@@ -1862,7 +2347,7 @@ class Atom(str):
         """
         if not self.use:
             return self
-        atom = remove_slot(self)
+        atom = remove_slot(str(self))
         if self.slot is not None or self.slot_operator is not None:
             atom += _slot_separator
             if self.slot is not None:
@@ -1878,12 +2363,13 @@ class Atom(str):
             unevaluated_atom=self,
             allow_repo=(self.repo is not None),
             _use=use_dep,
+            orig_atom=self._orig_atom,
         )
 
     def _eval_qa_conditionals(self, use_mask, use_force):
         if not (self.use and self.use.conditional):
             return self
-        atom = remove_slot(self)
+        atom = remove_slot(str(self))
         if self.slot is not None or self.slot_operator is not None:
             atom += _slot_separator
             if self.slot is not None:
@@ -1899,6 +2385,7 @@ class Atom(str):
             unevaluated_atom=self,
             allow_repo=(self.repo is not None),
             _use=use_dep,
+            orig_atom=self._orig_atom,
         )
 
     def __copy__(self):
@@ -1910,14 +2397,12 @@ class Atom(str):
         memo[id(self)] = self
         return self
 
-    def match(self, pkg: "_emerge.Package"):
+    def match(self, pkg: "Package") -> bool:
         """
         Check if the given package instance matches this atom.
 
         @param pkg: a Package instance
-        @type pkg: Package
         @return: True if this atom matches pkg, otherwise False
-        @rtype: bool
         """
         return bool(match_from_list(self, (pkg,)))
 
@@ -2042,7 +2527,7 @@ class ExtendedAtomDict(portage.cache.mappings.MutableMapping):
         self._normal.clear()
 
 
-def get_operator(mydep):
+def get_operator(mydep: Union[str, Atom]) -> Optional[str]:
     """
     Return the operator used in a depstring.
 
@@ -2052,18 +2537,24 @@ def get_operator(mydep):
             '>='
 
     @param mydep: The dep string to check
-    @type mydep: String
-    @rtype: String
     @return: The operator. One of:
             '~', '=', '>', '<', '=*', '>=', or '<='
+
+    .. deprecated::
+        Use ``Atom.operator`` directly.
     """
+    warnings.warn(
+        "get_operator() is deprecated, use Atom.operator instead",
+        UserWarning,
+        stacklevel=2,
+    )
     if not isinstance(mydep, Atom):
         mydep = Atom(mydep)
 
     return mydep.operator
 
 
-def dep_getcpv(mydep):
+def dep_getcpv(mydep: Union[str, Atom]) -> str:
     """
     Return the category-package-version with any operators/slot specifications stripped off
 
@@ -2072,17 +2563,23 @@ def dep_getcpv(mydep):
             'media-libs/test-3.0'
 
     @param mydep: The depstring
-    @type mydep: String
-    @rtype: String
     @return: The depstring with the operator removed
+
+    .. deprecated::
+        Use ``Atom.cpv`` directly.
     """
+    warnings.warn(
+        "dep_getcpv() is deprecated, use Atom.cpv instead",
+        UserWarning,
+        stacklevel=2,
+    )
     if not isinstance(mydep, Atom):
         mydep = Atom(mydep)
 
     return mydep.cpv
 
 
-def dep_getslot(mydep):
+def dep_getslot(mydep: Union[str, Atom]) -> Optional[str]:
     """
     Retrieve the slot on a depend.
 
@@ -2091,13 +2588,10 @@ def dep_getslot(mydep):
             '3'
 
     @param mydep: The depstring to retrieve the slot of
-    @type mydep: String
-    @rtype: String
     @return: The slot
     """
-    slot = getattr(mydep, "slot", False)
-    if slot is not False:
-        return slot
+    if isinstance(mydep, Atom):
+        return mydep.slot
 
     # remove repo_name if present
     mydep = mydep.split(_repo_separator)[0]
@@ -2111,49 +2605,41 @@ def dep_getslot(mydep):
     return None
 
 
-def dep_getrepo(mydep):
+def dep_getrepo(mydep: Union[str, Atom]) -> Optional[str]:
     """
     Retrieve the repo on a depend.
 
     @param mydep: The depstring to retrieve the repository of
-    @type mydep: String
-    @rtype: String
     @return: The repository name
 
     Example usage:
             >>> dep_getrepo('app-misc/test::repository')
             'repository'
     """
-    repo = getattr(mydep, "repo", False)
-    if repo is not False:
-        return repo
+    if isinstance(mydep, Atom):
+        return mydep.repo
 
-    metadata = getattr(mydep, "metadata", False)
-    if metadata:
-        repo = metadata.get("repository", False)
-        if repo is not False:
-            return repo
-
+    # Handle string case
     colon = mydep.find(_repo_separator)
     if colon != -1:
         bracket = mydep.find("[", colon)
         if bracket == -1:
             return mydep[colon + 2 :]
         return mydep[colon + 2 : bracket]
+
     return None
 
 
-def remove_slot(mydep):
+def remove_slot(mydep: Union[str, Atom]) -> str:
     """
     Removes dep components from the right side of an atom:
             - slot
             - use
             - repo
     And repo_name from the left side.
-
-    @type mydep: String
-    @rtype: String
     """
+    if isinstance(mydep, Atom):
+        mydep = str(mydep)
     colon = mydep.find(_slot_separator)
     if colon != -1:
         mydep = mydep[:colon]
@@ -2164,21 +2650,28 @@ def remove_slot(mydep):
     return mydep
 
 
-def dep_getusedeps(depend):
+def dep_getusedeps(depend: Union[str, Atom]) -> tuple[str, ...]:
     """
     Pull a listing of USE Dependencies out of a dep atom.
 
     @param depend: The depstring to process
-    @type depend: String
-    @rtype: List
-    @return: List of use flags ( or [] if no flags exist )
+    @return: Tuple of use flags (or () if no flags exist)
 
     Example usage:
             >>> dep_getusedeps('app-misc/test:3[foo,-bar]')
             ('foo', '-bar')
+
+    .. deprecated::
+        Use ``Atom.use.tokens`` directly.
     """
+    warnings.warn(
+        "dep_getusedeps() is deprecated, use Atom.use.tokens instead",
+        UserWarning,
+        stacklevel=2,
+    )
+    depend_str = str(depend)
     use_list = []
-    open_bracket = depend.find("[")
+    open_bracket = depend_str.find("[")
     # -1 = failure (think c++ string::npos)
     comma_separated = False
     bracket_count = 0
@@ -2189,10 +2682,10 @@ def dep_getusedeps(depend):
                 _("USE Dependency with more " "than one set of brackets: %s")
                 % (depend,)
             )
-        close_bracket = depend.find("]", open_bracket)
+        close_bracket = depend_str.find("]", open_bracket)
         if close_bracket == -1:
             raise InvalidAtom(_("USE Dependency with no closing bracket: %s") % depend)
-        use = depend[open_bracket + 1 : close_bracket]
+        use = depend_str[open_bracket + 1 : close_bracket]
         # foo[1:1] may return '' instead of None, we don't want '' in the result
         if not use:
             raise InvalidAtom(_("USE Dependency with " "no use flag ([]): %s") % depend)
@@ -2221,7 +2714,7 @@ def dep_getusedeps(depend):
             use_list.append(use)
 
         # Find next use flag
-        open_bracket = depend.find("[", open_bracket + 1)
+        open_bracket = depend_str.find("[", open_bracket + 1)
     return tuple(use_list)
 
 
@@ -2270,7 +2763,7 @@ def isvalidatom(
         return False
 
 
-def isjustname(mypkg):
+def isjustname(mypkg: Union[str, Atom]) -> bool:
     """
     Checks to see if the atom is only the package name (no version parts).
 
@@ -2281,8 +2774,6 @@ def isjustname(mypkg):
             True
 
     @param mypkg: The package atom to check
-    @param mypkg: String or Atom
-    @rtype: Integer
     @return: One of the following:
             1) False if the package string is not just the package name
             2) True if it is
@@ -2290,17 +2781,17 @@ def isjustname(mypkg):
     try:
         if not isinstance(mypkg, Atom):
             mypkg = Atom(mypkg)
-        return mypkg == mypkg.cp
+        return str(mypkg) == mypkg.cp
     except InvalidAtom:
         pass
 
-    for x in mypkg.split("-")[-2:]:
+    for x in str(mypkg).split("-")[-2:]:
         if ververify(x):
             return False
     return True
 
 
-def isspecific(mypkg):
+def isspecific(mypkg: Union[str, Atom]) -> bool:
     """
     Checks to see if a package is in =category/package-version or
     package-version format.
@@ -2312,8 +2803,6 @@ def isspecific(mypkg):
             True
 
     @param mypkg: The package depstring to check against
-    @type mypkg: String
-    @rtype: Boolean
     @return: One of the following:
             1) False if the package string is not specific
             2) True if it is
@@ -2321,7 +2810,7 @@ def isspecific(mypkg):
     try:
         if not isinstance(mypkg, Atom):
             mypkg = Atom(mypkg)
-        return mypkg != mypkg.cp
+        return str(mypkg) != mypkg.cp
     except InvalidAtom:
         pass
 
@@ -2329,7 +2818,7 @@ def isspecific(mypkg):
     return not isjustname(mypkg)
 
 
-def dep_getkey(mydep):
+def dep_getkey(mydep: Union[str, Atom]) -> str:
     """
     Return the category/package-name of a depstring.
 
@@ -2338,8 +2827,6 @@ def dep_getkey(mydep):
             'media-libs/test'
 
     @param mydep: The depstring to retrieve the category/package-name of
-    @type mydep: String
-    @rtype: String
     @return: The package category/package-name
     """
     if not isinstance(mydep, Atom):
@@ -2348,15 +2835,12 @@ def dep_getkey(mydep):
     return mydep.cp
 
 
-def match_to_list(mypkg, mylist):
+def match_to_list(mypkg: Union[str, Atom], mylist: list) -> list:
     """
     Searches list for entries that matches the package.
 
     @param mypkg: The package atom to match
-    @type mypkg: String
     @param mylist: The list of package atoms to compare against
-    @type mylist: List
-    @rtype: List
     @return: A unique list of package atoms that match the given package atom
     """
     matches = set()
@@ -2370,12 +2854,11 @@ def match_to_list(mypkg, mylist):
     return result
 
 
-def best_match_to_list(mypkg, mylist):
+def best_match_to_list(mypkg: Union[str, Atom], mylist: list) -> Optional[Atom]:
     """
     Returns the most specific entry that matches the package given.
 
     @param mypkg: The package atom to check
-    @type mypkg: String
     @param mylist: The list of package atoms to check against
     @type mylist: List
     @rtype: String
@@ -2392,8 +2875,6 @@ def best_match_to_list(mypkg, mylist):
             - cp:slot with extended syntax	0
             - cp with extended syntax	-1
     """
-    from portage.util import cmp_sort_key
-
     operator_values = {
         "=": 6,
         "~": 5,
@@ -2447,7 +2928,11 @@ def best_match_to_list(mypkg, mylist):
                 cpv_list = [bestm.cpv, mypkg_cpv, x.cpv]
 
                 def cmp_cpv(cpv1, cpv2):
-                    return vercmp(cpv1.version, cpv2.version)
+                    v1 = getattr(cpv1, "version", None) or cpv_getversion(str(cpv1))
+                    v2 = getattr(cpv2, "version", None) or cpv_getversion(str(cpv2))
+                    return vercmp(v1, v2)
+
+                from portage.util import cmp_sort_key
 
                 cpv_list.sort(key=cmp_sort_key(cmp_cpv))
                 if cpv_list[0] is mypkg_cpv or cpv_list[-1] is mypkg_cpv:
@@ -2460,7 +2945,7 @@ def best_match_to_list(mypkg, mylist):
     return bestm
 
 
-def match_from_list(mydep, candidate_list):
+def match_from_list(mydep: Union[str, Atom], candidate_list):
     """
     Searches list for entries that matches the package.
 
@@ -2471,17 +2956,14 @@ def match_from_list(mydep, candidate_list):
     @rtype: List
     @return: A list of package atoms that match the given package atom
     """
-    from portage.util import writemsg
-
     if not candidate_list:
         return []
 
-    if "!" == mydep[:1]:
-        if "!" == mydep[1:2]:
-            mydep = mydep[2:]
-        else:
-            mydep = mydep[1:]
-    if not isinstance(mydep, Atom):
+    if isinstance(mydep, Atom):
+        if mydep.blocker:
+            mydep = Atom(str(mydep).lstrip("!"), allow_wildcard=True, allow_repo=True)
+    else:
+        mydep = mydep.lstrip("!")
         mydep = Atom(mydep, allow_wildcard=True, allow_repo=True)
 
     mycpv = mydep.cpv
@@ -2495,14 +2977,15 @@ def match_from_list(mydep, candidate_list):
         cat, pkg, ver, rev = mycpv_cps
         if mydep == mycpv:
             raise KeyError(
-                _("Specific key requires an operator" " (%s) (try adding an '=')")
-                % (mydep)
+                f"Specific key requires an operator ({mydep}) (try adding an '=')"
             )
 
     if ver and rev:
         operator = mydep.operator
         if not operator:
-            writemsg(_("!!! Invalid atom: %s\n") % mydep, noiselevel=-1)
+            from portage.util import writemsg
+
+            writemsg(f"!!! Invalid atom: {mydep}\n", noiselevel=-1)
             return []
     else:
         operator = None
@@ -2511,11 +2994,17 @@ def match_from_list(mydep, candidate_list):
 
     if mydep.extended_syntax:
         for x in candidate_list:
-            cp = getattr(x, "cp", None)
-            if cp is None:
+            if isinstance(x, Atom):
+                cp = x.cp
+            elif hasattr(x, "cp"):
+                # Package object
+                cp = x.cp
+            else:
                 mysplit = catpkgsplit(remove_slot(x))
                 if mysplit is not None:
                     cp = mysplit[0] + "/" + mysplit[1]
+                else:
+                    cp = None
 
             if cp is None:
                 continue
@@ -2530,8 +3019,12 @@ def match_from_list(mydep, candidate_list):
             ver = mydep.version[1:-1]
 
             for x in candidate_list:
-                x_ver = getattr(x, "version", None)
-                if x_ver is None:
+                if isinstance(x, Atom):
+                    x_ver = x.version
+                elif hasattr(x, "version"):
+                    # Package object
+                    x_ver = x.version
+                else:
                     xs = catpkgsplit(remove_slot(x))
                     if xs is None:
                         continue
@@ -2541,11 +3034,17 @@ def match_from_list(mydep, candidate_list):
 
     elif operator is None:
         for x in candidate_list:
-            cp = getattr(x, "cp", None)
-            if cp is None:
+            if isinstance(x, Atom):
+                cp = x.cp
+            elif hasattr(x, "cp"):
+                # Package object
+                cp = x.cp
+            else:
                 mysplit = catpkgsplit(remove_slot(x))
                 if mysplit is not None:
                     cp = mysplit[0] + "/" + mysplit[1]
+                else:
+                    cp = None
 
             if cp is None:
                 continue
@@ -2555,13 +3054,18 @@ def match_from_list(mydep, candidate_list):
 
     elif operator == "=":  # Exact match
         for x in candidate_list:
-            xcpv = getattr(x, "cpv", None)
-            if xcpv is None:
+            if isinstance(x, Atom):
+                xcpv = x.cpv
+            elif hasattr(x, "cpv"):
+                # Package has cpv attribute - use it directly to preserve _pkg_str with build_id
+                xcpv = x.cpv
+            else:
                 xcpv = remove_slot(x)
             if not cpvequal(xcpv, mycpv):
                 continue
-            if build_id is not None and getattr(xcpv, "build_id", None) != build_id:
-                continue
+            if build_id is not None:
+                if isinstance(xcpv, _pkg_str) and xcpv.build_id != build_id:
+                    continue
             mylist.append(x)
 
     elif operator == "=*":  # glob match
@@ -2613,8 +3117,12 @@ def match_from_list(mydep, candidate_list):
 
     elif operator == "~":  # version, any revision, match
         for x in candidate_list:
-            xs = getattr(x, "cpv_split", None)
-            if xs is None:
+            if isinstance(x, _pkg_str):
+                xs = x.cpv_split
+            elif hasattr(x, "cpv"):
+                # Package object
+                xs = x.cpv.cpv_split
+            else:
                 xs = catpkgsplit(remove_slot(x))
             if xs is None:
                 raise InvalidData(x)
@@ -2642,6 +3150,8 @@ def match_from_list(mydep, candidate_list):
             try:
                 result = vercmp(pkg.version, mydep.version)
             except ValueError:  # pkgcmp may return ValueError during int() conversion
+                from portage.util import writemsg
+
                 writemsg(_("\nInvalid package name: %s\n") % x, noiselevel=-1)
                 raise
             if result is None:
@@ -2695,7 +3205,12 @@ def match_from_list(mydep, candidate_list):
         candidate_list = mylist
         mylist = []
         for x in candidate_list:
-            use = getattr(x, "use", None)
+            # Only package objects have 'use' and 'iuse' attributes
+            if not hasattr(x, "use"):
+                mylist.append(x)
+                continue
+
+            use = x.use
             if use is not None:
                 if mydep.unevaluated_atom.use and not x.iuse.is_valid_flag(
                     mydep.unevaluated_atom.use.required
@@ -2737,8 +3252,12 @@ def match_from_list(mydep, candidate_list):
         candidate_list = mylist
         mylist = []
         for x in candidate_list:
-            repo = getattr(x, "repo", False)
-            if repo is False:
+            if isinstance(x, Atom):
+                repo = x.repo
+            elif hasattr(x, "repo"):
+                # Package object
+                repo = x.repo
+            else:
                 repo = dep_getrepo(x)
             if repo is not None and repo != _unknown_repo and repo != mydep.repo:
                 continue
@@ -2779,10 +3298,8 @@ def get_required_use_flags(required_use, eapi=None):
     used_flags = set()
 
     def register_token(token):
-        if token.endswith("?"):
-            token = token[:-1]
-        if token.startswith("!"):
-            token = token[1:]
+        token = token.removesuffix("?")
+        token = token.removeprefix("!")
         used_flags.add(token)
 
     for token in mysplit:

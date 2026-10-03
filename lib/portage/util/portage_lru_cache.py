@@ -2,6 +2,7 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import os
+
 import portage
 
 
@@ -13,6 +14,7 @@ def show_lru_cache_info():
         portage.dep._use_reduce_cached: "use_reduce_cached",
         portage.eapi._get_eapi_attrs: "get_eapi_attrs",
         portage.process._encoded_length: "encoded_length",
+        portage.util.split_interned: "split_interned",
         portage.versions.catpkgsplit: "catpkgsplit",
         portage.versions.vercmp: "vercmp",
     }

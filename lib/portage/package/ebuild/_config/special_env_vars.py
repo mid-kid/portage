@@ -52,8 +52,10 @@ env_blacklist = frozenset(
         "PORTAGE_BUILDDIR_LOCKED",
         "PORTAGE_BUILT_USE",
         "PORTAGE_CONFIGROOT",
+        "PORTAGE_EBUILD_EXIT_FD",
         "PORTAGE_EXPLICIT_INHERIT",
         "PORTAGE_INTERNAL_CALLER",
+        "PORTAGE_IPC_ALIVE_FD",
         "PORTAGE_IUSE",
         "PORTAGE_NONFATAL",
         "PORTAGE_PIPE_FD",
@@ -151,6 +153,7 @@ environ_whitelist = frozenset(
         "PORTAGE_DOHTML_UNWARNED_SKIPPED_EXTENSIONS",
         "PORTAGE_DOHTML_UNWARNED_SKIPPED_FILES",
         "PORTAGE_DOHTML_WARN_ON_SKIPPED_FILES",
+        "PORTAGE_EBUILD_EXIT_FD",
         "PORTAGE_EBUILD_EXIT_FILE",
         "PORTAGE_FEATURES",
         "PORTAGE_GID",
@@ -158,6 +161,7 @@ environ_whitelist = frozenset(
         "PORTAGE_INTERNAL_CALLER",
         "PORTAGE_INST_GID",
         "PORTAGE_INST_UID",
+        "PORTAGE_IPC_ALIVE_FD",
         "PORTAGE_IPC_DAEMON",
         "PORTAGE_IUSE",
         "PORTAGE_ECLASS_LOCATIONS",
@@ -198,6 +202,7 @@ environ_whitelist = frozenset(
         "TMPDIR",
         "USE_EXPAND",
         "USE_ORDER",
+        "USERLAND",
         "WORKDIR",
         "XARGS",
         "__PORTAGE_TEST_HARDLINK_LOCKS",
@@ -247,7 +252,7 @@ environ_whitelist = frozenset(
     )
 )
 
-environ_whitelist_re = re.compile(r"^(CCACHE_|DISTCC_).*")
+environ_whitelist_re = re.compile(r"^(CCACHE_|DISTCC_|QEMU_).*")
 
 # Filter selected variables in the config.environ() method so that
 # they don't needlessly propagate down into the ebuild environment.
@@ -265,6 +270,7 @@ environ_filter = frozenset(
         # misc variables inherited from the calling environment
         "INFOPATH",
         "MANPATH",
+        "PYTHONUTF8",
         "USER",
         # variables that break bash
         "GLOBSORT",
@@ -286,6 +292,7 @@ environ_filter = frozenset(
         "EMERGE_DEFAULT_OPTS",
         "EMERGE_LOG_DIR",
         "EMERGE_WARNING_DELAY",
+        "FETCH_WRAPPER",
         "FETCHCOMMAND",
         "FETCHCOMMAND_FTP",
         "FETCHCOMMAND_HTTP",

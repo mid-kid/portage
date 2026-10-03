@@ -1,12 +1,12 @@
 """WebRsync module for portage"""
 
 import logging
+import os
 
 import portage
-from portage import os
-from portage.util import writemsg_level
 from portage.output import create_color_func
 from portage.sync.syncbase import SyncBase
+from portage.util import writemsg_level
 
 good = create_color_func("GOOD")
 bad = create_color_func("BAD")

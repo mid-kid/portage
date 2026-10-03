@@ -2,12 +2,13 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import difflib
+import os
 import re
+
 import portage
-from portage import os
-from portage.dbapi.porttree import _parse_uri_map
 from portage.dbapi.IndexedPortdb import IndexedPortdb
 from portage.dbapi.IndexedVardb import IndexedVardb
+from portage.dbapi.porttree import _parse_uri_map
 from portage.exception import InvalidBinaryPackageFormat
 from portage.localization import localized_size
 from portage.output import bold, darkgreen, green, red
@@ -30,7 +31,6 @@ class search:
     def __init__(
         self,
         root_config,
-        spinner,
         searchdesc,
         verbose,
         usepkg,
@@ -48,9 +48,6 @@ class search:
         self.searchdesc = searchdesc
         self.searchkey = None
         self._results_specified = False
-        # Disable the spinner since search results are displayed
-        # incrementally.
-        self.spinner = None
         self.root_config = root_config
         self.setconfig = root_config.setconfig
         self.regex_auto = regex_auto
@@ -77,10 +74,6 @@ class search:
         self._dbs.append(vardb)
         self._portdb = portdb
         self._vardb = vardb
-
-    def _spinner_update(self):
-        if self.spinner:
-            self.spinner.update()
 
     def _cp_all(self):
         iterators = []
@@ -275,16 +268,16 @@ class search:
             and re.search(r"[\^\$\*\[\]\{\}\|\?]|\.\+", self.searchkey) is not None
         ):
             try:
-                re.compile(self.searchkey, re.I)
+                re.compile(self.searchkey, re.IGNORECASE)
             except Exception:
                 pass
             else:
                 regexsearch = True
 
         if regexsearch:
-            self.searchre = re.compile(self.searchkey, re.I)
+            self.searchre = re.compile(self.searchkey, re.IGNORECASE)
         else:
-            self.searchre = re.compile(re.escape(self.searchkey), re.I)
+            self.searchre = re.compile(re.escape(self.searchkey), re.IGNORECASE)
 
             # Fuzzy search does not support regular expressions, therefore
             # it is disabled for regular expression searches.
@@ -324,16 +317,16 @@ class search:
                     )
 
         for package in self._cp_all():
-            self._spinner_update()
-
             if match_category:
                 match_string = package[:]
             else:
                 match_string = package.split("/")[-1]
 
-            if self.searchre.search(match_string):
-                yield ("pkg", package)
-            elif fuzzy and fuzzy_search(match_string):
+            if (
+                self.searchre.search(match_string)
+                or fuzzy
+                and fuzzy_search(match_string)
+            ):
                 yield ("pkg", package)
             elif self.searchdesc:  # DESCRIPTION searching
                 # Use _first_cp to avoid an expensive visibility check,
@@ -354,7 +347,6 @@ class search:
 
         self.sdict = self.setconfig.getSets()
         for setname in self.sdict:
-            self._spinner_update()
             if match_category:
                 match_string = setname
             else:

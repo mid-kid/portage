@@ -8,15 +8,17 @@ import portage
 
 portage._internal_caller = True
 portage._sync_mode = True
-from portage.output import bold, red, create_color_func
-from portage._global_updates import _global_updates
-from portage.sync.controller import SyncManager
-from portage.util.digraph import digraph
-from portage.util.futures import asyncio
-from portage.util._async.AsyncScheduler import AsyncScheduler
-
 import _emerge
 from _emerge.emergelog import emergelog
+
+from portage._global_updates import _global_updates
+from portage.binrepo.config import BinRepoConfigLoader
+from portage.const import BINREPOS_CONF_FILE, PORTAGE_BASE_PATH
+from portage.output import bold, create_color_func, red
+from portage.sync.controller import SyncManager
+from portage.util._async.AsyncScheduler import AsyncScheduler
+from portage.util.digraph import digraph
+from portage.util.futures import asyncio
 
 warn = create_color_func("WARN")
 
@@ -37,8 +39,8 @@ class SyncRepos:
         @param emerge_config: optional an emerge_config instance to use
         @param emerge_logging: boolean, defaults to False
         """
-        from _emerge.main import parse_opts
         from _emerge.actions import load_emerge_config
+        from _emerge.main import parse_opts
 
         if emerge_config is None:
             # need a basic options instance
@@ -126,10 +128,9 @@ class SyncRepos:
         """
         selected = []
         for repo in available:
-            if repo.name in repos:
-                selected.append(repo)
-            elif repo.aliases is not None and any(
-                alias in repos for alias in repo.aliases
+            if (repo.name in repos) or (
+                repo.aliases is not None
+                and any(alias in repos for alias in repo.aliases)
             ):
                 selected.append(repo)
         return selected
@@ -267,97 +268,149 @@ class SyncRepos:
 
     def _do_pkg_moves(self):
         configs = [self.emerge_config.target_config]
-        if (
-            self.emerge_config.target_config.root
-            != self.emerge_config.running_config.root
-        ):
-            configs.append(self.emerge_config.running_config)
+        target_config = self.emerge_config.target_config
+        running_config = self.emerge_config.running_config
+        package_moves = self.emerge_config.opts.get("--package-moves") != "n"
+        quiet = "--quiet" in self.emerge_config.opts
+        if not package_moves:
+            return
+
+        if target_config.root != running_config.root:
+            configs.append(running_config)
+
         for root_config in configs:
-            if self.emerge_config.opts.get(
-                "--package-moves"
-            ) != "n" and _global_updates(
+            if _global_updates(
                 root_config.root,
                 self.emerge_config.trees,
                 root_config.mtimedb["updates"],
-                quiet=("--quiet" in self.emerge_config.opts),
+                quiet=quiet,
             ):
                 root_config.mtimedb.commit()
                 # Reload the whole config.
                 self._reload_config()
 
     def _check_updates(self):
+        """
+        After syncing, notify the user if any important packages
+        have updates available that should be installed first before
+        anything else.
+
+        Portage always includes itself in this list to check.
+        """
         from _emerge.chk_updated_cfg_files import chk_updated_cfg_files
 
-        mybestpv = self.emerge_config.target_config.trees["porttree"].dbapi.xmatch(
-            "bestmatch-visible", portage.const.PORTAGE_PACKAGE_ATOM
-        )
-        mypvs = portage.best(
-            self.emerge_config.target_config.trees["vartree"].dbapi.match(
-                portage.const.PORTAGE_PACKAGE_ATOM
-            )
-        )
-        try:
-            old_use = (
-                self.emerge_config.target_config.trees["vartree"]
-                .dbapi.aux_get(mypvs, ["USE"])[0]
-                .split()
-            )
-        except KeyError:
-            old_use = ()
+        target_config = self.emerge_config.target_config
 
         chk_updated_cfg_files(
-            self.emerge_config.target_config.root,
-            self.emerge_config.target_config.settings.get("CONFIG_PROTECT", "").split(),
+            target_config.root,
+            target_config.settings.get("CONFIG_PROTECT", "").split(),
         )
 
         msgs = []
-        if (
-            not (mybestpv and mypvs)
-            or mybestpv == mypvs
-            or "--quiet" in self.emerge_config.opts
-        ):
+        if "--quiet" in self.emerge_config.opts:
             return msgs
 
-        # Suggest to update to the latest available version of portage.
-        # Since changes to PYTHON_TARGETS cause complications, this message
-        # is suppressed if the new version has different PYTHON_TARGETS enabled
-        # than previous version.
-        portdb = self.emerge_config.target_config.trees["porttree"].dbapi
-        portdb.doebuild_settings.setcpv(mybestpv, mydb=portdb)
-        usemask = portdb.doebuild_settings.usemask
-        useforce = portdb.doebuild_settings.useforce
-        new_use = (
-            frozenset(portdb.doebuild_settings["PORTAGE_USE"].split()) | useforce
-        ) - usemask
-        new_python_targets = frozenset(
-            x for x in new_use if x.startswith("python_targets_")
-        )
-        old_python_targets = frozenset(
-            x for x in old_use if x.startswith("python_targets_")
-        )
+        early_update_packages = {
+            portage.const.PORTAGE_PACKAGE_ATOM: "Portage",
+        }
 
-        if new_python_targets == old_python_targets:
-            msgs.append("")
-            msgs.append(
-                warn(" * ")
-                + bold("An update to portage is available.")
-                + " It is _highly_ recommended"
+        # A special OpenPGP key package can be defined in either
+        # repos.conf (sync-openpgp-key-package) or in
+        # binrepos.conf (openpgp-key-package)
+        repos = target_config.settings.repositories
+        for repo in repos:
+            try:
+                key_package = repo.sync_openpgp_key_package
+                if not key_package:
+                    continue
+                early_update_packages[key_package] = f"OpenPGP keys ({repo.name})"
+            except AttributeError:
+                continue
+        binrepos_config_paths = []
+        if portage._not_installed:
+            binrepos_config_paths.append(
+                os.path.join(PORTAGE_BASE_PATH, "cnf", "binrepos.conf")
             )
-            msgs.append(
-                warn(" * ")
-                + "that you update portage now, before any other packages are updated."
+        else:
+            binrepos_config_paths.append(
+                os.path.join(target_config.settings.global_config_path, "binrepos.conf")
             )
-            msgs.append("")
-            msgs.append(
-                warn(" * ")
-                + "To update portage, run 'emerge --oneshot sys-apps/portage' now."
+        binrepos_config_paths.append(
+            os.path.join(
+                target_config.settings["PORTAGE_CONFIGROOT"], BINREPOS_CONF_FILE
             )
-            msgs.append("")
+        )
+        binrepos_conf = BinRepoConfigLoader(
+            binrepos_config_paths, target_config.settings
+        )
+        if binrepos_conf:
+            for repo in binrepos_conf.values():
+                try:
+                    key_package = repo.openpgp_key_package
+                    if not key_package:
+                        continue
+                    early_update_packages[key_package] = (
+                        f"OpenPGP binhost keys ({repo.name})"
+                    )
+                except AttributeError:
+                    continue
+
+        porttree = target_config.trees["porttree"]
+        vartree = target_config.trees["vartree"]
+
+        for early_pkg, early_name in early_update_packages.items():
+            best_pv = porttree.dbapi.xmatch("bestmatch-visible", early_pkg)
+            installed_pv = portage.best(vartree.dbapi.match(early_pkg))
+
+            try:
+                old_use = vartree.dbapi.aux_get(installed_pv, ["USE"])[0].split()
+            except KeyError:
+                old_use = ()
+
+            if not (best_pv and installed_pv) or best_pv == installed_pv:
+                continue
+
+            # Suggest to update to the latest available version of portage.
+            # Since changes to PYTHON_TARGETS cause complications, this message
+            # is suppressed if the new version has different PYTHON_TARGETS enabled
+            # than previous version.
+            portdb = porttree.dbapi
+            portdb.doebuild_settings.setcpv(best_pv, mydb=portdb)
+            usemask = portdb.doebuild_settings.usemask
+            useforce = portdb.doebuild_settings.useforce
+            new_use = (
+                frozenset(portdb.doebuild_settings["PORTAGE_USE"].split()) | useforce
+            ) - usemask
+            new_python_targets = frozenset(
+                x for x in new_use if x.startswith("python_targets_")
+            )
+            old_python_targets = frozenset(
+                x for x in old_use if x.startswith("python_targets_")
+            )
+
+            if new_python_targets == old_python_targets:
+                msgs.append("")
+                msgs.append(
+                    warn(" * ")
+                    + bold(f"An update to {early_name} is available.")
+                    + " It is _highly_ recommended"
+                )
+                msgs.append(
+                    warn(" * ")
+                    + f"that you update {early_name} now, before any other packages are updated."
+                )
+                msgs.append("")
+                msgs.append(
+                    warn(" * ")
+                    + f"To update {early_name}, run 'emerge --oneshot {early_pkg}' now."
+                )
+                msgs.append("")
+
         return msgs
 
     def _reload_config(self):
         """Reload the whole config from scratch."""
-        from _emerge.actions import load_emerge_config, adjust_configs
+        from _emerge.actions import adjust_configs, load_emerge_config
 
         load_emerge_config(emerge_config=self.emerge_config)
         adjust_configs(self.emerge_config.opts, self.emerge_config.trees)

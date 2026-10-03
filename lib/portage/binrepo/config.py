@@ -1,22 +1,28 @@
-# Copyright 2020-2024 Gentoo Authors
+# Copyright 2020-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 from collections import OrderedDict
 from collections.abc import Mapping
 from hashlib import md5
 
+from portage._sets.base import WildcardPackageSet
 from portage.localization import _
+from portage.package.ebuild.fetch import _hide_url_passwd
+from portage.repository.config import _find_bad_atoms
 from portage.util import _recursive_file_list, writemsg
-from portage.util.configparser import SafeConfigParser, ConfigParserError, read_configs
+from portage.util.configparser import ConfigParserError, SafeConfigParser, read_configs
 
 
 class BinRepoConfig:
     __slots__ = (
+        "fetchcommand",
         "frozen",
+        "getbinpkg_exclude",
+        "getbinpkg_include",
+        "location",
         "name",
         "name_fallback",
-        "fetchcommand",
-        "location",
+        "openpgp_key_package",
         "priority",
         "resumecommand",
         "sync_uri",
@@ -34,6 +40,41 @@ class BinRepoConfig:
             if isinstance(getattr(self, k, None), str):
                 setattr(self, k, getattr(self, k).lower() in ("true", "yes"))
 
+        # getbinpkg-exclude and getbinpkg-include validation
+        for opt in ("getbinpkg-exclude", "getbinpkg-include"):
+            attr = opt.replace("-", "_")
+            if self.name == "DEFAULT":
+                setattr(self, attr, None)
+                continue
+            getbinpkg_atoms = opts.get(opt, "").split()
+            bad_atoms = _find_bad_atoms(getbinpkg_atoms)
+            if bad_atoms:
+                writemsg(
+                    "\n!!! The following atoms are invalid in %s attribute for "
+                    "binrepo [%s] (only package names and slot atoms allowed):\n"
+                    "\n    %s\n" % (opt, self.name, "\n    ".join(bad_atoms))
+                )
+                for a in bad_atoms:
+                    getbinpkg_atoms.remove(a)
+            getbinpkg_set = WildcardPackageSet(getbinpkg_atoms, allow_repo=True)
+            setattr(self, attr, getbinpkg_set)
+        conflicted_atoms = (
+            self.getbinpkg_exclude
+            and self.getbinpkg_exclude.getAtoms().intersection(
+                self.getbinpkg_include.getAtoms()
+            )
+        )
+        if conflicted_atoms:
+            writemsg(
+                "\n!!! The following atoms appear in both the getbinpkg-exclude "
+                "getbinpkg-include lists for binrepo [%s]:\n"
+                "\n    %s\n"
+                % (self.name, "\n    ".join(str(a) for a in conflicted_atoms))
+            )
+            for a in conflicted_atoms:
+                self.getbinpkg_exclude.remove(a)
+                self.getbinpkg_include.remove(a)
+
     def info_string(self):
         """
         Returns a formatted string containing information about the repository.
@@ -46,7 +87,7 @@ class BinRepoConfig:
             repo_msg.append(indent + "location: " + self.location)
         if self.priority is not None:
             repo_msg.append(indent + "priority: " + str(self.priority))
-        repo_msg.append(indent + "sync-uri: " + self.sync_uri)
+        repo_msg.append(indent + "sync-uri: " + _hide_url_passwd(self.sync_uri))
         repo_msg.append(indent + f"verify-signature: {self.verify_signature}")
         if self.frozen:
             repo_msg.append(f"{indent}frozen: {str(self.frozen).lower()}")
@@ -101,6 +142,7 @@ class BinRepoConfigLoader(Mapping):
 
         sync_uris = set(sync_uris)
         current_priority = 0
+        # Convert PORTAGE_BINHOST entries into implicit binrepos.conf ones
         for sync_uri in reversed(settings.get("PORTAGE_BINHOST", "").split()):
             sync_uri = self._normalize_uri(sync_uri)
             if sync_uri not in sync_uris:

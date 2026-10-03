@@ -1,11 +1,10 @@
-# Copyright 2010-2012 Gentoo Foundation
+# Copyright 2010-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = ["digestcheck"]
 
-import warnings
+import os
 
-from portage import os, _encodings, _unicode_decode
 from portage.checksum import _hash_filter
 from portage.exception import DigestException, FileNotFound
 from portage.localization import _
@@ -13,22 +12,12 @@ from portage.output import EOutput
 from portage.util import writemsg
 
 
-def digestcheck(myfiles, mysettings, strict=False, justmanifest=None, mf=None):
+def digestcheck(myfiles, mysettings, strict=False, mf=None):
     """
     Verifies checksums. Assumes all files have been downloaded.
     @rtype: int
     @return: 1 on success and 0 on failure
     """
-
-    if justmanifest is not None:
-        warnings.warn(
-            "The justmanifest parameter of the "
-            + "portage.package.ebuild.digestcheck.digestcheck()"
-            + " function is now unused.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        justmanifest = None
 
     if mysettings.get("EBUILD_SKIP_MANIFEST") == "1":
         return 1
@@ -108,14 +97,14 @@ def digestcheck(myfiles, mysettings, strict=False, justmanifest=None, mf=None):
 
     for parent, dirs, files in os.walk(filesdir):
         try:
-            parent = _unicode_decode(parent, encoding=_encodings["fs"], errors="strict")
+            if isinstance(parent, bytes):
+                parent = parent.decode("utf-8", "strict")
         except UnicodeDecodeError:
-            parent = _unicode_decode(
-                parent, encoding=_encodings["fs"], errors="replace"
-            )
+            if isinstance(parent, bytes):
+                parent = parent.decode("utf-8", "replace")
             writemsg(
                 _("!!! Path contains invalid " "character(s) for encoding '%s': '%s'")
-                % (_encodings["fs"], parent),
+                % ("utf-8", parent),
                 noiselevel=-1,
             )
             if strict:
@@ -124,15 +113,17 @@ def digestcheck(myfiles, mysettings, strict=False, justmanifest=None, mf=None):
         for d in dirs:
             d_bytes = d
             try:
-                d = _unicode_decode(d, encoding=_encodings["fs"], errors="strict")
+                if isinstance(d, bytes):
+                    d = d.decode("utf-8", "strict")
             except UnicodeDecodeError:
-                d = _unicode_decode(d, encoding=_encodings["fs"], errors="replace")
+                if isinstance(d, bytes):
+                    d = d.decode("utf-8", "replace")
                 writemsg(
                     _(
                         "!!! Path contains invalid "
                         "character(s) for encoding '%s': '%s'"
                     )
-                    % (_encodings["fs"], os.path.join(parent, d)),
+                    % ("utf-8", os.path.join(parent, d)),
                     noiselevel=-1,
                 )
                 if strict:
@@ -143,9 +134,11 @@ def digestcheck(myfiles, mysettings, strict=False, justmanifest=None, mf=None):
                 dirs.remove(d_bytes)
         for f in files:
             try:
-                f = _unicode_decode(f, encoding=_encodings["fs"], errors="strict")
+                if isinstance(f, bytes):
+                    f = f.decode("utf-8", "strict")
             except UnicodeDecodeError:
-                f = _unicode_decode(f, encoding=_encodings["fs"], errors="replace")
+                if isinstance(f, bytes):
+                    f = f.decode("utf-8", "replace")
                 if f.startswith("."):
                     continue
                 f = os.path.join(parent, f)[len(filesdir) + 1 :]
@@ -154,7 +147,7 @@ def digestcheck(myfiles, mysettings, strict=False, justmanifest=None, mf=None):
                         "!!! File name contains invalid "
                         "character(s) for encoding '%s': '%s'"
                     )
-                    % (_encodings["fs"], f),
+                    % ("utf-8", f),
                     noiselevel=-1,
                 )
                 if strict:

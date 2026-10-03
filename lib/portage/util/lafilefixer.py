@@ -1,10 +1,9 @@
 # Copyright 2010-2017 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
-import os as _os
+import os
 import re
 
-from portage import _unicode_decode
 from portage.exception import InvalidData
 
 #########################################################
@@ -112,7 +111,7 @@ def rewrite_lafile(contents):
             # Two cases:
             # 1) /usr/lib64/libfoo.la, turn it into -lfoo and append -L/usr/lib64 to libladir
             # 2) libfoo.la, keep it
-            dirname, basename = _os.path.split(dep_libs_entry)
+            dirname, basename = os.path.split(dep_libs_entry)
 
             if not dirname or not basename.startswith(b"lib"):
                 if dep_libs_entry not in new_dep_libs:
@@ -157,7 +156,11 @@ def rewrite_lafile(contents):
         else:
             raise InvalidData(
                 "Error: Unexpected entry '%s' in 'dependency_libs'"
-                % _unicode_decode(dep_libs_entry)
+                % (
+                    dep_libs_entry.decode("utf-8", "replace")
+                    if isinstance(dep_libs_entry, bytes)
+                    else dep_libs_entry
+                )
             )
 
     # What should 'dependency_libs' and 'inherited_linker_flags' look like?

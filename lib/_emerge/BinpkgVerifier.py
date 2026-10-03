@@ -3,27 +3,36 @@
 
 import errno
 import io
+import os
 import sys
 
-from _emerge.CompositeTask import CompositeTask
 import portage
-from portage import os
 from portage.checksum import (
     _apply_hash_filter,
     _filter_unaccelarated_hashes,
     _hash_filter,
 )
 from portage.output import EOutput
-from portage.util._async.FileDigester import FileDigester
 from portage.package.ebuild.fetch import _checksum_failure_temp_file
+from portage.util._async.FileDigester import FileDigester
+
+from _emerge.CompositeTask import CompositeTask
 
 
 class BinpkgVerifier(CompositeTask):
-    __slots__ = ("logfile", "pkg", "_digests", "_pkg_path")
+    __slots__ = ("_digests", "_pkg_path", "logfile", "pkg")
 
     def _start(self):
         bintree = self.pkg.root_config.trees["bintree"]
         digests = bintree._get_digests(self.pkg)
+
+        if self.pkg.remote and not ("size" in digests and digests.keys() - {"size"}):
+            # An entry without both a SIZE and a digest leaves the checks
+            # below with nothing to compare against, and they silently
+            # pass. Refuse the package instead of merging it unchecked.
+            self._missing_digests_exception()
+            return
+
         if "size" not in digests:
             self.returncode = os.EX_OK
             self._async_wait()
@@ -111,8 +120,7 @@ class BinpkgVerifier(CompositeTask):
                 portage.output.havecolor = not self.background
 
             path = self._pkg_path
-            if path.endswith(".partial"):
-                path = path[: -len(".partial")]
+            path = path.removesuffix(".partial")
             eout = EOutput()
             eout.ebegin(
                 f"{os.path.basename(path)} {' '.join(sorted(self._digests))} ;-)"
@@ -127,6 +135,18 @@ class BinpkgVerifier(CompositeTask):
         self.scheduler.output(
             out.getvalue(), log_path=self.logfile, background=self.background
         )
+
+    def _missing_digests_exception(self):
+        self.scheduler.output(
+            "\n!!! Digest verification failed:\n"
+            f"!!! {self._pkg_path}\n"
+            "!!! Reason: binhost's Packages index lacks size and checksum\n"
+            "!!! for this package\n",
+            log_path=self.logfile,
+            background=self.background,
+        )
+        self.returncode = 1
+        self._async_wait()
 
     def _digest_exception(self, name, value, expected):
         head, tail = os.path.split(self._pkg_path)

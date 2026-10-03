@@ -5,14 +5,12 @@ import copy
 import functools
 import io
 import multiprocessing
+import os
 import signal
 import sys
+import time
 
 import portage
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
-from portage import _unicode_decode
 from portage.checksum import _hash_filter
 from portage.elog.messages import eerror
 from portage.package.ebuild.fetch import (
@@ -25,20 +23,21 @@ from portage.util._async.AsyncTaskFuture import AsyncTaskFuture
 from portage.util._async.ForkProcess import ForkProcess
 from portage.util._pty import _create_pty_or_pipe
 from portage.util.futures import asyncio
+
 from _emerge.CompositeTask import CompositeTask
 
 
 class EbuildFetcher(CompositeTask):
     __slots__ = (
+        "_fetcher_proc",
         "config_pool",
         "ebuild_path",
-        "fetchonly",
         "fetchall",
+        "fetchonly",
         "logfile",
         "pkg",
-        "prefetch",
         "pre_exec",
-        "_fetcher_proc",
+        "prefetch",
     )
 
     def __init__(self, **kwargs):
@@ -104,17 +103,17 @@ class EbuildFetcher(CompositeTask):
 
 class _EbuildFetcherProcess(ForkProcess):
     __slots__ = (
-        "config_pool",
-        "ebuild_path",
-        "fetchonly",
-        "fetchall",
-        "pkg",
-        "prefetch",
-        "src_uri",
         "_digests",
         "_manifest",
         "_settings",
         "_uri_map",
+        "config_pool",
+        "ebuild_path",
+        "fetchall",
+        "fetchonly",
+        "pkg",
+        "prefetch",
+        "src_uri",
     )
 
     def async_already_fetched(self, settings):
@@ -272,7 +271,7 @@ class _EbuildFetcherProcess(ForkProcess):
         if pre_exec is not None:
             pre_exec()
 
-        if sys.version_info >= (3, 14):
+        if multiprocessing.get_start_method() == "forkserver":
             # Since we typically drop privileges for userfetch here,
             # a forkserver shared with the parent would open privilege
             # escalation issues that are better to avoid, therefore
@@ -316,12 +315,13 @@ class _EbuildFetcherProcess(ForkProcess):
                 for proc in multiprocessing.active_children():
                     proc.terminate()
 
-                # Use a non-zero timeout only for the first join because
-                # later joins are delayed by the first join.
-                timeout = 0.25
+                # exec closes the child's end of the sentinel pipe, so
+                # join(timeout) falls through to a blocking waitpid().
+                # Poll instead.
+                deadline = time.monotonic() + 0.25
                 for proc in multiprocessing.active_children():
-                    proc.join(timeout)
-                    timeout = 0
+                    while proc.is_alive() and time.monotonic() < deadline:
+                        time.sleep(0.01)
 
                 for proc in multiprocessing.active_children():
                     proc.kill()
@@ -418,19 +418,13 @@ class _EbuildFetcherProcess(ForkProcess):
         # output here.
         if self.logfile is not None:
             f = open(
-                _unicode_encode(
-                    self.logfile, encoding=_encodings["fs"], errors="strict"
-                ),
+                self.logfile,
                 mode="a",
-                encoding=_encodings["content"],
+                encoding="utf-8",
                 errors="backslashreplace",
             )
             for filename in uri_map:
-                f.write(
-                    _unicode_decode(
-                        f" * {filename} size ;-) ...".ljust(73) + "[ ok ]\n"
-                    )
-                )
+                f.write(f" * {filename} size ;-) ...".ljust(73) + "[ ok ]\n")
             f.close()
 
         return True
@@ -445,10 +439,8 @@ class _EbuildFetcherProcess(ForkProcess):
         stdout_pipe = None
         if not self.background:
             stdout_pipe = fd_pipes.get(1)
-        self._pty_ready, master_fd, slave_fd = _create_pty_or_pipe(
-            copy_term_size=stdout_pipe
-        )
-        return (master_fd, slave_fd)
+        master_fd, slave_fd = _create_pty_or_pipe(copy_term_size=stdout_pipe)
+        return master_fd, slave_fd
 
     def _eerror(self, lines):
         out = io.StringIO()

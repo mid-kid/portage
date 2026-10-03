@@ -1,15 +1,16 @@
 # Copyright 2010-2011 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 import re
-import portage
-from portage import os
-from portage.const import PORTAGE_PYM_PATH
-from portage.tests import TestCase
-from portage.util._eventloop.global_event_loop import global_event_loop
 
 from _emerge.PipeReader import PipeReader
 from _emerge.SpawnProcess import SpawnProcess
+
+import portage
+from portage.const import PORTAGE_PYM_PATH
+from portage.tests import TestCase
+from portage.util._eventloop.global_event_loop import global_event_loop
 
 
 class LazyImportPortageBaselineTestCase(TestCase):

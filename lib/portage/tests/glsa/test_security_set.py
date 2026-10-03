@@ -1,16 +1,15 @@
 # Copyright 2013-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 
 import portage
-from portage import os, _encodings
+from portage.glsa import GlsaFormatException
 from portage.tests import TestCase
 from portage.tests.resolver.ResolverPlayground import (
     ResolverPlayground,
     ResolverPlaygroundTestCase,
 )
-
-from portage.glsa import GlsaFormatException
 
 
 class SecuritySetTestCase(TestCase):
@@ -69,7 +68,7 @@ class SecuritySetTestCase(TestCase):
     def write_glsa_test_case(self, glsa_dir, glsa):
         with open(
             os.path.join(glsa_dir, "glsa-" + glsa["glsa_id"] + ".xml"),
-            encoding=_encodings["repo.content"],
+            encoding="utf-8",
             mode="w",
         ) as f:
             f.write(self.glsa_template % glsa)

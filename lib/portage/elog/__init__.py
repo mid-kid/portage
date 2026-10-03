@@ -2,14 +2,14 @@
 # Copyright 2006-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 
 from portage.const import EBUILD_PHASES
-from portage.exception import AlarmSignal, PortageException
-from portage.process import atexit_register
-from portage.elog.messages import collect_ebuild_messages, collect_messages
 from portage.elog.filtering import filter_loglevels
+from portage.elog.messages import collect_ebuild_messages, collect_messages
+from portage.exception import AlarmSignal, PortageException
 from portage.localization import _
-from portage import os
+from portage.process import atexit_register
 
 
 def _merge_logentries(a, b):
@@ -30,7 +30,7 @@ def _combine_logentries(logentries):
     # generate a single string with all log messages
     rValue = []
     for phase in EBUILD_PHASES:
-        if not phase in logentries:
+        if phase not in logentries:
             continue
         previous_type = None
         for msgtype, msgcontent in logentries[phase]:
@@ -136,7 +136,7 @@ def elog_process(cpv, mysettings, phasefilter=None):
 
         # in case the filters matched all messages and no module overrides exist
         if len(default_logentries) == 0 and (
-            not ":" in mysettings.get("PORTAGE_ELOG_SYSTEM", "")
+            ":" not in mysettings.get("PORTAGE_ELOG_SYSTEM", "")
         ):
             continue
 
@@ -168,7 +168,7 @@ def elog_process(cpv, mysettings, phasefilter=None):
                     m.process(mysettings, str(key), mod_logentries, mod_fulllog)
                 finally:
                     AlarmSignal.unregister()
-                if hasattr(m, "finalize") and not m.finalize in _elog_atexit_handlers:
+                if hasattr(m, "finalize") and m.finalize not in _elog_atexit_handlers:
                     _elog_atexit_handlers.append(m.finalize)
                     atexit_register(m.finalize)
             except (ImportError, AttributeError) as e:
@@ -179,8 +179,8 @@ def elog_process(cpv, mysettings, phasefilter=None):
                     )
                     % str(s)
                 )
-                writemsg(f"{str(e)}\n", noiselevel=-1)
+                writemsg(f"{e!s}\n", noiselevel=-1)
             except AlarmSignal:
                 writemsg(f"Timeout in elog_process for system '{s}'\n", noiselevel=-1)
             except PortageException as e:
-                writemsg(f"{str(e)}\n", noiselevel=-1)
+                writemsg(f"{e!s}\n", noiselevel=-1)

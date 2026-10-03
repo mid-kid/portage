@@ -2,16 +2,17 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import multiprocessing
+import os
 
-import portage
-from portage import os
-from portage.tests import TestCase
-from portage.tests.resolver.ResolverPlayground import ResolverPlayground
-from portage.package.ebuild._ipc.QueryCommand import QueryCommand
-from portage.util._async.ForkProcess import ForkProcess
-from portage.util._async.TaskScheduler import TaskScheduler
 from _emerge.Package import Package
 from _emerge.PipeReader import PipeReader
+
+import portage
+from portage.package.ebuild._ipc.QueryCommand import QueryCommand
+from portage.tests import TestCase
+from portage.tests.resolver.ResolverPlayground import ResolverPlayground
+from portage.util._async.ForkProcess import ForkProcess
+from portage.util._async.TaskScheduler import TaskScheduler
 
 
 class DoebuildFdPipesTestCase(TestCase):
@@ -177,7 +178,7 @@ class DoebuildFdPipesTestCase(TestCase):
                     pw.close()
 
                 task_scheduler.wait()
-                output = portage._unicode_decode(consumer.getvalue()).rstrip("\n")
+                output = consumer.getvalue().decode("utf-8", "replace").rstrip("\n")
 
                 if task_scheduler.returncode != os.EX_OK:
                     portage.writemsg(output, noiselevel=-1)
@@ -195,7 +196,14 @@ class DoebuildFdPipesTestCase(TestCase):
     @staticmethod
     def _doebuild(db, pw, *args, **kwargs):
         QueryCommand._db = db
-        kwargs["fd_pipes"] = {
+        fd_pipes = {
             DoebuildFdPipesTestCase.output_fd: pw.fileno(),
         }
-        return portage.doebuild(*args, **kwargs)
+        kwargs["fd_pipes"] = fd_pipes
+        rval = portage.doebuild(*args, **kwargs)
+        # doebuild runs every phase with the same fd_pipes, so a phase
+        # must not leave its own fds in it.
+        if list(fd_pipes) != [DoebuildFdPipesTestCase.output_fd]:
+            portage.writemsg(f"fd_pipes modified: {fd_pipes}\n", noiselevel=-1)
+            return 1
+        return rval

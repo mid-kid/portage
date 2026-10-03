@@ -17,7 +17,8 @@ portage_readonly_metadata=(
 portage_readonly_vars=(
 	D EBUILD_PHASE_FUNC EBUILD_SH_ARGS EBUILD_PHASE EMERGE_FROM EBUILD
 	EROOT ED FILESDIR MERGE_TYPE PORTAGE_EBUILD_EXTRA_SOURCE
-	PORTAGE_EBUILD_EXIT_FILE PORTAGE_ECLASS_LOCATIONS
+	PORTAGE_EBUILD_EXIT_FD PORTAGE_EBUILD_EXIT_FILE PORTAGE_ECLASS_LOCATIONS
+	PORTAGE_IPC_ALIVE_FD
 	PORTAGE_EXPLICIT_INHERIT PORTAGE_OVERRIDE_EPREFIX
 	PORTAGE_BINPKG_TAR_OPTS PORTAGE_INTERNAL_CALLER PORTAGE_ACTUAL_DISTDIR
 	PORTAGE_BINPKG_TMPFILE PORTAGE_XATTR_EXCLUDE PORTAGE_REPOSITORIES
@@ -86,16 +87,29 @@ portage_mutable_filtered_vars=( AA HOSTNAME )
 # is to preserve various variables as they were at the time that the binary
 # package was built while protecting against the application of package renames.
 __filter_readonly_variables() {
-	local -a filtered_vars bash_vars
-	local IFS
+	local -a filtered_vars bash_vars qemu_env
+	local -A excluded_vars=( [PATH]=1 [SHELL]=1 )
+	local IFS x
+
+	# Preserve QEMU vars for qemu-static. Exclude them from the reported
+	# variables below, or an ebuild-set QEMU_* var is taken for a bash one
+	# and filtered out. See bug #978685.
+	for x in ${!QEMU_@}; do
+		qemu_env+=( "${x}=${!x}" )
+		excluded_vars[${x}]=1
+	done
 
 	# Collect an initial list of special bash variables by instructing a
 	# hygienic instance of bash(1) to report them.
 	mapfile -t bash_vars < <(
 		# Like compgen -A variable but doesn't require readline support.
-		env -i -- "${BASH}" -c "printf %s\\\n $(printf '${!%s*} ' {A..Z} {a..z} _)" \
-		| grep -vx -e PATH -e SHELL
+		env -i -- "${qemu_env[@]}" "${BASH}" -c '
+			printf -v p "\${!%s*} " {A..Z} {a..z} _
+			eval "unset p; printf %s\\\\n ${p}"'
 	)
+	for x in "${!bash_vars[@]}"; do
+		[[ -n ${bash_vars[x]} && ${excluded_vars[${bash_vars[x]}]} ]] && unset "bash_vars[x]"
+	done
 	# Incorporate other variables that are known to either be set by or be
 	# able to influence bash. This list was last updated for bash-5.3.
 	# EMACS is omitted, so as not to break the "elisp-common" eclass.
@@ -341,7 +355,8 @@ __dyn_clean() {
 		rm -f "${PORTAGE_BUILDDIR}"/.{ebuild_changed,logid,pretended,setuped,unpacked,prepared} \
 			"${PORTAGE_BUILDDIR}"/.{configured,compiled,tested,packaged,instprepped} \
 			"${PORTAGE_BUILDDIR}"/.die_hooks \
-			"${PORTAGE_BUILDDIR}"/.exit_status
+			"${PORTAGE_BUILDDIR}"/.exit_status \
+			"${PORTAGE_BUILDDIR}"/.src_patches
 
 		rm -rf "${PORTAGE_BUILDDIR}/build-info" \
 			"${PORTAGE_BUILDDIR}/.ipc"
@@ -726,7 +741,10 @@ __dyn_install() {
 		QA_DESKTOP_FILE QA_PREBUILT PROVIDES_EXCLUDE REQUIRES_EXCLUDE \
 		PKG_INSTALL_MASK; do
 
-		x=$(echo -n ${!f})
+		# Collapse whitespace into single spaces.
+		# shellcheck disable=SC2086
+		printf -v x '%s ' ${!f}
+		x=${x% }
 		[[ -n ${x} ]] && echo "${x}" > ${f}
 	done
 	# whitespace preserved
@@ -831,11 +849,14 @@ __dyn_help() {
 }
 
 # @FUNCTION: __ebuild_arg_to_phase
+# @USAGE: <arg> [variable]
 # @DESCRIPTION:
 # Translate a known ebuild(1) argument into the precise
-# name of it's corresponding ebuild phase.
+# name of its corresponding ebuild phase. Print it, or assign it to the
+# named variable, which avoids a subshell. That variable must not be
+# named arg or phase_func, which are local here.
 __ebuild_arg_to_phase() {
-	[[ $# -ne 1 ]] && die "expected exactly 1 arg, got $#: $*"
+	[[ $# -ne 1 && $# -ne 2 ]] && die "expected 1 or 2 args, got $#: $*"
 	local arg=$1
 	local phase_func=""
 
@@ -884,8 +905,11 @@ __ebuild_arg_to_phase() {
 			;;
 	esac
 
+	if [[ $# -eq 2 ]]; then
+		printf -v "$2" '%s' "${phase_func}"
+	fi
 	[[ -z ${phase_func} ]] && return 1
-	echo "${phase_func}"
+	[[ $# -eq 1 ]] && echo "${phase_func}"
 	return 0
 }
 
@@ -1042,7 +1066,8 @@ __ebuild_main() {
 		export CCACHE_DISABLE=1
 	fi
 
-	local ___phase_func=$(__ebuild_arg_to_phase "${EBUILD_PHASE}")
+	local ___phase_func
+	__ebuild_arg_to_phase "${EBUILD_PHASE}" ___phase_func
 	[[ -n ${___phase_func} ]] && __ebuild_phase_funcs "${EAPI}" "${___phase_func}"
 
 	__source_all_bashrcs
@@ -1083,6 +1108,22 @@ __ebuild_main() {
 			export SANDBOX_ON="0"
 		fi
 
+		# build-info holds the saved ebuild environment and a copy of the
+		# ebuild; it must exist before the first src phase so src_install is
+		# reachable when earlier no-op src phases are skipped. Guard on
+		# PORTAGE_BUILDDIR: the clean phase can run before prepare_build_dirs()
+		# (and tolerates a missing builddir), so an unguarded cd would create
+		# a stray build-info/ in the cwd. Guard the cp on EBUILD existing:
+		# for binary merges EBUILD points inside build-info/ and is extracted
+		# later by unpack_metadata(), so it does not exist at clean time.
+		if [[ -d ${PORTAGE_BUILDDIR} ]]; then
+			cd "${PORTAGE_BUILDDIR}"
+			if [[ ! -d build-info ]]; then
+				mkdir build-info
+				[[ -e ${EBUILD} ]] && cp "${EBUILD}" "build-info/${PF}.ebuild"
+			fi
+		fi
+
 		case "${1}" in
 		configure|compile)
 
@@ -1113,12 +1154,6 @@ __ebuild_main() {
 				sleep 5
 			fi
 
-			cd "${PORTAGE_BUILDDIR}"
-			if [[ ! -d build-info ]]; then
-				mkdir build-info
-				cp "${EBUILD}" "build-info/${PF}.ebuild"
-			fi
-
 			# Our custom version of libtool uses ${S} and ${D} to fix
 			# invalid paths in .la files
 			export S D
@@ -1146,6 +1181,13 @@ __ebuild_main() {
 			set -x
 			__dyn_${1}
 			set +x
+		fi
+
+		# The ebuild is sourced by the time pkg_setup has run, so PATCHES
+		# is visible here. Record when it is set: the default src_prepare
+		# applies it, so the no-op src-phase skip must not fire.
+		if [[ ${1} == setup && -n ${PATCHES} ]]; then
+			: > "${PORTAGE_BUILDDIR}/.src_patches"
 		fi
 		;;
 	_internal_test)
@@ -1176,10 +1218,7 @@ __ebuild_main() {
 	[[ -n ${PORTAGE_EBUILD_EXIT_FILE} ]] && : > "${PORTAGE_EBUILD_EXIT_FILE}"
 	if [[ -n ${PORTAGE_IPC_DAEMON} ]] ; then
 		[[ ! -s ${SANDBOX_LOG} ]]
-		# Signal the EbuildIpcDaemon to exit, without using ebuild-ipc
-		# This is significantly faster, as it avoids python's startup time
-		dd < "${PORTAGE_BUILDDIR}/.ipc/out" \
-			| printf '](V%s\nV%s\ne.' exit $? \
-			| dd > "${PORTAGE_BUILDDIR}/.ipc/in" 2> /dev/null
+
+		__ebuild_exit $?
 	fi
 }

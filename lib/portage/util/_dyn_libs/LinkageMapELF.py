@@ -5,27 +5,24 @@ import collections
 import errno
 import itertools
 import logging
+import os
 import subprocess
 
-import portage
-from portage import _encodings
-from portage import _os_merge
-from portage import _unicode_decode
-from portage import _unicode_encode
 from portage.cache.mappings import slot_dict_class
 from portage.const import EPREFIX
 from portage.dep.soname.multilib_category import compute_multilib_category
 from portage.dep.soname.SonameAtom import SonameAtom
 from portage.exception import CommandNotFound, InvalidData
 from portage.localization import _
-from portage.util import getlibpaths
-from portage.util import grabfile
-from portage.util import normalize_path
-from portage.util import varexpand
-from portage.util import writemsg_level
+from portage.util import (
+    getlibpaths,
+    grabfile,
+    normalize_path,
+    varexpand,
+    writemsg_level,
+)
 from portage.util._dyn_libs.NeededEntry import NeededEntry
 from portage.util.elf.header import ELFHeader
-
 
 # Map ELF e_machine values from NEEDED.ELF.2 to approximate multilib
 # categories. This approximation will produce incorrect results on x32
@@ -59,12 +56,12 @@ class LinkageMapELF:
 
     class _obj_properties_class:
         __slots__ = (
+            "alt_paths",
             "arch",
             "needed",
+            "owner",
             "runpaths",
             "soname",
-            "alt_paths",
-            "owner",
         )
 
         def __init__(self, arch, needed, runpaths, soname, alt_paths, owner):
@@ -141,21 +138,6 @@ class LinkageMapELF:
 
             """
 
-            os = _os_merge
-
-            try:
-                _unicode_encode(obj, encoding=_encodings["merge"], errors="strict")
-            except UnicodeEncodeError:
-                # The package appears to have been merged with a
-                # different value of sys.getfilesystemencoding(),
-                # so fall back to utf_8 if appropriate.
-                try:
-                    _unicode_encode(obj, encoding=_encodings["fs"], errors="strict")
-                except UnicodeEncodeError:
-                    pass
-                else:
-                    os = portage.os
-
             abs_path = os.path.join(root, obj.lstrip(os.sep))
             try:
                 object_stat = os.stat(abs_path)
@@ -216,7 +198,6 @@ class LinkageMapELF:
         @type preserve_paths: set
         """
 
-        os = _os_merge
         root = self._root
         root_len = len(root) - 1
         self._clear_cache()
@@ -283,13 +264,11 @@ class LinkageMapELF:
             else:
                 for l in proc.stdout:
                     try:
-                        l = _unicode_decode(
-                            l, encoding=_encodings["content"], errors="strict"
-                        )
+                        if isinstance(l, bytes):
+                            l = l.decode("utf-8", "strict")
                     except UnicodeDecodeError:
-                        l = _unicode_decode(
-                            l, encoding=_encodings["content"], errors="replace"
-                        )
+                        if isinstance(l, bytes):
+                            l = l.decode("utf-8", "replace")
                         writemsg_level(
                             _(
                                 "\nError decoding characters "
@@ -309,11 +288,7 @@ class LinkageMapELF:
                         continue
                     try:
                         with open(
-                            _unicode_encode(
-                                entry.filename,
-                                encoding=_encodings["fs"],
-                                errors="strict",
-                            ),
+                            entry.filename,
                             "rb",
                         ) as f:
                             elf_header = ELFHeader.read(f)
@@ -329,11 +304,7 @@ class LinkageMapELF:
                             proc = subprocess.Popen(
                                 [
                                     b"file",
-                                    _unicode_encode(
-                                        entry.filename,
-                                        encoding=_encodings["fs"],
-                                        errors="strict",
-                                    ),
+                                    entry.filename,
                                 ],
                                 stdout=subprocess.PIPE,
                             )
@@ -509,8 +480,6 @@ class LinkageMapELF:
                 object that have no corresponding libraries to fulfill the dependency.
 
         """
-
-        os = _os_merge
 
         class _LibraryCache:
             """
@@ -709,7 +678,6 @@ class LinkageMapELF:
                 2. False if obj is not a master link
 
         """
-        os = _os_merge
         obj_key = self._obj_key(obj)
         if obj_key not in self._obj_properties:
             raise KeyError(f"{obj_key} ({obj}) not in object list")
@@ -813,8 +781,6 @@ class LinkageMapELF:
 
         """
 
-        os = _os_merge
-
         rValue = {}
 
         if not self._libs:
@@ -893,8 +859,6 @@ class LinkageMapELF:
         set-of-library-paths satisfy soname.
 
         """
-
-        os = _os_merge
 
         if not self._libs:
             self.rebuild()

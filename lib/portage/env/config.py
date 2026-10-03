@@ -6,16 +6,16 @@ __all__ = [
     "ConfigLoaderKlass",
     "GenericFile",
     "PackageKeywordsFile",
-    "PackageUseFile",
     "PackageMaskFile",
+    "PackageUseFile",
     "PortageModulesFile",
 ]
 
 from portage.cache.mappings import UserDict
 from portage.env.loaders import (
+    ItemFileLoader,
     KeyListFileLoader,
     KeyValuePairFileLoader,
-    ItemFileLoader,
 )
 
 
@@ -62,7 +62,7 @@ class GenericFile(UserDict):
             l = loader(self.filename, None)
             data, errors = l.load()
             if len(data) and not len(errors):
-                (self.data, self.errors) = (data, errors)
+                self.data, self.errors = (data, errors)
                 return
 
 

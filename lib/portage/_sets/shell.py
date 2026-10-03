@@ -1,12 +1,11 @@
 # Copyright 2007-2020 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 import subprocess
 
-from portage import os
-from portage import _unicode_decode
-from portage._sets.base import PackageSet
 from portage._sets import SetConfigError
+from portage._sets.base import PackageSet
 
 __all__ = ["CommandOutputSet"]
 
@@ -34,13 +33,19 @@ class CommandOutputSet(PackageSet):
         self.description = f"Package set generated from output of '{self._command}'"
 
     def load(self):
-        pipe = subprocess.Popen(self._command, stdout=subprocess.PIPE, shell=True)
+        pipe = subprocess.Popen(
+            self._command,
+            stdout=subprocess.PIPE,
+            shell=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         stdout, stderr = pipe.communicate()
         if pipe.wait() == os.EX_OK:
-            self._setAtoms(_unicode_decode(stdout).splitlines())
+            self._setAtoms(stdout.splitlines())
 
     def singleBuilder(self, options, settings, trees):
-        if not "command" in options:
+        if "command" not in options:
             raise SetConfigError("no command specified")
         return CommandOutputSet(options["command"])
 

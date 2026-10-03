@@ -2,15 +2,13 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import logging
-
+import os
 from collections import OrderedDict
+from warnings import warn
 
 import portage
-
-from portage import os
 from portage.output import create_color_func
-from portage.util import writemsg_level, _recursive_file_list
-from warnings import warn
+from portage.util import _recursive_file_list, writemsg_level
 
 bad = create_color_func("BAD")
 warn = create_color_func("WARN")
@@ -21,18 +19,13 @@ def get_hooks_from_dir(rel_directory, prefix="/"):
 
     hooks = OrderedDict()
     for filepath in _recursive_file_list(directory):
-        name = filepath.split(directory)[1].lstrip(portage.os.sep)
-        if portage.os.access(filepath, portage.os.X_OK):
+        name = filepath.split(directory)[1].lstrip(os.sep)
+        if os.access(filepath, os.X_OK):
             hooks[filepath] = name
         else:
             writemsg_level(
-                " %s %s hook: '%s' is not executable\n"
-                % (
-                    warn("*"),
-                    directory,
-                    portage._unicode_decode(name),
-                ),
-                level=logging.WARN,
+                f" {warn('*')} {directory} hook: '{name}' is not executable\n",
+                level=logging.WARNING,
                 noiselevel=2,
             )
 
@@ -44,7 +37,7 @@ def perform_hooks(rel_directory, *argv, prefix="/"):
         hook_command = filepath + " " + " ".join(map(str, argv))
         retval = portage.process.spawn(hook_command)
 
-        if retval != portage.os.EX_OK:
+        if retval != os.EX_OK:
             writemsg_level(
                 f" {bad('*')} Spawn failed for: {name}, {filepath}\n",
                 level=logging.ERROR,

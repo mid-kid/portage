@@ -5,47 +5,48 @@ __all__ = (
     "ALL_COMPLETED",
     "FIRST_COMPLETED",
     "FIRST_EXCEPTION",
-    "ensure_future",
     "CancelledError",
     "Future",
     "InvalidStateError",
     "Lock",
     "TimeoutError",
+    "ensure_future",
     "get_child_watcher",
     "get_event_loop",
-    "set_child_watcher",
     "get_event_loop_policy",
-    "set_event_loop_policy",
+    "iscoroutinefunction",
     "run",
+    "set_child_watcher",
+    "set_event_loop_policy",
     "shield",
     "sleep",
     "wait",
     "wait_for",
 )
 
+import asyncio as _real_asyncio
 import sys
+import threading
 import types
 import warnings
 import weakref
 
-import asyncio as _real_asyncio
-
 # pylint: disable=redefined-builtin
 from asyncio import (
     ALL_COMPLETED,
-    CancelledError,
     FIRST_COMPLETED,
     FIRST_EXCEPTION,
+    CancelledError,
     Future,
     InvalidStateError,
-    Lock as _Lock,
-    shield,
     TimeoutError,
+    shield,
     wait_for,
 )
-
+from asyncio import (
+    Lock as _Lock,
+)
 from inspect import iscoroutinefunction
-import threading
 from typing import Optional
 
 import portage
@@ -53,7 +54,6 @@ from portage.process import atexit_register
 from portage.util._eventloop.asyncio_event_loop import (
     AsyncioEventLoop as _AsyncioEventLoop,
 )
-
 
 _lock = threading.Lock()
 _policy = None
@@ -332,6 +332,17 @@ def _safe_loop(create: Optional[bool] = True) -> Optional[_AsyncioEventLoop]:
                 except AttributeError:
                     _loop = _real_asyncio.get_event_loop()
             except RuntimeError:
+                mainloop = _thread_weakrefs.mainloop
+                if (
+                    mainloop is not None
+                    and not mainloop.is_closed()
+                    and threading.current_thread() is threading.main_thread()
+                ):
+                    # An asyncio.run loop displaced the main loop's entry.
+                    # Restore it rather than create an unreferenced loop.
+                    _thread_weakrefs.loops[thread_key] = mainloop
+                    _real_asyncio.set_event_loop(mainloop._loop)
+                    return mainloop
                 _loop = _real_asyncio.new_event_loop()
                 _real_asyncio.set_event_loop(_loop)
             loop = _thread_weakrefs.loops[thread_key] = _AsyncioEventLoop(loop=_loop)

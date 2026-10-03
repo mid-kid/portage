@@ -1,8 +1,10 @@
-# Copyright 2020-2024 Gentoo Authors
+# Copyright 2020-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 import functools
+import gc
 import multiprocessing
+import warnings
 
 from portage.tests import TestCase
 from portage.tests.resolver.ResolverPlayground import ResolverPlayground
@@ -18,6 +20,14 @@ class AuxdbTestCase(TestCase):
             self.skipTest("dbm import failed")
         self._test_mod("portage.cache.anydbm.database", multiproc=False, picklable=True)
 
+    def test_anydbm_label(self):
+        from portage.cache.fs_template import gen_label
+
+        self.assertEqual(
+            gen_label("/var/cache/edb/dep", "/var/db/repos/gentoo"),
+            "gentoo-51410B74E34051F6",
+        )
+
     def test_flat_hash_md5(self):
         self._test_mod("portage.cache.flat_hash.md5_database")
 
@@ -32,6 +42,24 @@ class AuxdbTestCase(TestCase):
         self._test_mod("portage.cache.sqlite.database", picklable=True)
 
     def _test_mod(self, auxdbmodule, multiproc=True, picklable=True):
+        # close_caches() must close the cache, not leave it to the garbage
+        # collector.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.filterwarnings(
+                "always", "unclosed database", category=ResourceWarning
+            )
+            self._test_mod_playground(auxdbmodule, multiproc, picklable)
+            gc.collect()
+        self.assertEqual(
+            [
+                str(w.message)
+                for w in caught
+                if str(w.message).startswith("unclosed database")
+            ],
+            [],
+        )
+
+    def _test_mod_playground(self, auxdbmodule, multiproc, picklable):
         ebuilds = {
             "cat/A-1": {
                 "EAPI": "7",
@@ -60,6 +88,8 @@ class AuxdbTestCase(TestCase):
             ebuilds=ebuilds,
             eclasses=eclasses,
             user_config={"modules": (f"portdbapi.auxdbmodule = {auxdbmodule}",)},
+            # This test is about how the metadata is generated and stored.
+            share_metadata=False,
         )
 
         try:

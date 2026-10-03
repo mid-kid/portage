@@ -3,10 +3,10 @@
 
 __all__ = ("KeywordsManager",)
 
+import os
 import warnings
 
 import portage
-from portage import os
 from portage.dep import ExtendedAtomDict
 from portage.localization import _
 from portage.package.ebuild._config.helper import ordered_by_atom_specificity
@@ -31,6 +31,7 @@ class KeywordsManager:
                 eapi_default=None,
                 allow_repo=allow_profile_repo_deps(x),
                 allow_build_id=x.allow_build_id,
+                allow_use=False,
             )
             for x in profiles
         ]
@@ -53,6 +54,7 @@ class KeywordsManager:
                 eapi=x.eapi,
                 eapi_default=None,
                 allow_repo=allow_profile_repo_deps(x),
+                allow_use=False,
             )
             for x in profiles
         ]
@@ -80,6 +82,7 @@ class KeywordsManager:
                 allow_repo=True,
                 verify_eapi=False,
                 allow_build_id=True,
+                allow_use=False,
             )
 
             if pkgdict and portage._internal_caller:
@@ -96,6 +99,7 @@ class KeywordsManager:
                 allow_repo=True,
                 verify_eapi=False,
                 allow_build_id=True,
+                allow_use=False,
             ).items():
                 pkgdict.setdefault(k, []).extend(v)
 

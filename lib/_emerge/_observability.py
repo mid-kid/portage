@@ -1,0 +1,765 @@
+# Copyright 2026 Gentoo Authors
+# Distributed under the terms of the GNU General Public License v2
+
+"""
+Observability support for a running emerge process.
+
+When FEATURES="observability" is enabled, the Scheduler publishes a
+machine-readable snapshot of its current state (which packages are
+building/merging, in which phase, for how long) to a JSON status file
+under PORTAGE_RUN_PATH (e.g. /run/portage/emerge-<pid>.json).  External
+consumers can poll this file (see ``portageq jobs`` / ``emerge --status``).
+
+A Unix-domain socket at /run/portage/emerge-<pid>.sock additionally streams
+newline-delimited JSON snapshots: the current snapshot on connect, then one
+line per update.
+
+Every object carries a "type" field naming its kind ("snapshot" today).
+Consumers must dispatch on it and ignore kinds they do not know, so that
+other kinds can be added later without breaking them.
+
+Everything here degrades silently: if the runtime directory is not
+writable (e.g. unprivileged, no /run) emerge proceeds unaffected.
+"""
+
+import errno
+import glob
+import json
+import os as _os
+import socket
+import sys
+import time
+
+import portage
+import portage.exception
+from portage import os
+from portage.const import PORTAGE_RUN_PATH
+from portage.util import atomic_ofstream, ensure_dirs, writemsg_level
+from portage.util.futures import asyncio
+from portage.util.human_readable import bytes_to_human
+
+from _emerge.PackageMerge import PackageMerge as _PackageMerge
+
+_SCHEMA_VERSION = 1
+
+
+def _task_pkg(task):
+    """Return the Package associated with a running task, or None."""
+    pkg = getattr(task, "pkg", None)
+    if pkg is not None:
+        return pkg
+    merge = getattr(task, "merge", None)
+    if merge is not None:
+        return getattr(merge, "pkg", None)
+    return None
+
+
+def _task_pid(task):
+    """Return the live PID for task, or None."""
+    seen = set()
+    current = task
+    for _ in range(16):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        pid = getattr(current, "pid", None)
+        if pid:
+            return pid
+        current = getattr(current, "_current_task", None)
+    return None
+
+
+class _BuildTimes:
+    """Timing and final resource usage for one package's build.
+
+    Created when the build task starts and kept until the package's merge
+    finishes, so that consumers see one continuous record across the
+    build -> merge hand-off.
+    """
+
+    __slots__ = ("finished", "resources", "start")
+
+    def __init__(self, start):
+        self.start = start
+        self.finished = None
+        # Final cgroup counters, captured when the build finishes and
+        # before the cgroup is destroyed.
+        self.resources = None
+
+    def elapsed(self, now):
+        """Wall-clock duration of the build itself.
+
+        Frozen once the build finishes, so that time spent waiting to merge
+        does not inflate it.
+        """
+        if self.finished is not None:
+            return self.finished - self.start
+        return now - self.start
+
+
+def build_snapshot(monitor):
+    """Serialize the scheduler's current state into a plain dict."""
+    scheduler = monitor._scheduler
+    now = time.time()
+
+    cgroup = getattr(scheduler, "_cgroup", None)
+    merge_wait_ids = {id(t) for t in getattr(scheduler, "_merge_wait_queue", ())}
+
+    tasks = []
+    for task in scheduler._running_tasks.values():
+        pkg = _task_pkg(task)
+        if pkg is None:
+            continue
+        # PackageMerge installs an already-built package; everything else
+        # represents an in-progress build/extract.
+        cpv = str(pkg.cpv)
+        kind = "merge" if isinstance(task, _PackageMerge) else "build"
+        waiting = id(task) in merge_wait_ids
+
+        # Prefer the build's own start/finish times (continuous across the
+        # build -> merge hand-off) over the per-task start time.
+        times = monitor._build_times.get(cpv)
+        if times is not None:
+            start, build_finished = times.start, times.finished
+            frozen_res = times.resources
+        else:
+            start, build_finished = monitor._task_start.get(id(task)), None
+            frozen_res = None
+
+        # Duration of the build itself, which stops advancing once the build
+        # is done. "elapsed" below keeps running through the merge, so it is
+        # the wrong denominator for anything derived from the build's own
+        # cgroup counters.
+        build_elapsed = times.elapsed(now) if times is not None else None
+
+        # A package waiting to merge is done building: freeze its elapsed time at
+        # build completion rather than letting the wait inflate it.
+        if waiting and build_finished is not None and start is not None:
+            elapsed = build_finished - start
+        elif start is not None:
+            elapsed = now - start
+        else:
+            elapsed = None
+
+        entry = {
+            "cpv": cpv,
+            "category": pkg.category,
+            "pf": pkg.pf,
+            "root": pkg.root,
+            "operation": getattr(pkg, "operation", None),
+            "binary": bool(getattr(pkg, "built", False)),
+            "kind": kind,
+            "phase": "merge-wait" if waiting else monitor._phases.get(cpv),
+            "merge_wait": waiting,
+            "pid": _task_pid(task),
+            "start_time": start,
+            "elapsed": elapsed,
+            "build_elapsed": build_elapsed,
+        }
+        if frozen_res is not None:
+            entry["resources"] = frozen_res
+        elif cgroup is not None:
+            res = cgroup.read_stats(str(pkg.cpv))
+            if res:
+                entry["resources"] = res
+        tasks.append(entry)
+
+    tasks.sort(key=lambda t: (t["start_time"] is None, t["start_time"] or 0))
+
+    display = scheduler._status_display
+    return {
+        "type": "snapshot",
+        "schema": _SCHEMA_VERSION,
+        "emerge_pid": _os.getpid(),
+        "timestamp": now,
+        "jobs": {
+            "running": scheduler._jobs,
+            "max": scheduler._max_jobs,
+            "completed": display.curval,
+            "total": display.maxval,
+            "failed": len(scheduler._failed_pkgs),
+            "merge_wait": len(scheduler._merge_wait_queue),
+            "merges_pending": len(scheduler._task_queues.merge),
+        },
+        "tasks": tasks,
+    }
+
+
+# Counters that describe the cgroup as it is right now. They stop meaning
+# anything once the build is over and its cgroup has been destroyed, so they
+# are dropped rather than frozen; the peaks and the monotonic totals stay.
+_TRANSIENT_RESOURCE_FIELDS = frozenset(
+    ("mem_current", "mem_swap_current", "mem_zswap_current")
+)
+
+
+def freeze_resources(stats):
+    """Keep the counters from stats that outlive the cgroup, or None."""
+    if not stats:
+        return None
+    return {
+        k: v for k, v in stats.items() if k not in _TRANSIENT_RESOURCE_FIELDS
+    } or None
+
+
+def status_dir(eprefix=""):
+    """Directory where running emerge processes publish status files."""
+    if eprefix:
+        return os.path.join(eprefix, PORTAGE_RUN_PATH.lstrip(os.sep))
+    return PORTAGE_RUN_PATH
+
+
+# How long to wait for one emerge to answer on its socket. The waits are
+# serial, so this is the per-emerge cost of falling back to the status file
+# when an emerge's main loop is too busy to serve the connection.
+_SOCKET_TIMEOUT = 0.5
+
+
+def _status_path_pid(path):
+    """The pid encoded in an emerge-<pid>.{json,sock} path, or None."""
+    stem, _, _suffix = os.path.basename(path).rpartition(".")
+    name, _, pid = stem.partition("-")
+    if name != "emerge" or not pid.isdigit():
+        return None
+    return int(pid)
+
+
+def _snapshot_is_live(snapshot, path):
+    """True if snapshot came from a live emerge that still owns path.
+
+    A status file or socket left behind by an emerge that died without
+    cleaning up is claimed by an unrelated process as soon as its pid is
+    recycled, so the pid has to agree with the name it was published under.
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    pid = snapshot.get("emerge_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if pid != _status_path_pid(path):
+        return False
+    return _pid_alive(pid)
+
+
+def _read_socket_snapshot(path, timeout):
+    """Read one snapshot from an emerge status socket, or None."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(path)
+            with sock.makefile("r", encoding="utf_8") as f:
+                line = f.readline()
+        # socket.timeout is an OSError and JSONDecodeError is a ValueError,
+        # so this covers a refused connection, an emerge that never answers
+        # and a truncated line alike.
+        return json.loads(line) if line else None
+    except (OSError, ValueError):
+        return None
+
+
+def read_snapshots(eprefix=""):
+    """Read all live emerge status snapshots; return a list of snapshot dicts.
+
+    Each emerge's socket is tried first: connecting makes it publish a
+    snapshot built at that moment, whereas its status file is only as fresh
+    as the last publish. The status file is the fallback for an emerge
+    whose socket does not answer within _SOCKET_TIMEOUT, which happens when
+    its main loop is busy.
+    """
+    by_pid = {}
+
+    for path in glob.glob(os.path.join(status_dir(eprefix), "emerge-*.sock")):
+        snapshot = _read_socket_snapshot(path, _SOCKET_TIMEOUT)
+        if snapshot is not None and _snapshot_is_live(snapshot, path):
+            by_pid[snapshot["emerge_pid"]] = snapshot
+
+    for path in glob.glob(os.path.join(status_dir(eprefix), "emerge-*.json")):
+        if _status_path_pid(path) in by_pid:
+            continue
+        try:
+            with open(path, encoding="utf_8") as f:
+                snapshot = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if _snapshot_is_live(snapshot, path):
+            by_pid[snapshot["emerge_pid"]] = snapshot
+
+    # Order by pid rather than by path, so that the result does not depend
+    # on which transport answered for which emerge.
+    return [by_pid[pid] for pid in sorted(by_pid)]
+
+
+def _pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        _os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def average_parallelism(cpu_usec, elapsed):
+    """Mean number of CPUs kept busy over elapsed seconds, or None.
+
+    None when elapsed is unknown or non-positive, i.e. whenever the
+    quotient would not mean anything.
+    """
+    if not elapsed or elapsed <= 0:
+        return None
+    return (cpu_usec / 1e6) / elapsed
+
+
+def _format_cpu(cpu_usec, build_elapsed):
+    cpu_s = cpu_usec / 1e6
+    parallelism = average_parallelism(cpu_usec, build_elapsed)
+    if parallelism is None:
+        return f"{cpu_s:.2f}s"
+    return f"{cpu_s:.2f}s ({parallelism:.2f}x)"
+
+
+def _format_bytes(value, _build_elapsed):
+    # Same signature as _format_cpu(), which is the one that needs the
+    # duration, so that _RESOURCE_FIELDS can call either the same way.
+    return bytes_to_human(value)
+
+
+_RESOURCE_FIELDS = (
+    ("cpu_usec", "CPU", _format_cpu),
+    ("mem_current", "Mem", _format_bytes),
+    ("mem_peak", "MaxMem", _format_bytes),
+    ("mem_swap_current", "Swap", _format_bytes),
+    ("mem_swap_peak", "MaxSwap", _format_bytes),
+    ("mem_zswap_current", "ZSwap", _format_bytes),
+    ("io_read_bytes", "I/O R", _format_bytes),
+    ("io_write_bytes", "I/O W", _format_bytes),
+)
+
+
+def format_resources(resources, build_elapsed=None):
+    """Render cgroup counters as "Label: value" pairs, or "" if there are none.
+
+    A counter the kernel did report is rendered even when it is zero: no
+    I/O at all is a fact about the build, not a missing measurement.
+    """
+    if not resources:
+        return ""
+    parts = []
+    for key, label, formatter in _RESOURCE_FIELDS:
+        value = resources.get(key)
+        if value is not None:
+            parts.append(f"{label}: {formatter(value, build_elapsed)}")
+    return ", ".join(parts)
+
+
+def format_snapshots(snapshots):
+    """Render snapshots as a human-readable table."""
+    if not snapshots:
+        return "No emerge processes are currently running.\n"
+
+    lines = []
+    for snapshot in snapshots:
+        jobs = snapshot.get("jobs", {})
+        lines.append(
+            "emerge[{pid}]: {running} running, {completed}/{total} done, "
+            "{failed} failed".format(
+                pid=snapshot.get("emerge_pid", "?"),
+                running=jobs.get("running", 0),
+                completed=jobs.get("completed", 0),
+                total=jobs.get("total", 0),
+                failed=jobs.get("failed", 0),
+            )
+        )
+        for task in snapshot.get("tasks", []):
+            elapsed = task.get("elapsed")
+            elapsed_str = f"{max(0, int(elapsed))}s" if elapsed is not None else "-"
+            phase = task.get("phase") or task.get("kind") or "-"
+            line = f"  {task.get('cpv', '?'):<45} {phase:<10} {elapsed_str:>7}"
+
+            rendered = format_resources(
+                task.get("resources"), task.get("build_elapsed")
+            )
+            if rendered:
+                line += f"  [{rendered}]"
+
+            lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+NOT_ENABLED_HINT = (
+    "Nothing to report. Note that emerge only publishes status when it is "
+    'started with FEATURES="observability"; see make.conf(5).\n'
+)
+
+
+def missing_feature_hint(snapshots, features=None):
+    """Return a hint about FEATURES="observability", or None.
+
+    There is only something to say when nothing was read, since the
+    feature applies to the emerge being observed rather than to the one
+    observing it.
+
+    `features` defaults to this configuration's FEATURES, looked up only
+    when it is needed, since loading the config is not cheap.
+    """
+    if snapshots:
+        return None
+    if features is None:
+        settings = getattr(portage, "settings", None)
+        features = settings.features if settings is not None else frozenset()
+    if "observability" in features:
+        return None
+    return NOT_ENABLED_HINT
+
+
+# PyPy's socket module does not export MSG_NOSIGNAL, so fall back to the
+# Linux value, which is the only platform that gets this far: elsewhere the
+# socket is never created because there is no PORTAGE_RUN_PATH to bind in.
+_MSG_NOSIGNAL = getattr(
+    socket, "MSG_NOSIGNAL", 0x4000 if sys.platform.startswith("linux") else 0
+)
+
+_ACCEPT_RETRY_DELAY = 1  # seconds
+
+
+def _encode(snapshot):
+    """One snapshot as a line of the socket stream."""
+    return (json.dumps(snapshot, sort_keys=True) + "\n").encode("utf_8")
+
+
+class ObservabilityMonitor:
+    """Owns the status file and streaming socket for one Scheduler.
+
+    The Scheduler calls the public methods unconditionally. Everything
+    that publishes is a no-op when the feature is disabled; build timing is
+    still recorded, since FEATURES="cgroup" reports build parallelism from
+    it and is independent of this feature.
+    """
+
+    # Don't rewrite the status file more often than this (seconds), to
+    # bound IO when many short phases churn.  Mirrors JobStatusDisplay's
+    # rate-limiting intent.
+    _min_write_latency = 1.0
+
+    # Republish this often (seconds) even when no task event occurs, so that
+    # the live gauges (elapsed time, cgroup counters, task PIDs) keep moving
+    # through a phase that runs for hours.
+    _refresh_interval = 2.0
+
+    def __init__(self, scheduler):
+        self._scheduler = scheduler
+        settings = scheduler.settings
+
+        self.enabled = "observability" in settings.features
+
+        # id(task) -> epoch start time; str(cpv) -> current phase name.
+        self._task_start = {}
+        self._phases = {}
+        # str(cpv) -> _BuildTimes
+        self._build_times = {}
+
+        self._status_path = None
+        self._socket_path = None
+        self._loop = None
+        self._server = None
+        self._accept_handle = None
+        self._clients = []
+        self._server_started = False
+        self._last_write = 0
+        self._last_snapshot = None
+        self._refresh_handle = None
+
+        if not self.enabled:
+            return
+
+        run_dir = status_dir(settings.get("EPREFIX", ""))
+        pid = _os.getpid()
+        self._run_dir = run_dir
+        self._status_path = os.path.join(run_dir, f"emerge-{pid}.json")
+        self._socket_path = os.path.join(run_dir, f"emerge-{pid}.sock")
+
+    def note_task_started(self, task):
+        now = time.time()
+        if self.enabled:
+            self._task_start[id(task)] = now
+        # Build timing is recorded either way: FEATURES="cgroup" reports a
+        # build's average parallelism from it.
+        if not isinstance(task, _PackageMerge):
+            pkg = _task_pkg(task)
+            if pkg is not None:
+                self._build_times[str(pkg.cpv)] = _BuildTimes(now)
+
+    def note_task_finished(self, task):
+        self._task_start.pop(id(task), None)
+        pkg = _task_pkg(task)
+        if pkg is None:
+            return
+        cpv = str(pkg.cpv)
+        if isinstance(task, _PackageMerge):
+            self._phases.pop(cpv, None)
+            self._build_times.pop(cpv, None)
+        else:
+            times = self._build_times.get(cpv)
+            if times is not None:
+                times.finished = time.time()
+
+    def note_build_resources(self, cpv, stats):
+        """Keep the final cgroup counters for the build of cpv, and return them.
+
+        Called just before the cgroup is destroyed, so that a package that
+        has moved on to merging goes on reporting what its build used. The
+        counters that only describe a live cgroup are dropped, so the caller
+        gets back what it is worth reporting from here on.
+        """
+        resources = freeze_resources(stats)
+        times = self._build_times.get(str(cpv))
+        if times is not None:
+            times.resources = resources
+        return resources
+
+    def build_elapsed(self, cpv):
+        """Wall-clock duration of the build of cpv, or None if unknown.
+
+        Frozen once the build finishes, so callers reporting on a package
+        that has moved on to merging still see the build's own duration.
+        """
+        times = self._build_times.get(str(cpv))
+        if times is None:
+            return None
+        return times.elapsed(time.time())
+
+    def forget_build(self, task):
+        """Drop what is kept for a build that will not be merged.
+
+        note_task_finished() leaves the record in place so that the merge
+        can go on reporting the build's duration and resource usage. A
+        build that produces no merge task has to say so, or nothing ever
+        drops it.
+        """
+        pkg = _task_pkg(task)
+        if pkg is not None:
+            cpv = str(pkg.cpv)
+            self._build_times.pop(cpv, None)
+            self._phases.pop(cpv, None)
+
+    def note_phase(self, cpv, phase):
+        if not self.enabled:
+            return
+        self._phases[str(cpv)] = phase
+        self.update()
+
+    def update(self, force=False):
+        """Recompute the snapshot and publish it (rate-limited)."""
+        if not self.enabled:
+            return
+        now = time.time()
+        if not force and (now - self._last_write) < self._min_write_latency:
+            return
+        self._last_write = now
+        self._publish()
+
+    def _publish(self):
+        try:
+            snapshot = build_snapshot(self)
+        except Exception as e:
+            writemsg_level(
+                f"!!! observability: failed to build snapshot: {e}\n",
+                level=30,
+                noiselevel=-1,
+            )
+            self.enabled = False
+            return
+
+        self._last_snapshot = snapshot
+        self._write_status_file(snapshot)
+        self._ensure_server()
+        self._broadcast(snapshot)
+        self._schedule_refresh()
+
+    def _schedule_refresh(self):
+        if not self.enabled or self._refresh_handle is not None:
+            return
+        try:
+            self._refresh_handle = self._scheduler._event_loop.call_later(
+                self._refresh_interval, self._refresh
+            )
+        except RuntimeError:
+            # The loop is closed (shutdown in progress), so there will be no
+            # further refreshes. Task events still publish.
+            self._refresh_handle = None
+
+    def _refresh(self):
+        self._refresh_handle = None
+        # A publish that fails disables the monitor, but the handle armed by
+        # the previous one is still pending at that point.
+        if not self.enabled:
+            return
+        # Publish without advancing _last_write: the rate limit is there for
+        # bursty task events, not for this timer.
+        self._publish()
+
+    def _write_status_file(self, snapshot):
+        try:
+            ensure_dirs(self._run_dir, mode=0o755)
+            f = atomic_ofstream(self._status_path, mode="w", encoding="utf_8")
+            json.dump(snapshot, f, sort_keys=True)
+            f.write("\n")
+            f.close()
+        except (OSError, portage.exception.PortageException) as e:
+            # Typically EACCES/EROFS for unprivileged emerge or no /run.
+            writemsg_level(
+                f"!!! observability: cannot write {self._status_path}: {e}\n",
+                level=30,
+                noiselevel=-1,
+            )
+            self._status_path = None
+            self.enabled = False
+
+    def _ensure_server(self):
+        if self._server_started:
+            return
+        self._server_started = True
+        sock = None
+        try:
+            ensure_dirs(self._run_dir, mode=0o755)
+            try:
+                _os.unlink(self._socket_path)
+            except FileNotFoundError:
+                pass
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            sock.bind(self._socket_path)
+            # Before listen(), so that no connection is accepted while the
+            # socket still has the permissions the umask gave it.
+            _os.chmod(self._socket_path, 0o600)
+            sock.listen()
+            self._loop = asyncio._safe_loop()
+            self._server = sock
+            self._loop.add_reader(sock.fileno(), self._accept)
+        except Exception as e:
+            self._server = None
+            if sock is not None:
+                sock.close()
+            writemsg_level(
+                f"!!! observability: socket setup failed: {e}\n",
+                level=30,
+                noiselevel=-1,
+            )
+
+    def _accept(self):
+        published = False
+        while self._server is not None:
+            try:
+                conn, _addr = self._server.accept()
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError as e:
+                if e.errno in (errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM):
+                    # The socket stays readable while the connection is
+                    # pending, so accepting again at once would spin until
+                    # a descriptor comes free.
+                    self._loop.remove_reader(self._server.fileno())
+                    self._accept_handle = self._loop.call_later(
+                        _ACCEPT_RETRY_DELAY, self._resume_accept
+                    )
+                # Anything else, ECONNABORTED and the like, concerns the one
+                # connection, which is gone: returning is safe because the
+                # reader fires again if another is pending.
+                return
+            conn.setblocking(False)
+            if not published:
+                # Unconditional: under the rate limit a task event that
+                # published moments ago would leave the client with the
+                # older state.
+                self.update(force=True)
+                published = True
+            if self._last_snapshot is not None and not self._send(
+                conn, _encode(self._last_snapshot)
+            ):
+                conn.close()
+                continue
+            try:
+                # Clients are not expected to send anything; this notices
+                # the peer going away, which nothing else would until the
+                # next broadcast. A client that shuts down only its write
+                # side is therefore treated as gone.
+                self._loop.add_reader(conn.fileno(), self._client_readable, conn)
+            except Exception:
+                conn.close()
+                continue
+            self._clients.append(conn)
+
+    def _resume_accept(self):
+        self._accept_handle = None
+        if self._server is not None:
+            self._loop.add_reader(self._server.fileno(), self._accept)
+
+    def _client_readable(self, conn):
+        try:
+            if conn.recv(4096):
+                return
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            pass
+        self._drop_client(conn)
+
+    def _drop_client(self, conn):
+        if conn in self._clients:
+            self._clients.remove(conn)
+        try:
+            self._loop.remove_reader(conn.fileno())
+        except (RuntimeError, ValueError):
+            pass
+        conn.close()
+
+    def _broadcast(self, snapshot):
+        if not self._clients:
+            return
+        data = _encode(snapshot)
+        for conn in list(self._clients):
+            if not self._send(conn, data):
+                self._drop_client(conn)
+
+    @staticmethod
+    def _send(conn, data):
+        """Send one snapshot line without blocking; False drops the client.
+
+        MSG_NOSIGNAL because emerge restores SIGPIPE to SIG_DFL (bug 982689).
+        Nothing is buffered, so a partial send means the client is not
+        reading: a snapshot is far smaller than the socket buffer.
+        """
+        try:
+            return conn.send(data, _MSG_NOSIGNAL) == len(data)
+        except OSError:
+            return False
+
+    def close(self):
+        # Nothing may publish after this: a later update() would re-arm the
+        # timer and recreate the status file unlinked below.
+        self.enabled = False
+        if self._refresh_handle is not None:
+            self._refresh_handle.cancel()
+            self._refresh_handle = None
+        if self._accept_handle is not None:
+            self._accept_handle.cancel()
+            self._accept_handle = None
+        for conn in list(self._clients):
+            self._drop_client(conn)
+        if self._server is not None:
+            try:
+                self._loop.remove_reader(self._server.fileno())
+            except (RuntimeError, ValueError):
+                pass
+            self._server.close()
+            self._server = None
+        for path in (self._status_path, self._socket_path):
+            if path:
+                try:
+                    _os.unlink(path)
+                except OSError:
+                    pass

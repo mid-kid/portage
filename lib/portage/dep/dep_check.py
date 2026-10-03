@@ -11,8 +11,10 @@ import operator
 import portage
 from portage.dep import Atom, match_from_list, use_reduce
 from portage.dep._dnf import (
-    dnf_convert as _dnf_convert,
     contains_disjunction as _contains_disjunction,
+)
+from portage.dep._dnf import (
+    dnf_convert as _dnf_convert,
 )
 from portage.exception import InvalidDependString, ParseError
 from portage.localization import _
@@ -56,7 +58,7 @@ def _expand_new_virtuals(
     # example, atoms that appear identical may behave differently
     # in USE matching, depending on their unevaluated form. Also,
     # specially generated virtual atoms may appear identical while
-    # having different _orig_atom attributes.
+    # having different orig_atom attributes.
     atom_graph = mytrees.get("atom_graph")
     parent = mytrees.get("parent")
     virt_parent = mytrees.get("virt_parent")
@@ -149,7 +151,7 @@ def _expand_new_virtuals(
                     mysettings._populate_treeVirtuals_if_needed(myvartree)
                 mychoices = mysettings.getvirtuals().get(mykey, [])
                 for y in mychoices:
-                    a.append(Atom(x.replace(x.cp, y.cp, 1)))
+                    a.append(x.with_cp(y.cp))
                 if not a:
                     newsplit.append(x)
                 elif is_disjunction:
@@ -169,7 +171,7 @@ def _expand_new_virtuals(
         matches.reverse()
         for pkg in matches:
             # only use new-style matches
-            if pkg.cp.startswith("virtual/"):
+            if pkg.category == "virtual":
                 pkgs.append(pkg)
 
         mychoices = []
@@ -192,10 +194,11 @@ def _expand_new_virtuals(
 
         a = []
         for pkg in pkgs:
-            virt_atom = "=" + pkg.cpv
+            virt_atom_str = "=" + pkg.cpv
             if x.unevaluated_atom.use:
-                virt_atom += str(x.unevaluated_atom.use)
-                virt_atom = Atom(virt_atom)
+                virt_atom_str += str(x.unevaluated_atom.use)
+                # orig_atom is propagated through evaluate_conditionals
+                virt_atom = Atom(virt_atom_str, orig_atom=x)
                 if parent is None:
                     if myuse is None:
                         virt_atom = virt_atom.evaluate_conditionals(
@@ -206,12 +209,10 @@ def _expand_new_virtuals(
                 else:
                     virt_atom = virt_atom.evaluate_conditionals(pkg_use_enabled(parent))
             else:
-                virt_atom = Atom(virt_atom)
-
-            # Allow the depgraph to map this atom back to the
-            # original, in order to avoid distortion in places
-            # like display or conflict resolution code.
-            virt_atom.__dict__["_orig_atom"] = x
+                # Allow the depgraph to map this atom back to the
+                # original, in order to avoid distortion in places
+                # like display or conflict resolution code.
+                virt_atom = Atom(virt_atom_str, orig_atom=x)
 
             # According to GLEP 37, RDEPEND is the only dependency
             # type that is valid for new-style virtuals. Repoman
@@ -255,7 +256,7 @@ def _expand_new_virtuals(
 
             # Replace the original atom "x" with "virt_atom" which refers
             # to the specific version of the virtual whose deps we're
-            # expanding. The virt_atom._orig_atom attribute is used
+            # expanding. The virt_atom.orig_atom attribute is used
             # by depgraph to map virt_atom back to the original atom.
             # We specifically exclude the original atom "x" from the
             # the expanded output here, since otherwise it could trigger
@@ -271,7 +272,7 @@ def _expand_new_virtuals(
         if not a and mychoices:
             # Check for a virtual package.provided match.
             for y in mychoices:
-                new_atom = Atom(x.replace(x.cp, y.cp, 1))
+                new_atom = x.with_cp(y.cp)
                 if match_from_list(new_atom, pprovideddict.get(new_atom.cp, [])):
                     a.append(new_atom)
                     if atom_graph is not None:
@@ -324,14 +325,14 @@ def dep_eval(deplist):
 
 class _dep_choice(SlotObject):
     __slots__ = (
-        "atoms",
-        "slot_map",
-        "cp_map",
         "all_available",
-        "all_installed_slots",
-        "new_slot_count",
-        "want_update",
         "all_in_graph",
+        "all_installed_slots",
+        "atoms",
+        "cp_map",
+        "new_slot_count",
+        "slot_map",
+        "want_update",
     )
 
 
@@ -580,7 +581,7 @@ def dep_zapdeps(
                     parent, avail_pkg
                 ):
                     want_update = True
-                if not slot_atom.cp.startswith("virtual/") and not graph_db.match_pkgs(
+                if slot_atom.category != "virtual" and not graph_db.match_pkgs(
                     slot_atom
                 ):
                     new_slot_count += 1
@@ -602,7 +603,7 @@ def dep_zapdeps(
             all_installed = True
             for atom in {Atom(atom.cp) for atom in atoms if not atom.blocker}:
                 # New-style virtuals have zero cost to install.
-                if not vardb.match(atom) and not atom.startswith("virtual/"):
+                if not vardb.match(atom) and atom.category != "virtual":
                     all_installed = False
                     break
             all_installed_slots = False
@@ -610,9 +611,7 @@ def dep_zapdeps(
                 all_installed_slots = True
                 for slot_atom in slot_map:
                     # New-style virtuals have zero cost to install.
-                    if not vardb.match(slot_atom) and not slot_atom.startswith(
-                        "virtual/"
-                    ):
+                    if not vardb.match(slot_atom) and slot_atom.category != "virtual":
                         all_installed_slots = False
                         break
             this_choice.all_installed_slots = all_installed_slots
@@ -638,7 +637,7 @@ def dep_zapdeps(
                 all_in_graph = True
                 for atom in atoms:
                     # New-style virtuals have zero cost to install.
-                    if atom.blocker or atom.cp.startswith("virtual/"):
+                    if atom.blocker or atom.category == "virtual":
                         continue
                     # We check if the matched package has actually been
                     # added to the digraph, in order to distinguish between
@@ -823,7 +822,6 @@ def dep_check(
     depstring,
     mydbapi,
     mysettings,
-    use="yes",
     mode=None,
     myuse=None,
     use_cache=1,
@@ -840,39 +838,16 @@ def dep_check(
     # check_config_instance(mysettings)
     if trees is None:
         trees = globals()["db"]
-    if use == "yes":
-        if myuse is None:
-            # default behavior
-            myusesplit = mysettings["PORTAGE_USE"].split()
-        else:
-            myusesplit = myuse
-            # We've been given useflags to use.
-            # print "USE FLAGS PASSED IN."
-            # print myuse
-            # if "bindist" in myusesplit:
-            # 	print "BINDIST is set!"
-            # else:
-            # 	print "BINDIST NOT set."
+
+    if myuse is None:
+        # default behavior
+        myusesplit = mysettings["PORTAGE_USE"].split()
     else:
-        # we are being run by autouse(), don't consult USE vars yet.
-        # WE ALSO CANNOT USE SETTINGS
-        myusesplit = []
+        myusesplit = myuse
+        # We've been given useflags to use.
 
     mymasks = set()
     useforce = set()
-    if use == "all":
-        # This is only for repoman, in order to constrain the use_reduce
-        # matchall behavior to account for profile use.mask/force. The
-        # ARCH/archlist code here may be redundant, since the profile
-        # really should be handling ARCH masking/forcing itself.
-        arch = mysettings.get("ARCH")
-        mymasks.update(mysettings.usemask)
-        mymasks.update(mysettings.archlist())
-        if arch:
-            mymasks.discard(arch)
-            useforce.add(arch)
-        useforce.update(mysettings.useforce)
-        useforce.difference_update(mymasks)
 
     # eapi code borrowed from _expand_new_virtuals()
     mytrees = trees[myroot]
@@ -903,7 +878,7 @@ def dep_check(
                 depstring,
                 uselist=myusesplit,
                 masklist=mymasks,
-                matchall=(use == "all"),
+                matchall=False,
                 excludeall=useforce,
                 opconvert=True,
                 token_class=Atom,
@@ -924,7 +899,6 @@ def dep_check(
             edebug,
             mydbapi,
             mysettings,
-            use=use,
             mode=mode,
             myuse=myuse,
             use_force=useforce,
@@ -1062,14 +1036,14 @@ def dep_wordreduce(mydeplist, mysettings, mydbapi, mode, use_cache=1):
     "Reduces the deplist to ones and zeros"
     deplist = mydeplist[:]
     for mypos, token in enumerate(deplist):
-        if isinstance(deplist[mypos], list):
+        if isinstance(token, list):
             # recurse
             deplist[mypos] = dep_wordreduce(
                 deplist[mypos], mysettings, mydbapi, mode, use_cache=use_cache
             )
         elif deplist[mypos] == "||":
             pass
-        elif token[:1] == "!":
+        elif str(token).startswith("!"):
             deplist[mypos] = False
         else:
             mykey = deplist[mypos].cp
@@ -1097,7 +1071,7 @@ def dep_wordreduce(mydeplist, mysettings, mydbapi, mode, use_cache=1):
                     mydep = mydbapi.match(deplist[mypos], use_cache=use_cache)
                 if mydep is not None:
                     tmp = len(mydep) >= 1
-                    if deplist[mypos][0] == "!":
+                    if str(deplist[mypos]).startswith("!"):
                         tmp = False
                     deplist[mypos] = tmp
                 else:

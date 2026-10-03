@@ -15,17 +15,15 @@ __all__ = [
 # - RawConfigParser that provides no interpolation for values.
 
 import io
-
+from configparser import ConfigParser as SafeConfigParser
 from configparser import (
     Error as ConfigParserError,
+)
+from configparser import (
     NoOptionError,
     ParsingError,
     RawConfigParser,
 )
-from configparser import ConfigParser as SafeConfigParser
-
-from portage import _encodings
-from portage import _unicode_encode
 
 
 def read_configs(parser, paths):
@@ -37,39 +35,24 @@ def read_configs(parser, paths):
     @param paths: list of paths to read
     @type paths: iterable
     """
-    # use read_file/readfp in order to control decoding of unicode
-    try:
-        # Python >=3.2
-        read_file = parser.read_file
-        source_kwarg = "source"
-    except AttributeError:
-        read_file = parser.readfp
-        source_kwarg = "filename"
-
     for p in paths:
         if isinstance(p, str):
             f = None
             try:
                 f = open(
-                    _unicode_encode(p, encoding=_encodings["fs"], errors="strict"),
-                    encoding=_encodings["repo.content"],
+                    p,
+                    encoding="utf-8",
                     errors="replace",
                 )
             except OSError:
                 pass
             else:
-                # The 'source' keyword argument is needed since otherwise
-                # ConfigParser in Python <3.3.3 may throw a TypeError
-                # because it assumes that f.name is a native string rather
-                # than binary when constructing error messages.
-                kwargs = {source_kwarg: p}
-                read_file(f, **kwargs)
+                parser.read_file(f, source=p)
             finally:
                 if f is not None:
                     f.close()
         elif isinstance(p, io.StringIO):
-            kwargs = {source_kwarg: "<io.StringIO>"}
-            read_file(p, **kwargs)
+            parser.read_file(p, source="<io.StringIO>")
         else:
             raise TypeError(
                 f"Unsupported type {type(p)!r} of element {p!r} of 'paths' argument"

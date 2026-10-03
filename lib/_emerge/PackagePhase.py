@@ -1,18 +1,16 @@
 # Copyright 2018 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 import shlex
+
+import portage
+from portage.util._async.AsyncFunction import AsyncFunction
+from portage.util.install_mask import InstallMask, install_mask_dir
 
 from _emerge.CompositeTask import CompositeTask
 from _emerge.EbuildProcess import EbuildProcess
 from _emerge.SpawnProcess import SpawnProcess
-
-import portage
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
-from portage.util._async.AsyncFunction import AsyncFunction
-from portage.util.install_mask import install_mask_dir, InstallMask
 
 
 class PackagePhase(CompositeTask):
@@ -21,12 +19,12 @@ class PackagePhase(CompositeTask):
     """
 
     __slots__ = (
+        "_pkg_install_mask",
+        "_proot",
         "actionmap",
         "fd_pipes",
         "logfile",
         "settings",
-        "_pkg_install_mask",
-        "_proot",
     )
 
     _shell_binary = portage.const.BASH_BINARY
@@ -40,16 +38,12 @@ class PackagePhase(CompositeTask):
 
         try:
             with open(
-                _unicode_encode(
-                    os.path.join(
-                        self.settings["PORTAGE_BUILDDIR"],
-                        "build-info",
-                        "PKG_INSTALL_MASK",
-                    ),
-                    encoding=_encodings["fs"],
-                    errors="strict",
+                os.path.join(
+                    self.settings["PORTAGE_BUILDDIR"],
+                    "build-info",
+                    "PKG_INSTALL_MASK",
                 ),
-                encoding=_encodings["repo.content"],
+                encoding="utf-8",
                 errors="replace",
             ) as f:
                 self._pkg_install_mask = InstallMask(f.read() + packdebug_maskstr)
@@ -65,10 +59,10 @@ class PackagePhase(CompositeTask):
                         "-e",
                         "-c",
                         (
-                            "rm -rf {PROOT}; "
+                            f"rm -rf {shlex.quote(self._proot)}; "
                             'cp -pPR $(cp --help | grep -q -- "^[[:space:]]*-l," && echo -l)'
-                            ' "${{D}}" {PROOT}'
-                        ).format(PROOT=shlex.quote(self._proot)),
+                            f' "${{D}}" {shlex.quote(self._proot)}'
+                        ),
                     ],
                     background=self.background,
                     env=self.settings.environ(),

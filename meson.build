@@ -1,9 +1,21 @@
 project(
     'portage',
     'c',
-    version : '3.0.77',
-    license : 'GPL-2.0-or-later',
+    version : '3.0.82',
+    license : 'GPL-2.0-only',
     meson_version : '>=0.58.0'
+)
+
+# Errors by default since GCC 14.
+cc = meson.get_compiler('c')
+add_project_arguments(
+    cc.get_supported_arguments(
+        '-Werror=implicit-function-declaration',
+        '-Werror=implicit-int',
+        '-Werror=incompatible-pointer-types',
+        '-Werror=int-conversion',
+    ),
+    language : 'c'
 )
 
 py_mod = import('python')

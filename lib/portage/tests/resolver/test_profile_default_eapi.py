@@ -1,12 +1,12 @@
 # Copyright 2014-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 
-from portage import os, _encodings
 from portage.const import USER_CONFIG_PATH
+from portage.dep import ExtendedAtomDict
 from portage.tests import TestCase
 from portage.tests.resolver.ResolverPlayground import ResolverPlayground
-from portage.dep import ExtendedAtomDict
 from portage.util import ensure_dirs
 
 
@@ -124,10 +124,9 @@ class ProfileDefaultEAPITestCase(TestCase):
                     with open(
                         os.path.join(prof_path, k),
                         mode="w",
-                        encoding=_encodings["repo.content"],
+                        encoding="utf-8",
                     ) as f:
-                        for line in v:
-                            f.write(f"{line}\n")
+                        f.writelines(f"{line}\n" for line in v)
 
             if top_level_eapi is not None:
                 with open(os.path.join(profile_root, "eapi"), "w") as f:

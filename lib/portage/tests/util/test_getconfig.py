@@ -1,14 +1,13 @@
-# Copyright 2010-2020 Gentoo Authors
+# Copyright 2010-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
+import shutil
 import tempfile
 
-from portage import os
-from portage import shutil
-from portage import _unicode_encode
+from portage.exception import ParseError
 from portage.tests import TestCase
 from portage.util import getconfig
-from portage.exception import ParseError
 
 
 class GetConfigTestCase(TestCase):
@@ -18,7 +17,7 @@ class GetConfigTestCase(TestCase):
     """
 
     _cases = {
-        "FETCHCOMMAND": 'wget -t 3 -T 60 --passive-ftp -O "${DISTDIR}/${FILE}" "${URI}"',
+        "FETCHCOMMAND": 'wget -t 3 -T 60 --passive-ftp -U "Portage (Gentoo, https://www.gentoo.org) distfile-fetch" -O "${DISTDIR}/${FILE}" "${URI}"',
         "FETCHCOMMAND_RSYNC": 'rsync -LtvP "${URI}" "${DISTDIR}/${FILE}"',
         "FETCHCOMMAND_SFTP": 'bash -c "x=\\${2#sftp://} ; host=\\${x%%/*} ; port=\\${host##*:} ; host=\\${host%:*} ; [[ \\${host} = \\${port} ]] && port= ; eval \\"declare -a ssh_opts=(\\${3})\\" ; exec sftp \\${port:+-P \\${port}} \\"\\${ssh_opts[@]}\\" \\"\\${host}:/\\${x#*/}\\" \\"\\$1\\"" sftp "${DISTDIR}/${FILE}" "${URI}" "${PORTAGE_SSH_OPTS}"',
         "FETCHCOMMAND_SSH": 'bash -c "x=\\${2#ssh://} ; host=\\${x%%/*} ; port=\\${host##*:} ; host=\\${host%:*} ; [[ \\${host} = \\${port} ]] && port= ; exec rsync --rsh=\\"ssh \\${port:+-p\\${port}} \\${3}\\" -avP \\"\\${host}:/\\${x#*/}\\" \\"\\$1\\"" rsync "${DISTDIR}/${FILE}" "${URI}" "${PORTAGE_SSH_OPTS}"',
@@ -74,7 +73,7 @@ class GetConfigTestCase(TestCase):
                     line = f"export {k}=$'{v[1:]}'\n"
                 else:
                     line = f"export {k}='{v}'\n"
-                f.write(_unicode_encode(line))
+                f.write(line.encode("utf-8", "backslashreplace"))
             f.flush()
 
             d = getconfig(f.name, expand=False)

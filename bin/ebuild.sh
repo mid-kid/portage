@@ -251,7 +251,7 @@ inherit() {
 		location=""
 		potential_location=""
 
-		ECLASS="${1}"
+		ECLASS="${1##*/}"
 		__export_funcs_var=__export_functions_${ECLASS_DEPTH}
 		unset ${__export_funcs_var}
 
@@ -271,7 +271,7 @@ inherit() {
 		fi
 
 		for repo_location in "${PORTAGE_ECLASS_LOCATIONS[@]}"; do
-			potential_location="${repo_location}/eclass/${1}.eclass"
+			potential_location="${repo_location}/eclass/${ECLASS}.eclass"
 			if [[ -f ${potential_location} ]]; then
 				location="${potential_location}"
 				debug-print "  eclass exists: ${location}"
@@ -454,6 +454,7 @@ __source_env_files() {
 		shift
 	fi
 
+	local x
 	for x in "${1}"/${CATEGORY}/{${PN},${PN}:${SLOT%/*},${P},${PF}}; do
 		__try_source "${argument[@]}" "${x}"
 	done
@@ -512,7 +513,19 @@ fi
 if [[ -n ${QA_INTERCEPTORS} ]] ; then
 	# shellcheck disable=SC2086
 	for BIN in ${QA_INTERCEPTORS}; do
-		if ! BIN_PATH=$(type -P -- "${BIN}"); then
+		# Equivalent to BIN_PATH=$(type -P -- "${BIN}"), but without
+		# forking a subshell for each interceptor.
+		BIN_PATH=
+		PATH_REST=${PATH}:
+		while [[ -n ${PATH_REST} ]]; do
+			PATH_DIR=${PATH_REST%%:*}
+			PATH_REST=${PATH_REST#*:}
+			if [[ -f ${PATH_DIR:-.}/${BIN} && -x ${PATH_DIR:-.}/${BIN} ]]; then
+				BIN_PATH=${PATH_DIR:-.}/${BIN}
+				break
+			fi
+		done
+		if [[ -z ${BIN_PATH} ]]; then
 			BODY="echo \"*** missing command: ${BIN}\" >&2; return 127"
 		else
 			BODY="${BIN_PATH} \"\$@\"; return \$?"
@@ -554,7 +567,7 @@ if [[ -n ${QA_INTERCEPTORS} ]] ; then
 		fi
 		eval "${FUNC_SRC}" || echo "error creating QA interceptor ${BIN}" >&2
 	done
-	unset BIN_PATH BIN BODY FUNC_SRC
+	unset BIN_PATH BIN BODY FUNC_SRC PATH_DIR PATH_REST
 fi
 
 # Subshell/helper die support (must export for the die helper).
@@ -641,6 +654,41 @@ if [[ ${EBUILD_PHASE} != clean?(rm) ]]; then
 		unset E_RESTRICT PROVIDES_EXCLUDE REQUIRES_EXCLUDE
 		unset PORTAGE_EXPLICIT_INHERIT
 
+		pre_source_sandbox() {
+			export SANDBOX_ON=1
+			# DENY seems to take priority over READ+WRITE so
+			# don't use it.
+			#export SANDBOX_DENY="/"
+			export SANDBOX_PREDICT=""
+			export SANDBOX_READ="${EBUILD}:${BASH_SOURCE[1]}:${SANDBOX_LOG}"
+			export SANDBOX_WRITE="${SANDBOX_LOG}:/dev/null"
+			[[ ${PORTAGE_DEBUG} != 1 ]] || export SANDBOX_DEBUG=1
+
+			# We need inherit to work
+			local repo_location
+			for repo_location in "${PORTAGE_ECLASS_LOCATIONS[@]}"; do
+				local potential_location="${repo_location}/eclass"
+				if [[ -d ${potential_location} ]]; then
+					SANDBOX_READ+=":${potential_location}"
+				fi
+			done
+
+			# Give a nicer error message in case someone is confused
+			adddeny() { die "External commands disallowed while sourcing ebuild: ${FUNCNAME}" ; }
+			addpredict() { die "External commands disallowed while sourcing ebuild: ${FUNCNAME}" ; }
+			addread() { die "External commands disallowed while sourcing ebuild: ${FUNCNAME}" ; }
+			addwrite() { die "External commands disallowed while sourcing ebuild: ${FUNCNAME}" ; }
+
+			# Disallow any tampering
+			readonly SANDBOX_{ALLOW,ACTIVE,DENY,DEBUG,ON,PREDICT,READ,WRITE}
+		}
+
+		# We can't unset these post-sourcing because of `readonly`
+		# as we don't want the sourced ebuild to be able to modify
+		# the SANDBOX_* vars, but it's okay as the process shouldn't
+		# need to do anything interesting post-sourcing anyway.
+		[[ ${EBUILD_PHASE} = depend ]] && pre_source_sandbox
+
 		if [[ ${PORTAGE_DEBUG} != 1 || $- == *x* ]] ; then
 			source "${EBUILD}" || die "error sourcing ebuild"
 		else
@@ -648,6 +696,8 @@ if [[ ${EBUILD_PHASE} != clean?(rm) ]]; then
 			source "${EBUILD}" || die "error sourcing ebuild"
 			set +x
 		fi
+
+		[[ -s ${SANDBOX_LOG} ]] && die "Sandbox violations found, exiting"
 
 		if ___eapi_enables_failglob_in_global_scope; then
 			shopt -u failglob
@@ -741,7 +791,6 @@ if contains_word nostrip "${FEATURES} ${PORTAGE_RESTRICT}" || contains_word stri
 fi
 
 if [[ ${EBUILD_PHASE} = depend ]] ; then
-	export SANDBOX_ON="0"
 	set -f
 
 	metadata_keys=(
@@ -765,6 +814,8 @@ if [[ ${EBUILD_PHASE} = depend ]] ; then
 	done
 	exec {PORTAGE_PIPE_FD}>&-
 	set +f
+
+	[[ -s ${SANDBOX_LOG} ]] && die "Sandbox violations found, exiting"
 else
 	# Note: readonly variables interfere with __preprocess_ebuild_env(), so
 	# declare them only after it has already run.

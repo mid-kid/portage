@@ -1,17 +1,19 @@
 # Copyright 2012-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 import sys
 import textwrap
+
 import pytest
+
 import portage
-from portage import os
+from portage._global_updates import _do_global_updates
 from portage.const import SUPPORTED_GENTOO_BINPKG_FORMATS
+from portage.output import colorize
 from portage.tests import TestCase
 from portage.tests.resolver.ResolverPlayground import ResolverPlayground
 from portage.util import ensure_dirs
-from portage._global_updates import _do_global_updates
-from portage.output import colorize
 
 
 class MoveEntTestCase(TestCase):
@@ -43,11 +45,9 @@ class MoveEntTestCase(TestCase):
             },
         }
 
-        updates = textwrap.dedent(
-            """
+        updates = textwrap.dedent("""
 			move dev-libs/A dev-libs/A-moved
-		"""
-        )
+		""")
 
         for binpkg_format in SUPPORTED_GENTOO_BINPKG_FORMATS:
             with self.subTest(binpkg_format=binpkg_format):
@@ -151,11 +151,9 @@ class MoveEntTestCase(TestCase):
             },
         }
 
-        updates = textwrap.dedent(
-            """
+        updates = textwrap.dedent("""
 			move dev-libs/A dev-libs/A-moved
-		"""
-        )
+		""")
 
         for binpkg_format in ("gpkg",):
             with self.subTest(binpkg_format=binpkg_format):
@@ -231,10 +229,7 @@ class MoveEntTestCase(TestCase):
                 finally:
                     playground.cleanup()
 
-    # Ignore "The loop argument is deprecated" since this argument is conditionally
-    # added to asyncio.Lock as needed for compatibility with python 3.9.
-    @pytest.mark.filterwarnings("ignore:The loop argument is deprecated")
-    @pytest.mark.filterwarnings("error")
+    @pytest.mark.filterwarnings("error:gpkg file structure mismatch")
     def testMoveEntWithCorruptIndex(self):
         """
         Test handling of the Packages index being stale (bug #920828)
@@ -270,11 +265,9 @@ class MoveEntTestCase(TestCase):
             },
         }
 
-        updates = textwrap.dedent(
-            """
+        updates = textwrap.dedent("""
 			move dev-libs/A dev-libs/A-moved
-		"""
-        )
+		""")
 
         for binpkg_format in ("gpkg",):
             with self.subTest(binpkg_format=binpkg_format):

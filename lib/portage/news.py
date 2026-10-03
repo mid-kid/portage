@@ -1,35 +1,42 @@
 # portage: news management code
-# Copyright 2006-2025 Gentoo Authors
+# Copyright 2006-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = [
-    "NewsManager",
-    "NewsItem",
-    "DisplayRestriction",
-    "DisplayProfileRestriction",
-    "DisplayKeywordRestriction",
     "DisplayInstalledRestriction",
+    "DisplayKeywordRestriction",
+    "DisplayProfileRestriction",
+    "DisplayRestriction",
+    "NewsItem",
+    "NewsManager",
     "count_unread_news",
     "display_news_notifications",
 ]
 
-from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Optional
-from re import Pattern, Match
 import fnmatch
 import logging
-import os as _os
+import os
 import re
+from collections import OrderedDict
+from re import Match, Pattern
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     import portage.dbapi.vartree
     import portage.package.ebuild.config
 
-from portage import os
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
 from portage.const import NEWS_LIB_PATH
+from portage.data import portage_gid
+from portage.dep import isvalidatom
+from portage.exception import (
+    InvalidLocation,
+    OperationNotPermitted,
+    PermissionDenied,
+    ReadOnlyFileSystem,
+)
+from portage.localization import _
+from portage.locks import lockfile, unlockfile
+from portage.output import colorize
 from portage.util import (
     apply_secpass_permissions,
     ensure_dirs,
@@ -37,17 +44,6 @@ from portage.util import (
     normalize_path,
     write_atomic,
     writemsg_level,
-)
-from portage.data import portage_gid
-from portage.dep import isvalidatom
-from portage.localization import _
-from portage.locks import lockfile, unlockfile
-from portage.output import colorize
-from portage.exception import (
-    InvalidLocation,
-    OperationNotPermitted,
-    PermissionDenied,
-    ReadOnlyFileSystem,
 )
 
 
@@ -98,8 +94,7 @@ class NewsManager:
             profile_path = normalize_path(
                 os.path.realpath(portdb.settings.profile_path)
             )
-            if profile_path.startswith(profiles_base):
-                profile_path = profile_path[len(profiles_base) :]
+            profile_path = profile_path.removeprefix(profiles_base)
         self._profile_path = profile_path
 
     def _unread_filename(self, repoid: str) -> str:
@@ -138,11 +133,9 @@ class NewsManager:
             return
 
         news_dir: str = self._news_dir(repoid)
-        try:
-            news: list[str] = _os.listdir(
-                _unicode_encode(news_dir, encoding=_encodings["fs"], errors="strict")
-            )
-        except OSError:
+        news: list[str] = os.listdir(news_dir)
+
+        if not news:
             return
 
         skip_filename: str = self._skip_filename(repoid)
@@ -159,13 +152,11 @@ class NewsManager:
 
             for itemid in news:
                 try:
-                    itemid = _unicode_decode(
-                        itemid, encoding=_encodings["fs"], errors="strict"
-                    )
+                    if isinstance(itemid, bytes):
+                        itemid = itemid.decode("utf-8", "strict")
                 except UnicodeDecodeError:
-                    itemid = _unicode_decode(
-                        itemid, encoding=_encodings["fs"], errors="replace"
-                    )
+                    if isinstance(itemid, bytes):
+                        itemid = itemid.decode("utf-8", "replace")
                     writemsg_level(
                         _("!!! Invalid encoding in news item name: '%s'\n") % itemid,
                         level=logging.ERROR,
@@ -221,7 +212,11 @@ class NewsManager:
         """
 
         if update:
-            self.updateItems(repoid)
+            try:
+                self.updateItems(repoid)
+            except OSError:
+                # Repository doesn't have any news items
+                return 0
 
         unread_filename = self._unread_filename(repoid)
         unread_lock: Optional[bool] = None
@@ -317,8 +312,8 @@ class NewsItem:
 
     def parse(self) -> None:
         with open(
-            _unicode_encode(self.path, encoding=_encodings["fs"], errors="strict"),
-            encoding=_encodings["content"],
+            self.path,
+            encoding="utf-8",
             errors="replace",
         ) as f:
             lines = f.readlines()
@@ -439,10 +434,10 @@ class DisplayInstalledRestriction(DisplayRestriction):
         self.format = news_format
 
     def isValid(self) -> bool:
-        if fnmatch.fnmatch(self.format, "1.*"):
-            return isvalidatom(self.atom, eapi="0")
         if fnmatch.fnmatch(self.format, "2.*"):
             return isvalidatom(self.atom, eapi="5")
+        elif fnmatch.fnmatch(self.format, "1.*"):
+            return isvalidatom(self.atom, eapi="0")
         return isvalidatom(self.atom)
 
     def checkRestriction(self, **kwargs) -> Optional[Match[str]]:

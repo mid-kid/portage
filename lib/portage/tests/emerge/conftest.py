@@ -2,27 +2,26 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import argparse
+import os
 import shlex
-from typing import Optional, Callable  # ,  Self
-
-from portage.const import (
-    SUPPORTED_GENTOO_BINPKG_FORMATS,
-    BASH_BINARY,
-    BINREPOS_CONF_FILE,
-)
-from portage.tests.resolver.ResolverPlayground import ResolverPlayground
-from portage.cache.mappings import Mapping
-from portage.tests.util.test_socks5 import AsyncHTTPServer
-from portage import os
-from portage import shutil
-from portage.util.futures import asyncio
-from portage.tests import cnf_bindir, cnf_sbindir
-from portage.process import find_binary
-from portage.util import find_updated_config_files
-import portage
+import shutil
+from typing import Callable, Optional  # ,  Self
 
 import pytest
 
+import portage
+from portage.cache.mappings import Mapping
+from portage.const import (
+    BASH_BINARY,
+    BINREPOS_CONF_FILE,
+    SUPPORTED_GENTOO_BINPKG_FORMATS,
+)
+from portage.process import find_binary
+from portage.tests import cnf_bindir, cnf_sbindir
+from portage.tests.resolver.ResolverPlayground import ResolverPlayground
+from portage.tests.util.test_socks5 import AsyncHTTPServer
+from portage.util import find_updated_config_files
+from portage.util.futures import asyncio
 
 _INSTALL_SOMETHING = """
 S="${WORKDIR}"
@@ -179,7 +178,6 @@ _INSTALLED_EBUILDS = {
     },
 }
 
-
 _BASELINE_COMMAND_SEQUENCE = [
     "emerge -1 dev-libs/A -v dev-libs/B",
     "emerge with quickpkg direct",
@@ -194,6 +192,7 @@ _BASELINE_COMMAND_SEQUENCE = [
     "emerge --check-news",
     "emerge --regen/--metadata",
     "misc package operations",
+    "misc operations with eprefix",
     "binhost emerge",
 ]
 
@@ -435,10 +434,8 @@ def binhost(playground, async_loop):
     binhost_server = AsyncHTTPServer(
         binhost_address, BinhostContentMap(binhost_remote_path, binhost_dir), async_loop
     ).__enter__()
-    binhost_uri = "http://{address}:{port}{path}".format(
-        address=binhost_address,
-        port=binhost_server.server_port,
-        path=binhost_remote_path,
+    binhost_uri = (
+        f"http://{binhost_address}:{binhost_server.server_port}{binhost_remote_path}"
     )
     yield {"server": binhost_server, "uri": binhost_uri, "dir": binhost_dir}
     binhost_server.__exit__(None, None, None)
@@ -755,6 +752,15 @@ def _generate_all_baseline_commands(playground, binhost):
     test_commands["misc package operations"] = PortageCommandSequence(*abcd_seq)
 
     cross_prefix_seq = [
+        # Unmask dev-libs/C and dev-libs/D, and build binpkgs of dev-libs/A
+        # and dev-libs/B for --usepkgonly below.
+        Emerge(
+            "--autounmask",
+            "--autounmask-continue",
+            "dev-libs/C",
+            env_mod={"EMERGE_DEFAULT_OPTS": "--autounmask=n"},
+        ),
+        Emerge("-B", "dev-libs/A", "dev-libs/B"),
         # Test cross-prefix usage, including chpathtool for binpkgs.
         # EAPI 7
         Emerge("dev-libs/C", env_mod={"EPREFIX": cross_prefix}),
@@ -800,6 +806,9 @@ def _generate_all_baseline_commands(playground, binhost):
     with open(binrepos_conf_file, "w") as f:
         f.write("[test-binhost]\n")
         f.write(f"sync-uri = {binhost_uri}\n")
+        if binpkg_format == "xpak":
+            f.write("verify-signature = false\n")
+
     fetchcommand = shlex.split(settings["FETCHCOMMAND"])
     fetch_bin = portage.process.find_binary(fetchcommand[0])
 
@@ -842,6 +851,8 @@ def _generate_all_baseline_commands(playground, binhost):
             with open(binrepos_conf_file, "w") as f:
                 f.write("[test-binhost]\n")
                 f.write(f"sync-uri = file://{binhost_dir}\n")
+                if binpkg_format == "xpak":
+                    f.write("verify-signature = false\n")
 
         getbinpkgonly_file_uri = Emerge(
             "-fe",

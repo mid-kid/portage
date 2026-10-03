@@ -1,29 +1,28 @@
-# Copyright 2014-2024 Gentoo Authors
+# Copyright 2014-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import sys
-import logging
 import grp
+import logging
+import os
 import pwd
-import warnings
+import sys
+
+from _emerge.CompositeTask import CompositeTask
 
 import portage
-from portage import os
+from portage.metadata import action_metadata
+from portage.output import create_color_func
+from portage.package.ebuild.doebuild import _check_temp_dir
 from portage.progress import ProgressBar
 
 # from portage.emaint.defaults import DEFAULT_OPTIONS
 from portage.util import writemsg, writemsg_level
-from portage.output import create_color_func
+from portage.util._async.AsyncFunction import AsyncFunction
+from portage.util.hooks import get_hooks_from_dir
 
 good = create_color_func("GOOD")
 bad = create_color_func("BAD")
 warn = create_color_func("WARN")
-from portage.package.ebuild.doebuild import _check_temp_dir
-from portage.metadata import action_metadata
-from portage.util.hooks import get_hooks_from_dir
-from portage.util._async.AsyncFunction import AsyncFunction
-from portage import _unicode_decode
-from _emerge.CompositeTask import CompositeTask
 
 
 class TaskHandler:
@@ -102,17 +101,6 @@ class SyncManager:
     @property
     def module_names(self):
         return self.module_controller.module_names
-
-    def __getattr__(self, name):
-        if name == "async":
-            warnings.warn(
-                "portage.sync.controller.SyncManager.async "
-                "has been renamed to sync_async",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            return self.sync_async
-        raise AttributeError(name)
 
     def get_module_descriptions(self, mod):
         desc = self.module_controller.get_func_descriptions(mod)
@@ -200,7 +188,7 @@ class SyncManager:
             _hooks = self.hooks["postsync.d"]
         for filepath in _hooks:
             writemsg_level(
-                f"Spawning post_sync hook: {_unicode_decode(_hooks[filepath])}\n",
+                f"Spawning post_sync hook: {_hooks[filepath]}\n",
                 level=logging.ERROR,
                 noiselevel=4,
             )
@@ -213,8 +201,7 @@ class SyncManager:
                 retval = portage.process.spawn([filepath], env=self.settings.environ())
             if retval != os.EX_OK:
                 writemsg_level(
-                    " %s Spawn failed for: %s, %s\n"
-                    % (bad("*"), _unicode_decode(_hooks[filepath]), filepath),
+                    f" {bad('*')} Spawn failed for: {_hooks[filepath]}, {filepath}\n",
                     level=logging.ERROR,
                     noiselevel=-1,
                 )
@@ -286,7 +273,7 @@ class SyncManager:
                 return (logname, user, group, home)
 
             # user or user:group
-            (logname, uid, gid, home) = get_sync_user_data(repo.sync_user)
+            logname, uid, gid, home = get_sync_user_data(repo.sync_user)
             if uid is not None:
                 spawn_kwargs["uid"] = uid
                 self.usersync_uid = uid
@@ -395,7 +382,7 @@ class SyncRepo(CompositeTask):
     by SyncScheduler.
     """
 
-    __slots__ = ("sync_task", "sync_callback")
+    __slots__ = ("sync_callback", "sync_task")
 
     @property
     def kwargs(self):

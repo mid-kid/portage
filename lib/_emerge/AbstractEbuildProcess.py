@@ -3,32 +3,37 @@
 
 import functools
 import io
+import os
 import stat
 import textwrap
-from _emerge.SpawnProcess import SpawnProcess
-from _emerge.EbuildBuildDir import EbuildBuildDir
-from _emerge.EbuildIpcDaemon import EbuildIpcDaemon
+
 import portage
-from portage.elog import messages as elog_messages
 from portage import installation
+from portage.elog import messages as elog_messages
 from portage.package.ebuild._ipc.ExitCommand import ExitCommand
 from portage.package.ebuild._ipc.QueryCommand import QueryCommand
-from portage import os
-from portage.util.futures import asyncio
 from portage.util import apply_secpass_permissions, no_color
-import time
+from portage.util.futures import asyncio
 
+from _emerge.EbuildBuildDir import EbuildBuildDir
+from _emerge.EbuildIpcDaemon import EbuildIpcDaemon
+from _emerge.SpawnProcess import SpawnProcess
+
+import time
 
 class AbstractEbuildProcess(SpawnProcess):
     __slots__ = (
-        "phase",
-        "settings",
         "_build_dir",
         "_build_dir_unlock",
-        "_ipc_daemon",
+        "_alive_pipe",
         "_exit_command",
+        "_exit_pipe",
+        "_exit_status",
         "_exit_timeout_id",
+        "_ipc_daemon",
         "_start_future",
+        "phase",
+        "settings",
         "_time_start"
     )
 
@@ -150,6 +155,8 @@ class AbstractEbuildProcess(SpawnProcess):
 
         if self.fd_pipes is None:
             self.fd_pipes = {}
+        else:
+            self.fd_pipes = self.fd_pipes.copy()
         null_fd = None
         if (
             0 not in self.fd_pipes
@@ -159,12 +166,95 @@ class AbstractEbuildProcess(SpawnProcess):
             null_fd = os.open("/dev/null", os.O_RDONLY)
             self.fd_pipes[0] = null_fd
 
+        exit_fd = None
+        alive_fd = None
+        if start_ipc_daemon:
+            exit_fd = self._start_exit_pipe()
+            alive_fd = self._start_alive_pipe()
+
         self.log_filter_file = self.settings.get("PORTAGE_LOG_FILTER_FILE_CMD")
         try:
             SpawnProcess._start(self)
+        except BaseException:
+            self._close_exit_pipe()
+            self._close_alive_pipe()
+            raise
         finally:
             if null_fd is not None:
                 os.close(null_fd)
+            if exit_fd is not None:
+                os.close(exit_fd)
+                self.settings.pop("PORTAGE_EBUILD_EXIT_FD", None)
+            if alive_fd is not None:
+                os.close(alive_fd)
+                self.settings.pop("PORTAGE_IPC_ALIVE_FD", None)
+
+    def _start_exit_pipe(self):
+        """
+        Create the pipe that the ebuild reports its exit status on, and
+        return the write end, for the caller to close once the ebuild
+        process has inherited it.
+        """
+        self._exit_pipe, write_fd = os.pipe()
+        os.set_blocking(self._exit_pipe, False)
+        # Re-use of the allocated fd number for the key in fd_pipes
+        # guarantees that the key will not collide with the keys of
+        # similarly allocated pipes.
+        self.fd_pipes[write_fd] = write_fd
+        self.settings["PORTAGE_EBUILD_EXIT_FD"] = str(write_fd)
+        self.scheduler.add_reader(self._exit_pipe, self._exit_pipe_handler)
+        return write_fd
+
+    def _start_alive_pipe(self):
+        """
+        Create the pipe that tells the ebuild whether the daemon is still
+        running, and return the read end, for the caller to close once
+        the ebuild process has inherited it. Only this process holds the
+        write end, so the read end reports POLLHUP as soon as the daemon
+        can no longer answer.
+        """
+        read_fd, self._alive_pipe = os.pipe()
+        self.fd_pipes[read_fd] = read_fd
+        self.settings["PORTAGE_IPC_ALIVE_FD"] = str(read_fd)
+        return read_fd
+
+    def _close_alive_pipe(self):
+        if self._alive_pipe is None:
+            return
+        os.close(self._alive_pipe)
+        self._alive_pipe = None
+
+    def _exit_pipe_handler(self):
+        try:
+            data = os.read(self._exit_pipe, 64)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+
+        if not data:
+            # The ebuild process and everything it left behind are gone.
+            self._close_exit_pipe()
+            return
+
+        if self._exit_status is not None:
+            # Ignore all but the first status, since if die is called
+            # then we certainly want to honor that one.
+            return
+
+        try:
+            self._exit_status = int(data.split(b"\n")[0])
+        except ValueError:
+            return
+
+        self._exit_command_callback()
+
+    def _close_exit_pipe(self):
+        if self._exit_pipe is None:
+            return
+        self.scheduler.remove_reader(self._exit_pipe)
+        os.close(self._exit_pipe)
+        self._exit_pipe = None
 
     def _init_ipc_fifos(self):
         input_fifo = os.path.join(self.settings["PORTAGE_BUILDDIR"], ".ipc", "in")
@@ -328,8 +418,16 @@ class AbstractEbuildProcess(SpawnProcess):
 
         if self._ipc_daemon is not None:
             self._ipc_daemon.cancel()
-            if self._exit_command.exitcode is not None:
-                self.returncode = self._exit_command.exitcode
+            self._close_alive_pipe()
+            # The ebuild may have reported its status just before it
+            # exited, without the event loop having read it yet.
+            if self._exit_pipe is not None:
+                self._exit_pipe_handler()
+            self._close_exit_pipe()
+            if self._exit_status is None:
+                self._exit_status = self._exit_command.exitcode
+            if self._exit_status is not None:
+                self.returncode = self._exit_status
             else:
                 if self.returncode < 0:
                     if not self.cancelled:

@@ -7,8 +7,6 @@ import io
 import os
 import stat
 
-from portage import _encodings
-from portage import _unicode_encode
 from portage.util._xattr import XATTRS_WORKS, xattr
 
 
@@ -27,12 +25,8 @@ def compare_files(file1, file2, skipped_types=()):
     @return: Tuple of strings specifying types of properties different between compared files
     """
 
-    file1_stat = os.lstat(
-        _unicode_encode(file1, encoding=_encodings["fs"], errors="strict")
-    )
-    file2_stat = os.lstat(
-        _unicode_encode(file2, encoding=_encodings["fs"], errors="strict")
-    )
+    file1_stat = os.lstat(file1)
+    file2_stat = os.lstat(file2)
 
     differences = []
 
@@ -91,29 +85,17 @@ def compare_files(file1, file2, skipped_types=()):
     else:
         if "content" not in skipped_types:
             if stat.S_ISLNK(file1_stat.st_mode):
-                file1_stream = io.BytesIO(
-                    os.readlink(
-                        _unicode_encode(
-                            file1, encoding=_encodings["fs"], errors="strict"
-                        )
-                    )
-                )
+                file1_stream = io.BytesIO(os.readlink(os.fsencode(file1)))
             else:
                 file1_stream = open(
-                    _unicode_encode(file1, encoding=_encodings["fs"], errors="strict"),
+                    file1,
                     "rb",
                 )
             if stat.S_ISLNK(file2_stat.st_mode):
-                file2_stream = io.BytesIO(
-                    os.readlink(
-                        _unicode_encode(
-                            file2, encoding=_encodings["fs"], errors="strict"
-                        )
-                    )
-                )
+                file2_stream = io.BytesIO(os.readlink(os.fsencode(file2)))
             else:
                 file2_stream = open(
-                    _unicode_encode(file2, encoding=_encodings["fs"], errors="strict"),
+                    file2,
                     "rb",
                 )
             while True:

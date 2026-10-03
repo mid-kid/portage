@@ -3,9 +3,9 @@
 
 __all__ = ("MaskManager",)
 
+import os
 import warnings
 
-from portage import os
 from portage.dep import ExtendedAtomDict, match_from_list
 from portage.localization import _
 from portage.repository.config import allow_profile_repo_deps
@@ -71,14 +71,14 @@ class MaskManager:
             lines = []
             repo_lines = grab_pmask(repo.location, repo)
             removals = frozenset(
-                line[0][1:] for line in repo_lines if line[0][:1] == "-"
+                str(line[0])[1:] for line in repo_lines if str(line[0])[:1] == "-"
             )
             matched_removals = set()
             for master in repo.masters:
                 master_lines = grab_pmask(master.location, master)
                 for line in master_lines:
-                    if line[0] in removals:
-                        matched_removals.add(line[0])
+                    if str(line[0]) in removals:
+                        matched_removals.add(str(line[0]))
                 # Since we don't stack masters recursively, there aren't any
                 # atoms earlier in the stack to be matched by negative atoms in
                 # master_lines. Also, repo_lines may contain negative atoms

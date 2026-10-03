@@ -24,12 +24,12 @@ The test also works with pytest-xdist, e.g.::
 
 """
 
+import os
 import subprocess
 
 import pytest
 
 import portage
-from portage import os
 from portage.const import (
     PORTAGE_PYM_PATH,
     USER_CONFIG_PATH,
@@ -38,7 +38,6 @@ from portage.process import find_binary
 from portage.tests import cnf_etc_path
 from portage.util import ensure_dirs
 from portage.util.futures import asyncio
-
 
 _METADATA_XML_FILES = (
     (
@@ -132,6 +131,7 @@ async def _async_test_baseline(playground, binhost, commands):
         "PORTAGE_PYTHON": portage._python_interpreter,
         "PORTAGE_REPOSITORIES": settings.repositories.config_string(),
         "PORTAGE_TMPDIR": portage_tmpdir,
+        "PORTAGE_TRUST_HELPER": "getuto",
         "PORTAGE_LOGDIR": portage_tmpdir,
         "PYTHONDONTWRITEBYTECODE": os.environ.get("PYTHONDONTWRITEBYTECODE", ""),
         "PYTHONPATH": pythonpath,
@@ -142,6 +142,11 @@ async def _async_test_baseline(playground, binhost, commands):
         env["__PORTAGE_TEST_HARDLINK_LOCKS"] = os.environ[
             "__PORTAGE_TEST_HARDLINK_LOCKS"
         ]
+
+    # Allow the suite to be run against a dependency calculation which
+    # happens in a child process (bug 549906).
+    if "PORTAGE_FORK_DEP_CALC" in os.environ:
+        env["PORTAGE_FORK_DEP_CALC"] = os.environ["PORTAGE_FORK_DEP_CALC"]
 
     updates_dir = os.path.join(test_repo_location, "profiles", "updates")
     dirs = [
@@ -160,7 +165,7 @@ async def _async_test_baseline(playground, binhost, commands):
     # Override things that may be unavailable, or may have portability
     # issues when running tests in exotic environments.
     #   prepstrip - bug #447810 (bash read builtin EINTR problem)
-    true_symlinks = ["find", "prepstrip", "sed", "scanelf"]
+    true_symlinks = ["find", "prepstrip", "sed", "scanelf", "getuto"]
     true_binary = find_binary("true")
     assert true_binary is not None, "true command not found"
 

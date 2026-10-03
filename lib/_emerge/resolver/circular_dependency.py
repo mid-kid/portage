@@ -2,30 +2,41 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import logging
+from itertools import chain, product
+
+from portage.dep import (
+    Atom,
+    check_required_use,
+    extract_affecting_use,
+    get_required_use_flags,
+    use_reduce,
+)
+from portage.exception import InvalidDependString
+from portage.output import blue, colorize, red
+from portage.util import writemsg_level
 
 from _emerge.DepPrioritySatisfiedRange import DepPrioritySatisfiedRange
 from _emerge.Package import Package
 
-from itertools import chain, product
-
-from portage.dep import (
-    use_reduce,
-    extract_affecting_use,
-    check_required_use,
-    get_required_use_flags,
-)
-from portage.exception import InvalidDependString
-from portage.output import colorize
-from portage.util import writemsg_level
-
 
 class circular_dependency_handler:
+    # Default number of USE flags that are explored per cycle edge. The
+    # number of combinations is exponential in this, so raising it can be
+    # slow (bug 555698, bug 374397).
     MAX_AFFECTING_USE = 10
 
     def __init__(self, depgraph, graph):
         self.depgraph = depgraph
         self.graph = graph
         self.all_parent_atoms = depgraph._dynamic_config._parent_atoms
+        self.max_affecting_use = self._get_max_affecting_use()
+        # Packages for which the search for a USE change was given up
+        # on, so that the user is not told that no solution exists.
+        self.search_truncated = set()
+        # Solutions, keyed by the package whose USE flags have to
+        # change. Unlike self.solutions, this identifies the package
+        # that the change applies to.
+        self.parent_solutions = {}
 
         if "--debug" in depgraph._frozen_config.myopts:
             # Show this debug output before doing the calculations
@@ -45,15 +56,27 @@ class circular_dependency_handler:
         self.circular_dep_message = self._prepare_circular_dep_message()
         # Suggestions, in machine and human readable form
         self.solutions, self.suggestions = self._find_suggestions()
+        # Packages in the cycle whose test dependencies are involved
+        self.test_dep_parents = self._find_test_dep_parents()
+        # Masked packages that could be used instead of a cycle member
+        self.masked_alternatives = self._find_masked_alternatives()
 
     def _find_cycles(self):
-        shortest_cycle = None
-        cycles = self.graph.get_cycles(
-            ignore_priority=DepPrioritySatisfiedRange.ignore_medium_soft
-        )
-        for cycle in cycles:
-            if not shortest_cycle or len(cycle) < len(shortest_cycle):
-                shortest_cycle = cycle
+        # Ignoring soft dependencies usually gives the most relevant
+        # cycles, but a cycle can consist entirely of dependencies that
+        # would be ignored at that level. Lower the threshold until a
+        # cycle is found, so that we never report a cycle without being
+        # able to show it (bug 929010).
+        ignore_priorities = DepPrioritySatisfiedRange.ignore_priority
+        highest = ignore_priorities.index(DepPrioritySatisfiedRange.ignore_medium_soft)
+        for ignore_priority in reversed(ignore_priorities[: highest + 1]):
+            shortest_cycle = None
+            cycles = self.graph.get_cycles(ignore_priority=ignore_priority)
+            for cycle in cycles:
+                if not shortest_cycle or len(cycle) < len(shortest_cycle):
+                    shortest_cycle = cycle
+            if shortest_cycle is not None:
+                break
         return cycles, shortest_cycle
 
     def _prepare_reduced_merge_list(self):
@@ -74,6 +97,231 @@ class circular_dependency_handler:
             tempgraph.remove(node)
         return tuple(display_order)
 
+    def _dep_string(self, parent, priority):
+        """
+        Return the dependency string of parent that the given priority
+        was derived from, or None if the priority does not correspond to
+        a dependency string that USE flags can influence.
+        """
+        if not isinstance(parent, Package):
+            return None
+        if priority.buildtime:
+            return " ".join(parent._metadata[k] for k in Package._buildtime_keys)
+        if priority.runtime:
+            return parent._metadata["RDEPEND"]
+        if priority.runtime_post:
+            return parent._metadata["PDEPEND"]
+        return None
+
+    def _parent_atom(self, parent, pkg):
+        """
+        Return the atom of parent that pulls in pkg, or None.
+        """
+        for ppkg, atom in self.all_parent_atoms.get(pkg, ()):
+            if ppkg == parent:
+                return atom
+        return None
+
+    def _affecting_use(self, parent, pkg, priority):
+        """
+        Return the USE flags of parent that are responsible for the
+        dependency on pkg (bug 310613).
+        """
+        dep = self._dep_string(parent, priority)
+        parent_atom = self._parent_atom(parent, pkg)
+        if not dep or parent_atom is None or not parent_atom.package:
+            return frozenset()
+
+        try:
+            affecting_use = extract_affecting_use(
+                dep, parent_atom.unevaluated_atom, eapi=parent.eapi
+            )
+        except InvalidDependString:
+            return frozenset()
+
+        # extract_affecting_use() returns every flag that the dependency
+        # is nested under, including flags whose current setting is not
+        # what pulls it in. Blame the flags that the dependency goes away
+        # without, so that a flag under "!flag? ( )" is named while it is
+        # disabled, and an unconditional dependency that also appears
+        # under "flag? ( )" is blamed on nothing.
+        unevaluated_atom = parent_atom.unevaluated_atom
+        use = frozenset(self.depgraph._pkg_use_enabled(parent))
+        flipped = use ^ frozenset(affecting_use)
+
+        responsible = {
+            flag
+            for flag in affecting_use
+            if not self._depends_on(parent, dep, use ^ {flag}, unevaluated_atom)
+        }
+
+        if not self._depends_on(parent, dep, flipped, unevaluated_atom):
+            # No flag is enough on its own, but together they do control
+            # the dependency, as in "a? ( x ) b? ( x )" with both
+            # enabled. Blame each flag that keeps it alive by itself.
+            responsible.update(
+                flag
+                for flag in affecting_use
+                if self._depends_on(parent, dep, flipped ^ {flag}, unevaluated_atom)
+            )
+
+        return frozenset(responsible)
+
+    def _depends_on(self, parent, dep, use, unevaluated_atom):
+        """
+        Return True if dep still pulls in unevaluated_atom when the USE
+        flags of parent are set to use.
+        """
+        try:
+            atoms = use_reduce(
+                dep,
+                uselist=use,
+                is_valid_flag=parent.iuse.is_valid_flag,
+                flat=True,
+                token_class=Atom,
+                eapi=parent.eapi,
+            )
+        except InvalidDependString:
+            # Assume the worst, so that a flag is not blamed for a
+            # dependency that we cannot evaluate.
+            return True
+
+        return any(
+            isinstance(atom, Atom) and atom.unevaluated_atom == unevaluated_atom
+            for atom in atoms
+        )
+
+    def _edge_description(self, parent, pkg):
+        priorities = self.graph.nodes[parent][0][pkg]
+        description = str(priorities[-1])
+        affecting_use = self._affecting_use(parent, pkg, priorities[-1])
+        if affecting_use:
+            use = self.depgraph._pkg_use_enabled(parent)
+            flags = " ".join(
+                red(flag) if flag in use else blue("-" + flag)
+                for flag in sorted(affecting_use)
+            )
+            description += f", USE={flags}"
+        return description
+
+    def _find_test_dep_parents(self):
+        """
+        Return the packages in the cycle that pull in a cycle member via
+        their test dependencies (bug 416871, bug 703348). These cycles
+        can be avoided without changing the installed USE configuration,
+        by disabling FEATURES=test for the affected packages.
+        """
+        parents = set()
+        if not self.shortest_cycle:
+            return frozenset(parents)
+
+        for pos, pkg in enumerate(self.shortest_cycle):
+            parent = self.shortest_cycle[pos - 1]
+            priorities = self.graph.nodes[parent][0][pkg]
+            if "test" in self._affecting_use(parent, pkg, priorities[-1]):
+                parents.add(parent)
+
+        return frozenset(parents)
+
+    def _iter_any_of_alternatives(self, dep, parent_atom):
+        """
+        Yield the atoms of every || ( ) group of dep that contains
+        parent_atom, except those of the choice that contains it.
+        """
+        # Compare unevaluated atoms, since parent_atom and the atoms of
+        # dep are not necessarily evaluated with the same USE flags.
+        unevaluated_atom = parent_atom.unevaluated_atom
+
+        def _is_parent_atom(node):
+            return isinstance(node, Atom) and node.unevaluated_atom == unevaluated_atom
+
+        def _flatten(node):
+            if isinstance(node, list):
+                for child in node:
+                    yield from _flatten(child)
+            else:
+                yield node
+
+        def _walk(node):
+            if not isinstance(node, list):
+                return
+            if node and node[0] == "||":
+                choices = [list(_flatten(choice)) for choice in node[1:]]
+                matched = [any(_is_parent_atom(x) for x in c) for c in choices]
+                if any(matched):
+                    for choice, choice_matched in zip(choices, matched):
+                        if choice_matched:
+                            continue
+                        yield from choice
+            for child in node:
+                yield from _walk(child)
+
+        yield from _walk(dep)
+
+    def _find_masked_alternatives(self):
+        """
+        Return a mapping of cycle member to masked packages that could
+        satisfy a || ( ) choice instead of it. Cycles that involve a
+        bootstrap package which is not keyworded are common, and the
+        masked candidate is never considered because || ( ) preferences
+        are evaluated with autounmask disabled (bug 971256).
+        """
+        alternatives = {}
+        if not self.shortest_cycle:
+            return alternatives
+
+        for pos, pkg in enumerate(self.shortest_cycle):
+            parent = self.shortest_cycle[pos - 1]
+            priorities = self.graph.nodes[parent][0][pkg]
+            dep = self._dep_string(parent, priorities[-1])
+            parent_atom = self._parent_atom(parent, pkg)
+            if not dep or parent_atom is None or not parent_atom.package:
+                continue
+
+            try:
+                dep = use_reduce(
+                    dep,
+                    uselist=self.depgraph._pkg_use_enabled(parent),
+                    is_valid_flag=parent.iuse.is_valid_flag,
+                    opconvert=True,
+                    token_class=Atom,
+                    eapi=parent.eapi,
+                )
+            except InvalidDependString:
+                continue
+
+            for atom in self._iter_any_of_alternatives(dep, parent_atom):
+                if not isinstance(atom, Atom) or not atom.package or atom.blocker:
+                    continue
+                candidates = list(
+                    self.depgraph._iter_match_pkgs_any(parent.root_config, atom)
+                )
+                if any(x.installed or x.visible for x in candidates):
+                    # An acceptable package exists, so it was rejected
+                    # for some other reason and unmasking would not help.
+                    continue
+
+                maskable = [x for x in candidates if self._maskable_by_config(x)]
+                if maskable:
+                    alternatives.setdefault(pkg, set()).add(max(maskable))
+
+        return alternatives
+
+    def _maskable_by_config(self, pkg):
+        """
+        Return True if every mask on pkg can be lifted with a
+        configuration change (keywords, package.mask, license).
+        """
+        # Imported here because _emerge.depgraph imports this module.
+        from _emerge.depgraph import _get_masking_status
+
+        pkgsettings = self.depgraph._frozen_config.pkgsettings[pkg.root]
+        root_config = self.depgraph._frozen_config.roots[pkg.root]
+        mreasons = _get_masking_status(pkg, pkgsettings, root_config)
+        if not mreasons:
+            return False
+        return all(reason.unmask_hint is not None for reason in mreasons)
+
     def _prepare_circular_dep_message(self):
         """
         Like digraph.debug_print(), but prints only the shortest cycle.
@@ -85,17 +333,15 @@ class circular_dependency_handler:
         indent = ""
         for pos, pkg in enumerate(self.shortest_cycle):
             parent = self.shortest_cycle[pos - 1]
-            priorities = self.graph.nodes[parent][0][pkg]
             if pos > 0:
-                msg.append(indent + f"{pkg} ({priorities[-1]})")
+                msg.append(indent + f"{pkg} ({self._edge_description(parent, pkg)})")
             else:
                 msg.append(indent + f"{pkg} depends on")
             indent += " "
 
         pkg = self.shortest_cycle[0]
         parent = self.shortest_cycle[-1]
-        priorities = self.graph.nodes[parent][0][pkg]
-        msg.append(indent + f"{pkg} ({priorities[-1]})")
+        msg.append(indent + f"{pkg} ({self._edge_description(parent, pkg)})")
 
         return "\n".join(msg)
 
@@ -112,6 +358,30 @@ class circular_dependency_handler:
         use, changes = needed_use_config_change
         return frozenset(changes.keys())
 
+    def _get_max_affecting_use(self):
+        """
+        Return the number of USE flags to explore per cycle edge, which
+        PORTAGE_CIRCULAR_MAX_USE_FLAGS can raise when the extra search
+        time is acceptable.
+        """
+        settings = self.depgraph._frozen_config.settings
+        value = settings.get("PORTAGE_CIRCULAR_MAX_USE_FLAGS")
+        if value:
+            try:
+                limit = int(value)
+            except ValueError:
+                limit = 0
+            if limit >= 1:
+                return limit
+            writemsg_level(
+                f"!!! Invalid PORTAGE_CIRCULAR_MAX_USE_FLAGS: {value}\n"
+                f"!!! Expected an integer greater than zero, using "
+                f"{self.MAX_AFFECTING_USE} instead.\n",
+                level=logging.ERROR,
+                noiselevel=-1,
+            )
+        return self.MAX_AFFECTING_USE
+
     def _find_suggestions(self):
         if not self.shortest_cycle:
             return None, None
@@ -122,18 +392,18 @@ class circular_dependency_handler:
         for pos, pkg in enumerate(self.shortest_cycle):
             parent = self.shortest_cycle[pos - 1]
             priorities = self.graph.nodes[parent][0][pkg]
-            parent_atoms = self.all_parent_atoms.get(pkg)
 
-            if priorities[-1].buildtime:
-                dep = " ".join(parent._metadata[k] for k in Package._buildtime_keys)
-            elif priorities[-1].runtime:
-                dep = parent._metadata["RDEPEND"]
+            if priorities[-1].buildtime or priorities[-1].runtime:
+                dep = self._dep_string(parent, priorities[-1])
+            else:
+                # The edge does not come from a dependency string that
+                # we can manipulate with USE flags.
+                continue
 
-            for ppkg, atom in parent_atoms:
-                if ppkg == parent:
-                    changed_parent = ppkg
-                    parent_atom = atom
-                    break
+            parent_atom = self._parent_atom(parent, pkg)
+            if dep is None or parent_atom is None:
+                continue
+            changed_parent = parent
 
             if parent_atom.package:
                 parent_atom = parent_atom.unevaluated_atom
@@ -179,7 +449,7 @@ class circular_dependency_handler:
                 total_flags = set()
                 total_flags.update(affecting_use, required_use_flags)
                 total_flags.difference_update(untouchable_flags)
-                if len(total_flags) <= self.MAX_AFFECTING_USE:
+                if len(total_flags) <= self.max_affecting_use:
                     affecting_use = total_flags
 
             affecting_use = tuple(affecting_use)
@@ -187,7 +457,7 @@ class circular_dependency_handler:
             if not affecting_use:
                 continue
 
-            if len(affecting_use) > self.MAX_AFFECTING_USE:
+            if len(affecting_use) > self.max_affecting_use:
                 # Limit the number of combinations explored (bug #555698).
                 # First, discard irrelevant flags that are not enabled.
                 # Since extract_affecting_use doesn't distinguish between
@@ -198,9 +468,10 @@ class circular_dependency_handler:
                     flag for flag in affecting_use if flag in current_use
                 )
 
-                if len(affecting_use) > self.MAX_AFFECTING_USE:
+                if len(affecting_use) > self.max_affecting_use:
                     # There are too many USE combinations to explore in
                     # a reasonable amount of time.
+                    self.search_truncated.add(parent)
                     continue
 
             # We iterate over all possible settings of these use flags and gather
@@ -294,6 +565,7 @@ class circular_dependency_handler:
                     )
                 suggestions.append(msg)
                 final_solutions.setdefault(pkg, set()).add(solution)
+                self.parent_solutions.setdefault(changed_parent, set()).add(solution)
 
         return final_solutions, suggestions
 
@@ -308,6 +580,11 @@ class circular_dependency_handler:
                 ignore_priority=DepPrioritySatisfiedRange.ignore_medium_soft
             )
             if not root_nodes:
+                break
+            if len(root_nodes) == len(graph.order):
+                # Pruning would leave nothing to display, so show the
+                # last non-empty state instead of nothing at all
+                # (bug 929010).
                 break
             graph.difference_update(root_nodes)
 

@@ -2,18 +2,17 @@
 # Similar to test_gpkg_gpg.py but
 # with full emerge calls to test how we control signature verification.
 
-import portage
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
-import subprocess
 
-from portage import os
-from portage import shutil
+import portage
 from portage.const import PORTAGE_PYM_PATH, USER_CONFIG_PATH
 from portage.gpg import GPG
 from portage.process import find_binary
-from portage.tests import TestCase, CommandStep, FunctionStep
+from portage.tests import CommandStep, FunctionStep, TestCase
 from portage.tests.resolver.ResolverPlayground import ResolverPlayground
 from portage.util import ensure_dirs
 
@@ -195,7 +194,6 @@ class test_gpkg_gpg_emerge_case(TestCase):
                     returncode=not os.EX_OK,
                     env={
                         "FEATURES": "binpkg-request-signature",
-                        "PORTAGE_TRUST_HELPER": "true",
                     },
                     command=emerge_cmd
                     + (
@@ -235,6 +233,7 @@ class test_gpkg_gpg_emerge_case(TestCase):
                 "PATH": path,
                 "PORTAGE_PYTHON": portage_python,
                 "PORTAGE_REPOSITORIES": settings.repositories.config_string(),
+                "PORTAGE_TRUST_HELPER": "getuto",
                 "PYTHONDONTWRITEBYTECODE": os.environ.get(
                     "PYTHONDONTWRITEBYTECODE", ""
                 ),
@@ -251,7 +250,7 @@ class test_gpkg_gpg_emerge_case(TestCase):
                 user_config_dir,
                 var_cache_edb,
             ]
-            true_symlinks = ["chown", "chgrp"]
+            true_symlinks = ["chown", "chgrp", "getuto"]
             needed_binaries = {
                 "true": (find_binary("true"), True),
             }
@@ -300,7 +299,7 @@ class test_gpkg_gpg_emerge_case(TestCase):
                     proc.stdout.close()
                     if proc.returncode != step.returncode:
                         for line in output:
-                            sys.stderr.write(portage._unicode_decode(line))
+                            sys.stderr.write(line.decode("utf-8", "replace"))
 
                 self.assertEqual(
                     step.returncode,

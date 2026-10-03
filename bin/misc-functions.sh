@@ -203,6 +203,20 @@ install_qa_check() {
 		esac
 
 		if [[ -n ${scanelf_output} ]]; then
+			local -a no_soname
+			local -A shared_object
+			local desc
+
+			# Find which objects lacking a DT_SONAME are shared libraries.
+			while IFS=';' read -r _ obj soname _; do
+				[[ -z ${soname} ]] && no_soname+=( "${D%/}/${obj}" )
+			done <<< "${scanelf_output}"
+			if (( ${#no_soname[@]} )); then
+				while IFS= read -r -d '' f && IFS= read -r desc; do
+					[[ ${desc} == *"SB shared object"* ]] && shared_object[${f}]=1
+				done < <(printf '%s\n' "${no_soname[@]}" | file -S -r -0 -f -)
+			fi
+
 			while IFS= read -r l; do
 				arch=${l%%;*}; l=${l#*;}
 				obj="/${l%%;*}"; l=${l#*;}
@@ -211,7 +225,7 @@ install_qa_check() {
 				needed=${l%%;*}; l=${l#*;}
 
 				# Infer implicit soname from basename (bug 715162).
-				if [[ -z ${soname} && $(file -S "${D%/}${obj}") == *"SB shared object"* ]]; then
+				if [[ -z ${soname} && ${shared_object[${D%/}${obj}]} ]]; then
 					soname=${obj##*/}
 				fi
 
@@ -510,6 +524,7 @@ __generate_packdebug() {
 		return
 	fi
 
+	__vecho ">>> Creating packdebug tarball"
 	install -d "${debugpath}"/"${CATEGORY}"{,/"${PN}"} \
 		|| die "Failed to generate target debug directory"
 
@@ -533,6 +548,7 @@ __generate_packdebug() {
 	# in the real image but not in the binpkg. Unfortunately, we can't
 	# easily leverage PKG_INSTALL_MASK because of when it runs.
 	mv "${debugpath}" "${PORTAGE_BUILDDIR}/image/${EPREFIX}/usr/lib/debug/". || die
+	__vecho ">>> Done."
 }
 
 __dyn_package() {
@@ -577,6 +593,7 @@ __dyn_package() {
 		fi
 	fi
 
+	__vecho ">>> Creating binpkg"
 	if [[ "${BINPKG_FORMAT}" == "xpak" ]]; then
 		local tar_options=""
 
@@ -745,11 +762,7 @@ if [[ -n "${MISC_FUNCTIONS_ARGS}" ]]; then
 
 	if [[ -n ${PORTAGE_IPC_DAEMON} ]] ; then
 		[[ ! -s ${SANDBOX_LOG} ]]
-		# Signal the EbuildIpcDaemon to exit, without using ebuild-ipc.
-		# This is significantly faster, as it avoids python's startup time.
-		dd < "${PORTAGE_BUILDDIR}/.ipc/out" \
-			| printf '](V%s\nV%s\ne.' exit $? \
-			| dd > "${PORTAGE_BUILDDIR}/.ipc/in" 2> /dev/null
+		__ebuild_exit $?
 	fi
 fi
 

@@ -2,6 +2,18 @@
 # Copyright 1999-2023 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import locale
+import os
+import sys
+
+if (
+    sys.getfilesystemencoding().lower() != "utf-8"
+    or locale.getpreferredencoding(False).lower() != "utf-8"
+):
+    os.environ["PYTHONUTF8"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 #
 # Typical usage:
 # dohtml -r docs/*
@@ -28,10 +40,8 @@
 #  - will do as 'dohtml -r', but ignore directories named CVS, SCCS, RCS
 #
 
-import os as _os
-import sys
+import shutil
 
-from portage import _unicode_encode, _unicode_decode, os, shutil
 from portage.util import normalize_path, writemsg
 
 # Change back to original cwd _after_ all imports (bug #469338).
@@ -114,12 +124,12 @@ def install(basename, dirname, options, prefix=""):
         and os.path.isdir(fullpath)
         and basename not in options.disallowed_dirs
     ):
-        for i in _os.listdir(_unicode_encode(fullpath)):
+        for i in os.listdir(fullpath.encode("utf-8", "backslashreplace")):
             try:
-                i = _unicode_decode(i, errors="strict")
+                i = i.decode("utf-8", "strict")
             except UnicodeDecodeError:
                 writemsg(
-                    f"dohtml: argument is not encoded as UTF-8: {_unicode_decode(i)}\n",
+                    f"dohtml: argument is not encoded as UTF-8: {i.decode('utf-8', 'replace')}\n",
                     noiselevel=-1,
                 )
                 sys.exit(1)
@@ -194,10 +204,10 @@ def parse_args():
 
     for x, arg in enumerate(argv):
         try:
-            argv[x] = _unicode_decode(arg, errors="strict")
+            argv[x] = arg.decode("utf-8", "strict")
         except UnicodeDecodeError:
             writemsg(
-                f"dohtml: argument is not encoded as UTF-8: {_unicode_decode(arg)}\n",
+                f"dohtml: argument is not encoded as UTF-8: {arg.decode('utf-8', 'replace')}\n",
                 noiselevel=-1,
             )
             sys.exit(1)
@@ -243,7 +253,7 @@ def parse_args():
 
 
 def main():
-    (options, args) = parse_args()
+    options, args = parse_args()
 
     if options.verbose:
         print("Allowed extensions:", options.allowed_exts)

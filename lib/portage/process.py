@@ -1,7 +1,6 @@
 # portage.py -- core Portage functionality
-# Copyright 1998-2025 Gentoo Authors
+# Copyright 1998-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
-
 
 import asyncio as _asyncio
 import atexit
@@ -10,29 +9,24 @@ import fcntl
 import io
 import logging
 import multiprocessing
+import os
 import platform
 import signal
 import socket
 import subprocess
 import sys
 import traceback
-import os as _os
 import warnings
-
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import Any, Optional, Callable, Union
 from inspect import iscoroutinefunction
+from typing import Any, Callable, Optional, Union
 
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
 import portage
-
-from portage.const import BASH_BINARY, SANDBOX_BINARY, FAKEROOT_BINARY
+from portage.const import BASH_BINARY, FAKEROOT_BINARY, SANDBOX_BINARY
 from portage.exception import CommandNotFound
 from portage.proxy.objectproxy import ObjectProxy
-from portage.util._ctypes import load_libc, LoadLibrary, ctypes
+from portage.util._ctypes import LoadLibrary, ctypes, load_libc
 
 try:
     from portage.util.netlink import RtNetlink
@@ -47,18 +41,6 @@ try:
     max_fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
 except ImportError:
     max_fd_limit = 256
-
-
-# Support PEP 446 for Python >=3.4
-try:
-    _set_inheritable = _os.set_inheritable
-except AttributeError:
-    _set_inheritable = None
-
-try:
-    _FD_CLOEXEC = fcntl.FD_CLOEXEC
-except AttributeError:
-    _FD_CLOEXEC = None
 
 # Prefer /proc/self/fd if available (/dev/fd
 # doesn't work on solaris, see bug #474536).
@@ -117,21 +99,20 @@ def sanitize_fds():
     ensures that any unintentionally inherited file descriptors will
     not be inherited by child processes.
     """
-    if _set_inheritable is not None:
-        whitelist = frozenset(
-            [
-                portage._get_stdin().fileno(),
-                sys.__stdout__.fileno(),
-                sys.__stderr__.fileno(),
-            ]
-        )
+    whitelist = frozenset(
+        [
+            portage._get_stdin().fileno(),
+            sys.__stdout__.fileno(),
+            sys.__stderr__.fileno(),
+        ]
+    )
 
-        for fd in get_open_fds():
-            if fd not in whitelist:
-                try:
-                    _set_inheritable(fd, False)
-                except OSError:
-                    pass
+    for fd in get_open_fds():
+        if fd not in whitelist:
+            try:
+                os.set_inheritable(fd, False)
+            except OSError:
+                pass
 
 
 def spawn_bash(mycommand, debug=False, opt_name=None, **keywords):
@@ -298,8 +279,11 @@ _atexit_register_run_exitfuncs()
 
 class _dummy_list(list):
     def remove(self, item):
-        # TODO: Trigger a DeprecationWarning here, after stable portage
-        # has dummy spawned_pids.
+        warnings.warn(
+            "_dummy_list.remove() is no longer necessary for spawned_pids; drop the call",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         try:
             list.remove(self, item)
         except ValueError:
@@ -498,8 +482,7 @@ class MultiprocessingProcess(AbstractProcess):
                 if proc.exitcode is not None:
                     break
                 delay *= proc_join_interval_factor
-                if delay > proc_join_interval_max:
-                    delay = proc_join_interval_max
+                delay = min(delay, proc_join_interval_max)
                 await _asyncio.sleep(delay)
 
         # We can only safely create a new thread to await the join if
@@ -564,6 +547,7 @@ def spawn(
     unshare_ipc=False,
     unshare_mount=False,
     unshare_pid=False,
+    cgroup=None,
     warn_on_large_env=False,
 ) -> Union[int, MultiprocessingProcess, list[int]]:
     """
@@ -681,7 +665,7 @@ def spawn(
             raise ValueError(fd_pipes)
 
         # Create a pipe
-        (pr, pw) = os.pipe()
+        pr, pw = os.pipe()
 
         # Create a tee process, giving it our stdout and stderr
         # as well as the read end of the pipe.
@@ -756,6 +740,7 @@ def spawn(
             unshare_pid,
             unshare_flags,
             env_stats,
+            cgroup,
         ),
         fd_pipes=fd_pipes,
         close_fds=close_fds,
@@ -766,7 +751,7 @@ def spawn(
         return pid
 
     if returnpid and not isinstance(pid, int):
-        raise AssertionError(f"fork returned non-integer: {repr(pid)}")
+        raise AssertionError(f"fork returned non-integer: {pid!r}")
 
     # Add the pid to our local and the global pid lists.
     mypids.append(pid)
@@ -831,25 +816,21 @@ def has_ipv6():
     """
     global __has_ipv6
 
-    if __has_ipv6 is None:
-        if socket.has_ipv6:
-            sock = None
-            try:
-                # With ipv6.disable=0 and ipv6.disable_ipv6=1, socket creation
-                # succeeds, but then the bind call fails with this error:
-                # [Errno 99] Cannot assign requested address.
-                sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    if __has_ipv6 is not None:
+        return __has_ipv6
+
+    __has_ipv6 = False
+    if socket.has_ipv6:
+        try:
+            # With ipv6.disable=0 and ipv6.disable_ipv6=1, socket creation
+            # succeeds, but then the bind call fails with this error:
+            # [Errno 99] Cannot assign requested address.
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
                 sock.bind(("::1", 0))
-            except OSError:
-                __has_ipv6 = False
-            else:
-                __has_ipv6 = True
-            finally:
-                # python2.7 sockets do not support context management protocol
-                if sock is not None:
-                    sock.close()
-        else:
-            __has_ipv6 = False
+
+            __has_ipv6 = True
+        except OSError:
+            pass
 
     return __has_ipv6
 
@@ -909,6 +890,7 @@ def _exec_wrapper(
     unshare_pid,
     unshare_flags,
     env_stats,
+    cgroup=None,
 ):
     """
     Calls _exec with the given args and handles any raised Exception.
@@ -916,6 +898,16 @@ def _exec_wrapper(
     other process cloning implementations besides _start_fork.
     """
     from portage.util import writemsg
+
+    if cgroup:
+        try:
+            with open(os.path.join(cgroup, "cgroup.procs"), "w", encoding="ascii") as f:
+                f.write(str(os.getpid()))
+        except OSError as e:
+            writemsg(
+                f"!!! cgroup: cannot add pid {os.getpid()} to {cgroup}: {e}\n",
+                noiselevel=-1,
+            )
 
     try:
         _exec(
@@ -953,8 +945,21 @@ def _exec_wrapper(
             writemsg(
                 f"ERROR: Executing {mycommand} failed with E2BIG. Child process environment size: {env_stats.env_size} bytes. Largest environment variable: {env_stats.env_largest_name} ({env_stats.env_largest_size} bytes)\n"
             )
-        writemsg(f"{e}:\n   {' '.join(mycommand)}\n", noiselevel=-1)
+        writemsg(f"{e}:\n   {' '.join(str(x) for x in mycommand)}\n", noiselevel=-1)
         raise
+
+
+_FORWARD_SIGNALS = (
+    signal.SIGINT,
+    signal.SIGTERM,
+    signal.SIGHUP,
+    signal.SIGTSTP,
+    signal.SIGCONT,
+)
+
+
+def _forward_signal(pid, signum, frame):
+    os.kill(pid, signum)
 
 
 def _exec(
@@ -1031,11 +1036,6 @@ def _exec(
     myargs = [opt_name]
     myargs.extend(mycommand[1:])
 
-    # Avoid a potential UnicodeEncodeError from os.execve().
-    myargs = [
-        _unicode_encode(x, encoding=_encodings["fs"], errors="strict") for x in myargs
-    ]
-
     # Use default signal handlers in order to avoid problems
     # killing subprocesses as reported in bug #353239.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -1062,7 +1062,7 @@ def _exec(
     have_unshare = False
     libc = None
     if unshare_net or unshare_ipc or unshare_mount or unshare_pid:
-        (libc, _) = load_libc()
+        libc, _ = load_libc()
         if libc is not None:
             have_unshare = hasattr(libc, "unshare")
 
@@ -1115,13 +1115,11 @@ def _exec(
             [
                 portage._python_interpreter,
                 os.path.join(portage._bin_path, "pid-ns-init"),
-                _unicode_encode("" if uid is None else str(uid)),
-                _unicode_encode("" if gid is None else str(gid)),
-                _unicode_encode(
-                    "" if groups is None else ",".join(str(group) for group in groups)
-                ),
-                _unicode_encode("" if umask is None else str(umask)),
-                _unicode_encode(",".join(str(fd) for fd in fd_pipes)),
+                "" if uid is None else str(uid),
+                "" if gid is None else str(gid),
+                "" if groups is None else ",".join(str(group) for group in groups),
+                "" if umask is None else str(umask),
+                ",".join(str(fd) for fd in fd_pipes),
                 binary,
             ]
             + myargs,
@@ -1130,6 +1128,9 @@ def _exec(
         gid = None
         groups = None
         umask = None
+
+        # Mask signals until we can set up our handlers
+        signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARD_SIGNALS)
 
         # Use _start_fork for os.fork() error handling, ensuring
         # that if exec fails then the child process will display
@@ -1155,21 +1156,24 @@ def _exec(
             ),
             fd_pipes=None,
             close_fds=False,
+            signal_mask=signal_mask,
         )
 
-        # Execute a supervisor process which will forward
-        # signals to init and forward exit status to the
-        # parent process. The supervisor process runs in
-        # the global pid namespace, so skip /proc remount
-        # and other setup that's intended only for the
-        # init process.
-        binary, myargs = portage._python_interpreter, [
-            portage._python_interpreter,
-            os.path.join(portage._bin_path, "pid-ns-init"),
-            str(main_child_pid),
-        ]
+        # Forward signals to child
+        handler = partial(_forward_signal, main_child_pid)
+        for signum in _FORWARD_SIGNALS:
+            signal.signal(signum, handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, signal_mask)
 
-        os.execve(binary, myargs, env)
+        # Wait for child, exit with same result
+        pid, status = os.wait()
+        ec = os.waitstatus_to_exitcode(status)
+        if ec < 0:
+            signum = -ec
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            os._exit(127)
+        os._exit(ec)
 
     # Reachable only if unshare_pid is False.
     _exec2(
@@ -1315,7 +1319,7 @@ class _unshare_validator:
         """
         # This ctypes library lookup caches the result for use in the
         # subprocess when the multiprocessing start method is fork.
-        (libc, filename) = load_libc()
+        libc, filename = load_libc()
         if libc is None:
             return errno.ENOTSUP
 
@@ -1443,27 +1447,21 @@ def _setup_pipes(fd_pipes, close_fds=True, inheritable=None):
 
             if oldfd != newfd:
                 os.dup2(oldfd, newfd)
-                if _set_inheritable is not None:
-                    # Don't do this unless _set_inheritable is available,
-                    # since it's used below to ensure correct state, and
-                    # otherwise /dev/null stdin fails to inherit (at least
-                    # with Python versions from 3.1 to 3.3).
-                    if old_fdflags is None:
-                        old_fdflags = fcntl.fcntl(oldfd, fcntl.F_GETFD)
-                    fcntl.fcntl(newfd, fcntl.F_SETFD, old_fdflags)
+                if old_fdflags is None:
+                    old_fdflags = fcntl.fcntl(oldfd, fcntl.F_GETFD)
+                fcntl.fcntl(newfd, fcntl.F_SETFD, old_fdflags)
 
-            if _set_inheritable is not None:
-                inheritable_state = None
-                if not (old_fdflags is None or _FD_CLOEXEC is None):
-                    inheritable_state = not bool(old_fdflags & _FD_CLOEXEC)
+            inheritable_state = None
+            if old_fdflags is not None:
+                inheritable_state = not bool(old_fdflags & fcntl.FD_CLOEXEC)
 
-                if inheritable is not None:
-                    if inheritable_state is not inheritable:
-                        _set_inheritable(newfd, inheritable)
+            if inheritable is not None:
+                if inheritable_state is not inheritable:
+                    os.set_inheritable(newfd, inheritable)
 
-                elif newfd in (0, 1, 2):
-                    if inheritable_state is not True:
-                        _set_inheritable(newfd, True)
+            elif newfd in (0, 1, 2):
+                if inheritable_state is not True:
+                    os.set_inheritable(newfd, True)
 
         if oldfd not in fd_pipes:
             # If oldfd is not a key in fd_pipes, then it's safe
@@ -1490,6 +1488,7 @@ def _start_fork(
     kwargs: Optional[dict[str, Any]] = {},
     fd_pipes: Optional[dict[int, int]] = None,
     close_fds: Optional[bool] = True,
+    signal_mask=None,
 ) -> int:
     """
     Execute the target function in a fork. The fd_pipes and
@@ -1514,6 +1513,8 @@ def _start_fork(
         if pid == 0:
             try:
                 _setup_pipes(fd_pipes, close_fds=close_fds, inheritable=True)
+                if signal_mask is not None:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, signal_mask)
                 target(*args, **kwargs)
             except Exception:
                 # We need to catch _any_ exception and display it since the child
@@ -1523,7 +1524,7 @@ def _start_fork(
     finally:
         # Don't used portage.getpid() here, in case there is a race
         # with getpid cache invalidation via _ForkWatcher hook.
-        if pid == 0 or (pid is None and _os.getpid() != parent_pid):
+        if pid == 0 or (pid is None and os.getpid() != parent_pid):
             # Call os._exit() from a finally block in order
             # to suppress any finally blocks from earlier
             # in the call stack (see bug #345289). This
@@ -1654,7 +1655,7 @@ def find_binary(binary):
         paths = paths.split(":")
 
     for path in paths:
-        filename = _os.path.join(path, binary)
-        if _os.access(filename, os.X_OK) and _os.path.isfile(filename):
+        filename = os.path.join(path, binary)
+        if os.access(filename, os.X_OK) and os.path.isfile(filename):
             return filename
     return None

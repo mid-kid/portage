@@ -3,12 +3,10 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import errno
+import os
 import time
+
 import portage
-from portage import os
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
 from portage.data import portage_gid, portage_uid
 from portage.localization import _
 from portage.package.ebuild.prepare_build_dirs import _ensure_log_subdirs
@@ -41,9 +39,9 @@ def process(mysettings, key, logentries, fulltext):
     elogfilename = elogdir + "/summary.log"
     try:
         elogfile = open(
-            _unicode_encode(elogfilename, encoding=_encodings["fs"], errors="strict"),
+            elogfilename,
             mode="a",
-            encoding=_encodings["content"],
+            encoding="utf-8",
             errors="backslashreplace",
         )
     except OSError as e:
@@ -84,7 +82,9 @@ def process(mysettings, key, logentries, fulltext):
         )
         % {"pid": portage.getpid(), "time": time_str, "pkg": key}
     )
-    elogfile.write(_unicode_decode(fulltext))
+    elogfile.write(
+        fulltext.decode("utf-8", "replace") if isinstance(fulltext, bytes) else fulltext
+    )
     elogfile.write("\n")
     elogfile.close()
 

@@ -5,15 +5,16 @@ __all__ = ["dbapi"]
 
 import functools
 import logging
+import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple
 from collections.abc import Sequence
+from typing import Any, Optional
 
-from portage.const import MERGING_IDENTIFIER
+from _emerge.Package import Package
 
-from portage import os
 from portage import auxdbkeys
+from portage.const import MERGING_IDENTIFIER
 from portage.eapi import _get_eapi_attrs
 from portage.exception import (
     CorruptionKeyError,
@@ -21,7 +22,6 @@ from portage.exception import (
     InvalidData,
 )
 from portage.localization import _
-from _emerge.Package import Package
 
 
 class dbapi:
@@ -392,8 +392,8 @@ class dbapi:
         @type onUpdate: a callable that takes 2 integer arguments:
                 maxval and curval
         """
-        from portage.versions import _pkg_str
         from portage.update import update_dbentries
+        from portage.versions import _pkg_str
 
         cpv_all = self.cpv_all()
         cpv_all.sort()

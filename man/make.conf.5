@@ -398,7 +398,9 @@ This feature is enabled by default.
 Binary packages are requested to be signed by a trusted GnuPG signature.
 Portage will reject to process any binary package without a valid GnuPG
 signature. The verify command is defined in \fBBINPKG_GPG_VERIFY_COMMAND\fR
-variable.  If enabled, takes precedence over \fBbinrepos.conf\fR.
+variable.  If enabled, takes precedence over \fBbinrepos.conf\fR.  Remote
+binary packages have the equivalent of this option (\fIverify-signature\fR)
+enabled by default in \fBbinrepos.conf\fR, see \fBportage\fR(5).
 .TP
 .B binpkg-signing
 Binary packages will be signed by given GnuPG command. The signing command
@@ -413,6 +415,15 @@ Binary packages will be created for all packages that are merged. Also see
 When this option is enabled (the default), \fBbuildpkg\fR will exhibit
 the default behavior of building binary cache for all packages. When
 it is disabled, binary packages will not be created for live ebuilds.
+.TP
+.B buildpkg\-proactive
+Proactively rebuild packages that have no (usable) binary package. This only
+applies to installed packages that Portage is already checking but would
+otherwise not consider rebuilding, e.g. because they're already up-to-date.
+This does nothing unless \fBbuildpkg\fR or \fBbuildsyspkg\fR is also enabled.
+When \fBemerge\fR(1) \fB--binpkg-respect-use\fR or \fB--binpkg-changed-deps\fR
+are enabled (they usually are), binary packages will also be rebuilt if the USE
+flags or dependencies have changed.
 .TP
 .B buildsyspkg
 Build binary packages for just packages in the system set.
@@ -438,6 +449,15 @@ lead to packages that cannot be emerged. If this happens (if you receive errors
 like "File not recognized: File truncated"), try recompiling the application
 with ccache disabled before reporting a bug. Unless you are doing development
 work, do not enable ccache.
+.TP
+.B cgroup
+Place each source build's process tree in its own cgroup v2 under
+\fIPORTAGE_CGROUP_ROOT\fR (default \fI/sys/fs/cgroup/portage\fR), so the kernel
+accounts the build's CPU time, peak memory, and I/O. The totals are reported in
+the build log, together with the average number of CPUs the build kept busy,
+and, with FEATURES="observability", in the live status snapshot.
+No limits are imposed. Requires root and a cgroup v2 unified hierarchy;
+degrades silently otherwise.
 .TP
 .B clean\-logs
 Enable automatic execution of the command specified by the
@@ -532,8 +552,10 @@ except when \fImirror\fR is in the \fBebuild\fR(5) \fBRESTRICT\fR variable.
 .TP
 .B getbinpkg
 Force emerges to always try to fetch files from the remote binhosts configured
-in \fBbinrepos.conf\fR or \fIPORTAGE_BINHOST\fR. (deprecated).
-See \fBmake.conf\fR(5) for more information.
+in \fBbinrepos.conf\fR or \fIPORTAGE_BINHOST\fR (deprecated).
+See \fBmake.conf\fR(5) for more information.  This option cannot be set
+via \fBpackage.env\fR, use the experimental binpkg selection options in
+\fBbinrepos.conf\fR instead.
 .TP
 .B gpg-keepalive
 Run GnuPG unlock command every 5 mins to avoid passphrase expiry.
@@ -600,11 +622,23 @@ Wait for all builds to complete before merging new packages, which only
 matters when using the \fBemerge\fR(1) \fB\-\-jobs\fR option. Unless the
 \fBemerge\fR(1) \fB\-\-implicit\-system\-deps=n\fR option is used,
 \fImerge\-wait\fR is always effectively enabled for packages that satisfy
-direct or indirect dependencies of the system set. The \fImerge\-wait\fR
+direct or indirect dependencies of the system set. The
+\fBemerge\fR(1) \fB\-\-merge\-wait\-scope\fR option controls which packages
+those are. The \fImerge\-wait\fR
 feature can be disabled in order to trade the possibility of random build
 failures for greater parallelism.
 The queue can be flushed by sending the SIGUSR2 signal to \fBemerge\fR(1).
 This feature is enabled by default.
+.TP
+.B merge\-use\-vdb
+When this feature is enabled, Portage uses the file hashes and modification
+times recorded in the package database to determine if a file needs to be
+replaced on the live filesystem.  This avoids reading the live filesystem files
+directly, saving disk I/O, unless the file's mtime differs from the time it was
+installed.  Note that this feature must be disabled if Portage is being used to
+repair corrupted files.  Otherwise, Portage will trust the package database and
+fail to overwrite the corrupted files on the live filesystem.  This feature is
+disabled by default.
 .TP
 .B metadata\-transfer
 Automatically perform a metadata transfer when `emerge \-\-sync` is run.
@@ -671,6 +705,19 @@ Prevents the stripping of binaries that are merged to the live filesystem.
 .B notitles
 Disables xterm titlebar updates (which contains status info).
 .TP
+.B observability
+Publish a machine\-readable snapshot of the running \fBemerge\fR(1)
+process to \fI/run/portage/emerge\-<pid>.json\fR, listing the packages
+currently being built or merged, their current ebuild phase, and elapsed
+time. The file is refreshed on every job state change, periodically while
+a phase runs, and whenever a client connects to the socket described
+below; it is removed when emerge exits. Query it with \fBportageq jobs\fR
+or \fBemerge \-\-status\fR.
+A \fI/run/portage/emerge\-<pid>.sock\fR Unix socket additionally streams
+newline\-delimited JSON snapshots to connected clients. This feature
+degrades silently when the runtime directory is not writable (for
+example, for an unprivileged emerge).
+.TP
 .B packdebug
 Create a tarball of debug information and source files for use with
 debuginfod.  Debug tarballs are placed at
@@ -714,7 +761,8 @@ parallel installation occurs in batches when there are no builds
 running. Unless the \fBemerge\fR(1) \fB\-\-implicit\-system\-deps=n\fR
 option is used, \fIparallel\-install\fR is always effectively disabled
 for packages that satisfy direct or indirect dependencies of the system
-set.
+set. The \fBemerge\fR(1) \fB\-\-merge\-wait\-scope\fR option controls which
+packages those are.
 .TP
 .B pid\-sandbox
 Isolate the process space for the ebuild processes. This makes it
@@ -731,19 +779,6 @@ with detection of packages that have been manually added or removed,
 which significantly improves performance in some cases, such as when
 \fBPKGDIR\fR resides on a high\-latency network file system.  Enabled by
 default.
-.TP
-.B prelink\-checksums
-If \fBprelink\fR(8) is installed then use it to undo any prelinks on files
-before computing checksums for merge and unmerge. This feature is
-useful only if \fBprelink\fR(8) is installed and accurate checksums (despite
-prelinking) are needed for some reason such as for checking the integrity of
-installed files or because the \fIunmerge\-orphans\fR feature is disabled.
-
-Note that normal emerging of packages from source computes the
-checksums before things will be prelinked, so in such cases, this
-feature isn't required either. Undoing prelinking while merging is
-only required when using tools like \fBquickpkg\fR(1) which can cause
-already prelinked files to be merged.
 .TP
 .B preserve\-libs
 Preserve libraries when the sonames change during upgrade or downgrade.
@@ -847,10 +882,12 @@ and \fIsrc_test()\fR in \fBebuild\fR(5). This feature implies the "test"
 \fBUSE\fR flag.
 .TP
 .B test\-fail\-continue
-If "test" is enabled \fBFEATURES\fR and the test phase of an ebuild fails,
-continue to execute the remaining phases as if the failure had not occurred.
-Note that the test phase for a specific package may be disabled by masking
-the "test" \fBUSE\fR flag in \fBpackage.use.mask\fR (see \fBportage\fR(5)).
+If \fItest\fR is enabled and the test phase of an ebuild fails, continue to
+execute the remaining phases as if the failure had not occurred.
+
+Note that the test phase for an individual package can be disabled by setting
+\%FEATURES="-test" for that package specifically. Refer to \%\fBpackage.env\fR
+in \%\fBportage\fR(5) for creating per\-package environment variable settings.
 .TP
 .B unknown\-features\-filter
 Filter out any unknown values that the FEATURES variable contains.
@@ -874,7 +911,7 @@ checksum differs from the file that was originally installed.
 .TP
 .B userfetch
 When portage is run as root, drop privileges to portage:portage during the
-fetching of package sources.
+fetching of package sources or binary packages.
 .TP
 .B userpriv
 Allow portage to drop root privileges and compile packages as
@@ -923,6 +960,27 @@ Placeholder	Meaning	Example
 
 \\${DIGESTS}	Space separated list of file digests	blake2b:<hexdigest> sha512:<hexdigest>
 .TE
+.RE
+.TP
+.B FETCH_WRAPPER
+An optional command prefix prepended to \fBFETCHCOMMAND\fR and
+\fBRESUMECOMMAND\fR at fetch time.  When set, the fetch command is
+expanded, each argument is individually shell\-quoted, and the result is
+passed as a single string argument to the wrapper.  This ensures that
+wrappers which re\-interpret arguments through a shell \(em most commonly
+\fBssh\fR(1), which concatenates post\-hostname arguments into a remote
+command string \(em receive a properly quoted command.
+.RS
+.PP
+Without \fBFETCH_WRAPPER\fR, an ssh\-based \fBFETCHCOMMAND\fR breaks when
+the command contains shell metacharacters such as the parentheses in the
+default user\-agent string.  Setting \fBFETCH_WRAPPER\fR avoids this and
+allows \fBFETCHCOMMAND\fR and \fBRESUMECOMMAND\fR to remain at their
+\fImake.globals\fR defaults.
+.PP
+.nf
+FETCH_WRAPPER="ssh \-i ~/.ssh/id_ed25519 user@host"
+.fi
 .RE
 .TP
 .B FFLAGS FCFLAGS
@@ -1107,6 +1165,13 @@ for bzip2 compression operations. \fBPORTAGE_BZIP2_COMMAND\fR will also be
 called for extraction operation, with -d appended, unless the
 \fBPORTAGE_BUNZIP2_COMMAND\fR variable is set.
 .TP
+\fBPORTAGE_CGROUP_ROOT\fR = \fI[path]\fR
+Base cgroup v2 directory under which FEATURES="cgroup" creates one leaf cgroup
+per source build. Defaults to \fI/sys/fs/cgroup/portage\fR, or to a
+\fIportage\fR subdirectory of the cgroup emerge itself runs in when that cgroup
+has been delegated every controller needed, as with a systemd service started
+with \fIDelegate=yes\fR.
+.TP
 \fBPORTAGE_CHECKSUM_FILTER\fR = \fI[space delimited list of hash names]\fR
 This variable may be used to filter the hash functions that are used to
 verify integrity of files. Hash function names are case\-insensitive, and
@@ -1123,6 +1188,14 @@ PORTAGE_CHECKSUM_FILTER="* \-whirlpool"
 # Only use sha256
 PORTAGE_CHECKSUM_FILTER="\-* sha256"
 .fi
+.TP
+\fBPORTAGE_CIRCULAR_MAX_USE_FLAGS\fR = \fI[integer]\fR
+The number of USE flags that Portage explores per dependency when it looks
+for a USE change that breaks a circular dependency. The number of
+combinations grows exponentially with this value, so raising it can make
+the search much slower.
+.br
+Defaults to 10.
 .TP
 \fBPORTAGE_COMPRESS\fR = \fI"bzip2"\fR
 This variable contains the name of the command used to compress documentation
@@ -1423,6 +1496,7 @@ have been partially downloaded.  It should be defined using the same format
 as \fBFETCHCOMMAND\fR, and must include any additional option(s) that may
 be necessary in order to continue a partially downloaded file located at
 \\${DISTDIR}/\\${FILE}.
+Also see \fBFETCH_WRAPPER\fR.
 .TP
 \fBROOT\fR = \fI[path]\fR
 Use \fBROOT\fR to specify the target root filesystem to be used for merging

@@ -3,10 +3,11 @@
 
 import itertools
 import logging
+import os
 import stat
 
-from portage import os
 from portage.package.ebuild.fetch import DistfileName
+
 from .DeletionTask import DeletionTask
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ class DeletionIterator:
                 path = os.path.join(distdir, layout.get_path(filename))
                 try:
                     st = os.stat(path)
-                except OSError as e:
+                except OSError:
                     # is it a dangling symlink?
                     try:
                         if os.path.islink(path):
@@ -69,20 +70,13 @@ class DeletionIterator:
                     )
                 continue
 
-            if filename in file_owners:
-                if deletion_db is not None:
-                    try:
-                        del deletion_db[filename]
-                    except KeyError:
-                        pass
-            elif whitelist is not None and filename in whitelist:
-                if deletion_db is not None:
-                    try:
-                        del deletion_db[filename]
-                    except KeyError:
-                        pass
-            elif distfiles_local is not None and os.path.exists(
-                os.path.join(distfiles_local, filename)
+            if (
+                filename in file_owners
+                or (whitelist is not None and filename in whitelist)
+                or (
+                    distfiles_local is not None
+                    and os.path.exists(os.path.join(distfiles_local, filename))
+                )
             ):
                 if deletion_db is not None:
                     try:

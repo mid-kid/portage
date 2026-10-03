@@ -2,15 +2,13 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import collections
+import os
 import re
 
 import portage
-from portage.cache import fs_template
-from portage.cache import cache_errors
-from portage import os
-from portage import _unicode_decode
-from portage.util import writemsg
+from portage.cache import cache_errors, fs_template
 from portage.localization import _
+from portage.util import writemsg
 
 
 class database(fs_template.FsBased):
@@ -113,7 +111,7 @@ class database(fs_template.FsBased):
             if not self.readonly:
                 self._ensure_dirs()
             connection = self._db_module.connect(
-                database=_unicode_decode(self._dbpath), **connection_kwargs
+                database=self._dbpath, **connection_kwargs
             )
             cursor = connection.cursor()
             self._db_connection_info = self._connection_info_entry(
@@ -319,11 +317,23 @@ class database(fs_template.FsBased):
             s = " ".join(update_statement)
             cursor.execute(s)
         except self._db_error as e:
-            writemsg(f"{cpv}: {str(e)}\n")
+            writemsg(f"{cpv}: {e!s}\n")
             raise
 
     def commit(self):
-        self._db_connection.commit()
+        info = self._db_connection_info
+        # Unlike _db_connection, don't open a connection to commit.
+        if info is not None and info.pid == portage.getpid():
+            info.connection.commit()
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            info = self._db_connection_info
+            self._db_connection_info = None
+            if info is not None and info.pid == portage.getpid():
+                info.connection.close()
 
     def _delitem(self, cpv):
         cursor = self._db_cursor

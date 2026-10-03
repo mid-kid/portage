@@ -1,52 +1,47 @@
 # Copyright 2001-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import tarfile
-import traceback
-import io
-import threading
-import subprocess
 import errno
-import pwd
 import grp
+import io
+import os
+import pwd
 import re
 import shlex
+import shutil
 import stat
+import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
+import traceback
 from copy import copy
 from datetime import datetime
 
 import portage
-from portage import checksum
-from portage import os
-from portage import shutil
-from portage import normalize_path
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
+from portage import checksum, normalize_path
 from portage.binpkg import get_binpkg_format
+from portage.const import HASHING_BLOCKSIZE, MANIFEST2_HASH_DEFAULTS
 from portage.exception import (
-    FileNotFound,
-    InvalidBinaryPackageFormat,
-    InvalidCompressionMethod,
+    CommandNotFound,
     CompressorNotFound,
     CompressorOperationFailed,
-    CommandNotFound,
-    GPGException,
     DigestException,
-    MissingSignature,
+    FileNotFound,
+    GPGException,
+    InvalidBinaryPackageFormat,
+    InvalidCompressionMethod,
     InvalidSignature,
+    MissingSignature,
     SignedPackage,
 )
-from portage.output import colorize, EOutput
+from portage.output import EOutput, colorize
+from portage.process import find_binary
+from portage.util import varexpand, writemsg
 from portage.util._urlopen import urlopen
-from portage.util import writemsg
-from portage.util import varexpand
 from portage.util.compression_probe import _compressors
 from portage.util.cpuinfo import makeopts_to_job_count
-from portage.process import find_binary
-from portage.const import MANIFEST2_HASH_DEFAULTS, HASHING_BLOCKSIZE
 
 
 class tar_stream_writer:
@@ -681,6 +676,61 @@ class tar_safe_extract:
         self.closed = False
         self.file_list = []
 
+    @staticmethod
+    def _check_symlink_path(root, name):
+        """
+        Resolve existing symlinks on disk and reject paths outside root.
+        This does not check a new symlink's target from the tar header.
+        """
+        real_root = os.path.realpath(root)
+        real_path = os.path.realpath(os.path.join(root, name))
+        if os.path.commonpath((real_root, real_path)) != real_root:
+            writemsg(colorize("BAD", f"Danger: symlink escape detected: {name}\n"))
+            raise ValueError("Symlink escape detected.")
+
+    def _check_hardlink(self, root, member):
+        """Check the on-disk hardlink source and any relocated symlink target."""
+        self._check_symlink_path(root, member.linkname)
+        source = os.path.join(root, member.linkname)
+        if os.path.islink(source):
+            # A relative symlink target may escape from the new location.
+            self._check_symlink_path(
+                root,
+                os.path.join(os.path.dirname(member.name), os.readlink(source)),
+            )
+
+    def _check_member(self, member: tarfile.TarInfo, extract_dir: str):
+        """
+        Raise ValueError if member is not safe to extract into extract_dir.
+
+        tarfile.data_filter can't be used for this containment check
+        because it also rejects absolute symlink targets and strips the
+        setuid/setgid/sticky bits, which ordinary binary packages
+        legitimately contain, so the guarantee is enforced here instead.
+        """
+        name = member.name
+        if (name in self.file_list) or (os.path.join(".", name) in self.file_list):
+            writemsg(colorize("BAD", f"Danger: duplicate files detected: {name}\n"))
+            raise ValueError("Duplicate files detected.")
+        if name.startswith("/"):
+            writemsg(colorize("BAD", f"Danger: absolute path detected: {name}\n"))
+            raise ValueError("Absolute path detected.")
+        if ".." in name.split("/"):
+            writemsg(colorize("BAD", f"Danger: path traversal detected: {name}\n"))
+            raise ValueError("Path traversal detected.")
+        if member.isdev():
+            writemsg(colorize("BAD", f"Danger: device file detected: {name}\n"))
+            raise ValueError("Device file detected.")
+        if member.islnk() and (member.linkname not in self.file_list):
+            writemsg(colorize("BAD", f"Danger: hardlink escape detected: {name}\n"))
+            raise ValueError("Hardlink escape detected.")
+
+        # Check the parent too: replacing a symlink must not modify an outside directory.
+        self._check_symlink_path(extract_dir, os.path.dirname(name))
+        self._check_symlink_path(extract_dir, name)
+        if member.islnk():
+            self._check_hardlink(extract_dir, member)
+
     def extractall(self, dest_dir: str):
         """
         Extract all files to a temporary directory in the dest_dir, and move
@@ -689,8 +739,11 @@ class tar_safe_extract:
         if self.closed:
             raise OSError("Tar file is closed.")
         temp_dir = tempfile.TemporaryDirectory(dir=dest_dir)
-        # The below tar member security checks can be refactored as a filter function
-        # that raises an exception. Use tarfile.fully_trusted_filter for now, which
+        # tarfile's own filters can't be used here: tarfile.data_filter
+        # rejects absolute symlink targets and strips the setuid/setgid/
+        # sticky bits that ordinary binary packages legitimately contain.
+        # Members are validated by _check_member() before extraction instead,
+        # so the extraction itself must not mangle them. fully_trusted_filter
         # is simply an identity function:
         # def fully_trusted_filter(member, dest_path):
         #     return member
@@ -699,54 +752,17 @@ class tar_safe_extract:
         except AttributeError:
             pass
         try:
-            while True:
-                member = self.tar.next()
-                if member is None:
-                    break
-                if (member.name in self.file_list) or (
-                    os.path.join(".", member.name) in self.file_list
-                ):
-                    writemsg(
-                        colorize(
-                            "BAD", f"Danger: duplicate files detected: {member.name}\n"
-                        )
-                    )
-                    raise ValueError("Duplicate files detected.")
-                if member.name.startswith("/"):
-                    writemsg(
-                        colorize(
-                            "BAD", f"Danger: absolute path detected: {member.name}\n"
-                        )
-                    )
-                    raise ValueError("Absolute path detected.")
-                if member.name.startswith("../") or ("/../" in member.name):
-                    writemsg(
-                        colorize(
-                            "BAD", f"Danger: path traversal detected: {member.name}\n"
-                        )
-                    )
-                    raise ValueError("Path traversal detected.")
-                if member.isdev():
-                    writemsg(
-                        colorize(
-                            "BAD", f"Danger: device file detected: {member.name}\n"
-                        )
-                    )
-                    raise ValueError("Device file detected.")
-                if member.islnk() and (member.linkname not in self.file_list):
-                    writemsg(
-                        colorize(
-                            "BAD", f"Danger: hardlink escape detected: {member.name}\n"
-                        )
-                    )
-                    raise ValueError("Hardlink escape detected.")
+            for member in self.tar:
+                self._check_member(member, temp_dir.name)
 
                 self.file_list.append(member.name)
                 self.tar.extract(member, path=temp_dir.name)
 
+            self._check_symlink_path(temp_dir.name, self.prefix)
             data_dir = os.path.join(temp_dir.name, self.prefix)
             for file in os.listdir(data_dir):
-                shutil.move(os.path.join(data_dir, file), os.path.join(dest_dir, file))
+                # Same filesystem: rename without following destination symlinks.
+                os.rename(os.path.join(data_dir, file), os.path.join(dest_dir, file))
         finally:
             temp_dir.cleanup()
             self.closed = True
@@ -769,8 +785,10 @@ class gpkg:
         if gpkg_file is None:
             self.gpkg_file = None
         else:
-            self.gpkg_file = _unicode_decode(
-                gpkg_file, encoding=_encodings["fs"], errors="strict"
+            self.gpkg_file = (
+                gpkg_file.decode("utf-8", "strict")
+                if isinstance(gpkg_file, bytes)
+                else gpkg_file
             )
 
         if basename is None:
@@ -794,6 +812,9 @@ class gpkg:
 
         # If `verify-signature` is unset in binrepos.conf, use the FEATURES
         # flags instead.
+        #
+        # Note that cnf/binrepos.conf shipped with Portage sets it to
+        # true in [DEFAULT].
         if verify_signature is None:
             # request_signature is whether signature files are mandatory.
             # If true, any missing signature file will cause processing to be
@@ -831,6 +852,22 @@ class gpkg:
             "zstd": ".zst",
         }
 
+    @staticmethod
+    def _check_metadata_files(metadata):
+        """Check that all metadata tar members are regular files."""
+        for member in metadata.getmembers():
+            if not member.isreg():
+                raise InvalidBinaryPackageFormat(
+                    f"Metadata member is not a regular file: {member.name}"
+                )
+
+    @staticmethod
+    def _strip_metadata_prefix(path):
+        prefix = "metadata/"
+        if not path.startswith(prefix):
+            raise InvalidBinaryPackageFormat(f"Invalid metadata path: {path}")
+        return path[len(prefix) :]
+
     def unpack_metadata(self, dest_dir=None):
         """
         Unpack metadata to dest_dir.
@@ -851,9 +888,10 @@ class gpkg:
                 metadata_tar = io.BytesIO(metadata_reader.read())
 
             with tarfile.open(mode="r:", fileobj=metadata_tar) as metadata:
+                self._check_metadata_files(metadata)
                 if dest_dir is None:
                     metadata_ = {
-                        os.path.relpath(k.name, "metadata"): metadata.extractfile(
+                        self._strip_metadata_prefix(k.name): metadata.extractfile(
                             k
                         ).read()
                         for k in metadata.getmembers()
@@ -961,16 +999,17 @@ class gpkg:
                 metadata_file = io.BytesIO(metadata_reader.read())
 
             with tarfile.open(mode="r:", fileobj=metadata_file) as metadata:
+                self._check_metadata_files(metadata)
                 if want is None:
                     metadata_ = {
-                        os.path.relpath(k.name, "metadata"): metadata.extractfile(
+                        self._strip_metadata_prefix(k.name): metadata.extractfile(
                             k
                         ).read()
                         for k in metadata.getmembers()
                     }
                 else:
                     metadata_ = {
-                        os.path.relpath(k.name, "metadata"): metadata.extractfile(
+                        self._strip_metadata_prefix(k.name): metadata.extractfile(
                             k
                         ).read()
                         for k in metadata.getmembers()
@@ -989,7 +1028,9 @@ class gpkg:
         """
 
         root_dir = normalize_path(
-            _unicode_decode(root_dir, encoding=_encodings["fs"], errors="strict")
+            root_dir.decode("utf-8", "strict")
+            if isinstance(root_dir, bytes)
+            else root_dir
         )
 
         # Get pre image info
@@ -1031,13 +1072,19 @@ class gpkg:
 
         image_tarinfo = self._create_tarinfo("image")
         image_tarinfo.mtime = datetime.now().timestamp()
-        with tar_stream_writer(
-            image_tarinfo, container, image_tar_format, compression_cmd, checksum_info
-        ) as image_writer:
-            with tarfile.open(
+        with (
+            tar_stream_writer(
+                image_tarinfo,
+                container,
+                image_tar_format,
+                compression_cmd,
+                checksum_info,
+            ) as image_writer,
+            tarfile.open(
                 mode="w|", fileobj=image_writer, format=image_tar_format
-            ) as image_tar:
-                image_tar.add(root_dir, "image", recursive=True)
+            ) as image_tar,
+        ):
+            image_tar.add(root_dir, "image", recursive=True)
 
         image_tarinfo = container.getmember(image_tarinfo.name)
         self._record_checksum(checksum_info, image_tarinfo)
@@ -1061,7 +1108,9 @@ class gpkg:
         Decompress current gpkg to decompress_dir
         """
         decompress_dir = normalize_path(
-            _unicode_decode(decompress_dir, encoding=_encodings["fs"], errors="strict")
+            decompress_dir.decode("utf-8", "strict")
+            if isinstance(decompress_dir, bytes)
+            else decompress_dir
         )
 
         self._verify_binpkg()
@@ -1070,21 +1119,23 @@ class gpkg:
         with tarfile.open(self.gpkg_file, "r") as container:
             image_tarinfo, image_comp = self._get_inner_tarinfo(container, "image")
 
-            with tar_stream_reader(
-                container.extractfile(image_tarinfo),
-                self._get_decompression_cmd(image_comp),
-            ) as image_tar:
-                with tarfile.open(mode="r|", fileobj=image_tar) as image:
-                    try:
-                        image_safe = tar_safe_extract(image, "image")
-                        image_safe.extractall(decompress_dir)
-                        image_tar.close()
-                    except Exception as ex:
-                        writemsg(colorize("BAD", "!!!Extract failed.\n"))
-                        raise
-                    finally:
-                        if not image_tar.closed:
-                            image_tar.kill()
+            with (
+                tar_stream_reader(
+                    container.extractfile(image_tarinfo),
+                    self._get_decompression_cmd(image_comp),
+                ) as image_tar,
+                tarfile.open(mode="r|", fileobj=image_tar) as image,
+            ):
+                try:
+                    image_safe = tar_safe_extract(image, "image")
+                    image_safe.extractall(decompress_dir)
+                    image_tar.close()
+                except Exception:
+                    writemsg(colorize("BAD", "!!!Extract failed.\n"))
+                    raise
+                finally:
+                    if not image_tar.closed:
+                        image_tar.kill()
 
     def update_metadata(self, metadata, new_basename=None, force=False):
         """
@@ -1288,30 +1339,32 @@ class gpkg:
         else:
             checksum_info = checksum_helper(self.settings)
 
-        with tar_stream_writer(
-            metadata_tarinfo,
-            container,
-            tarfile.USTAR_FORMAT,
-            compression_cmd,
-            checksum_info,
-        ) as metadata_writer:
-            with tarfile.open(
+        with (
+            tar_stream_writer(
+                metadata_tarinfo,
+                container,
+                tarfile.USTAR_FORMAT,
+                compression_cmd,
+                checksum_info,
+            ) as metadata_writer,
+            tarfile.open(
                 mode="w|", fileobj=metadata_writer, format=tarfile.USTAR_FORMAT
-            ) as metadata_tar:
-                for m in metadata:
-                    m_info = tarfile.TarInfo(os.path.join("metadata", m))
-                    m_info.mtime = datetime.now().timestamp()
+            ) as metadata_tar,
+        ):
+            for m in metadata:
+                m_info = tarfile.TarInfo(os.path.join("metadata", m))
+                m_info.mtime = datetime.now().timestamp()
 
-                    if isinstance(metadata[m], bytes):
-                        m_data = io.BytesIO(metadata[m])
-                    else:
-                        m_data = io.BytesIO(metadata[m].encode("UTF-8"))
+                if isinstance(metadata[m], bytes):
+                    m_data = io.BytesIO(metadata[m])
+                else:
+                    m_data = io.BytesIO(metadata[m].encode("UTF-8"))
 
-                    m_data.seek(0, io.SEEK_END)
-                    m_info.size = m_data.tell()
-                    m_data.seek(0)
-                    metadata_tar.addfile(m_info, m_data)
-                    m_data.close()
+                m_data.seek(0, io.SEEK_END)
+                m_info.size = m_data.tell()
+                m_data.seek(0)
+                metadata_tar.addfile(m_info, m_data)
+                m_data.close()
 
         metadata_tarinfo = container.getmember(metadata_tarinfo.name)
         self._record_checksum(checksum_info, metadata_tarinfo)
@@ -1334,7 +1387,9 @@ class gpkg:
         protect_file_size = protect_file.tell()
 
         root_dir = normalize_path(
-            _unicode_decode(root_dir, encoding=_encodings["fs"], errors="strict")
+            root_dir.decode("utf-8", "strict")
+            if isinstance(root_dir, bytes)
+            else root_dir
         )
 
         # Get pre image info
@@ -1377,106 +1432,109 @@ class gpkg:
         paths.sort()
         image_tarinfo = self._create_tarinfo("image")
         image_tarinfo.mtime = datetime.now().timestamp()
-        with tar_stream_writer(
-            image_tarinfo, container, image_tar_format, compression_cmd, checksum_info
-        ) as image_writer:
-            with tarfile.open(
+        with (
+            tar_stream_writer(
+                image_tarinfo,
+                container,
+                image_tar_format,
+                compression_cmd,
+                checksum_info,
+            ) as image_writer,
+            tarfile.open(
                 mode="w|", fileobj=image_writer, format=image_tar_format
-            ) as image_tar:
-                if len(paths) == 0:
-                    tarinfo = image_tar.tarinfo("image")
-                    tarinfo.type = tarfile.DIRTYPE
-                    tarinfo.size = 0
-                    tarinfo.mode = 0o755
-                    image_tar.addfile(tarinfo)
+            ) as image_tar,
+        ):
+            if len(paths) == 0:
+                tarinfo = image_tar.tarinfo("image")
+                tarinfo.type = tarfile.DIRTYPE
+                tarinfo.size = 0
+                tarinfo.mode = 0o755
+                image_tar.addfile(tarinfo)
 
-                for path in paths:
-                    try:
-                        lst = os.lstat(path)
-                    except OSError as e:
-                        if e.errno != errno.ENOENT:
-                            raise
-                        eout.ewarn(f'Missing file from local system: "{path}"')
-                        del e
-                        continue
-                    contents_type = contents[path][0]
-                    if path.startswith(root_dir):
-                        arcname = "image/" + path[len(root_dir) :]
-                    else:
-                        raise ValueError(f"invalid root argument: '{root_dir}'")
-                    live_path = path
+            for path in paths:
+                try:
+                    lst = os.lstat(path)
+                except OSError as e:
+                    if e.errno != errno.ENOENT:
+                        raise
+                    eout.ewarn(f'Missing file from local system: "{path}"')
+                    del e
+                    continue
+                contents_type = contents[path][0]
+                if path.startswith(root_dir):
+                    arcname = "image/" + path[len(root_dir) :]
+                else:
+                    raise ValueError(f"invalid root argument: '{root_dir}'")
+                live_path = path
+                if (
+                    "dir" == contents_type
+                    and not stat.S_ISDIR(lst.st_mode)
+                    and os.path.isdir(live_path)
+                ):
+                    # Even though this was a directory in the original ${D}, it exists
+                    # as a symlink to a directory in the live filesystem.  It must be
+                    # recorded as a real directory in the tar file to ensure that tar
+                    # can properly extract it's children.
+                    live_path = os.path.realpath(live_path)
+                    lst = os.lstat(live_path)
+
+                # Since os.lstat() inside TarFile.gettarinfo() can trigger a
+                # UnicodeEncodeError when python has something other than utf_8
+                # return from sys.getfilesystemencoding() (as in bug #388773),
+                # we implement the needed functionality here, using the result
+                # of our successful lstat call. An alternative to this would be
+                # to pass in the fileobj argument to TarFile.gettarinfo(), so
+                # that it could use fstat instead of lstat. However, that would
+                # have the unwanted effect of dereferencing symlinks.
+
+                tarinfo = image_tar.tarinfo(arcname)
+                tarinfo.mode = lst.st_mode
+                tarinfo.uid = lst.st_uid
+                tarinfo.gid = lst.st_gid
+                tarinfo.size = 0
+                tarinfo.mtime = lst.st_mtime
+                tarinfo.linkname = ""
+                if stat.S_ISREG(lst.st_mode):
+                    inode = (lst.st_ino, lst.st_dev)
                     if (
-                        "dir" == contents_type
-                        and not stat.S_ISDIR(lst.st_mode)
-                        and os.path.isdir(live_path)
+                        lst.st_nlink > 1
+                        and inode in image_tar.inodes
+                        and arcname != image_tar.inodes[inode]
                     ):
-                        # Even though this was a directory in the original ${D}, it exists
-                        # as a symlink to a directory in the live filesystem.  It must be
-                        # recorded as a real directory in the tar file to ensure that tar
-                        # can properly extract it's children.
-                        live_path = os.path.realpath(live_path)
-                        lst = os.lstat(live_path)
-
-                    # Since os.lstat() inside TarFile.gettarinfo() can trigger a
-                    # UnicodeEncodeError when python has something other than utf_8
-                    # return from sys.getfilesystemencoding() (as in bug #388773),
-                    # we implement the needed functionality here, using the result
-                    # of our successful lstat call. An alternative to this would be
-                    # to pass in the fileobj argument to TarFile.gettarinfo(), so
-                    # that it could use fstat instead of lstat. However, that would
-                    # have the unwanted effect of dereferencing symlinks.
-
-                    tarinfo = image_tar.tarinfo(arcname)
-                    tarinfo.mode = lst.st_mode
-                    tarinfo.uid = lst.st_uid
-                    tarinfo.gid = lst.st_gid
-                    tarinfo.size = 0
-                    tarinfo.mtime = lst.st_mtime
-                    tarinfo.linkname = ""
-                    if stat.S_ISREG(lst.st_mode):
-                        inode = (lst.st_ino, lst.st_dev)
-                        if (
-                            lst.st_nlink > 1
-                            and inode in image_tar.inodes
-                            and arcname != image_tar.inodes[inode]
-                        ):
-                            tarinfo.type = tarfile.LNKTYPE
-                            tarinfo.linkname = image_tar.inodes[inode]
-                        else:
-                            image_tar.inodes[inode] = arcname
-                            tarinfo.type = tarfile.REGTYPE
-                            tarinfo.size = lst.st_size
-                    elif stat.S_ISDIR(lst.st_mode):
-                        tarinfo.type = tarfile.DIRTYPE
-                    elif stat.S_ISLNK(lst.st_mode):
-                        tarinfo.type = tarfile.SYMTYPE
-                        tarinfo.linkname = os.readlink(live_path)
+                        tarinfo.type = tarfile.LNKTYPE
+                        tarinfo.linkname = image_tar.inodes[inode]
                     else:
-                        continue
-                    try:
-                        tarinfo.uname = pwd.getpwuid(tarinfo.uid)[0]
-                    except KeyError:
-                        pass
-                    try:
-                        tarinfo.gname = grp.getgrgid(tarinfo.gid)[0]
-                    except KeyError:
-                        pass
+                        image_tar.inodes[inode] = arcname
+                        tarinfo.type = tarfile.REGTYPE
+                        tarinfo.size = lst.st_size
+                elif stat.S_ISDIR(lst.st_mode):
+                    tarinfo.type = tarfile.DIRTYPE
+                elif stat.S_ISLNK(lst.st_mode):
+                    tarinfo.type = tarfile.SYMTYPE
+                    tarinfo.linkname = os.readlink(live_path)
+                else:
+                    continue
+                try:
+                    tarinfo.uname = pwd.getpwuid(tarinfo.uid)[0]
+                except KeyError:
+                    pass
+                try:
+                    tarinfo.gname = grp.getgrgid(tarinfo.gid)[0]
+                except KeyError:
+                    pass
 
-                    if stat.S_ISREG(lst.st_mode):
-                        if protect and protect(path):
-                            protect_file.seek(0)
-                            tarinfo.size = protect_file_size
-                            image_tar.addfile(tarinfo, protect_file)
-                        else:
-                            path_bytes = _unicode_encode(
-                                path, encoding=_encodings["fs"], errors="strict"
-                            )
-
-                            with open(path_bytes, "rb") as f:
-                                image_tar.addfile(tarinfo, f)
-
+                if stat.S_ISREG(lst.st_mode):
+                    if protect and protect(path):
+                        protect_file.seek(0)
+                        tarinfo.size = protect_file_size
+                        image_tar.addfile(tarinfo, protect_file)
                     else:
-                        image_tar.addfile(tarinfo)
+
+                        with open(path, "rb") as f:
+                            image_tar.addfile(tarinfo, f)
+
+                else:
+                    image_tar.addfile(tarinfo)
 
         image_tarinfo = container.getmember(image_tarinfo.name)
         self._record_checksum(checksum_info, image_tarinfo)
@@ -1651,7 +1709,7 @@ class gpkg:
             prefix = os.path.commonpath(container_files)
             if not prefix:
                 raise InvalidBinaryPackageFormat(
-                    f"gpkg file structure mismatch in {self.gpkg_file}, {str(container_files)}"
+                    f"gpkg file structure mismatch in {self.gpkg_file}, {container_files!s}"
                 )
 
             gpkg_version_file = os.path.join(prefix, self.gpkg_version)
@@ -1804,13 +1862,13 @@ class gpkg:
         # Check if any files are IN the Manifest but NOT IN the binary package
         if len(unverified_manifest) != 0:
             raise DigestException(
-                f"Missing files: {str(unverified_manifest)} in {self.gpkg_file}"
+                f"Missing files: {unverified_manifest!s} in {self.gpkg_file}"
             )
 
         # Check if any files are NOT IN the Manifest but are IN the binary package
         if len(unverified_files) != 0:
             raise DigestException(
-                f"Unknown files exists: {str(unverified_files)} in {self.gpkg_file}"
+                f"Unknown files exists: {unverified_files!s} in {self.gpkg_file}"
             )
 
         # Save current Manifest for other operations.
@@ -1824,13 +1882,15 @@ class gpkg:
         """
         metadata = {}
         metadata_dir = normalize_path(
-            _unicode_decode(metadata_dir, encoding=_encodings["fs"], errors="strict")
+            metadata_dir.decode("utf-8", "strict")
+            if isinstance(metadata_dir, bytes)
+            else metadata_dir
         )
         for parent, dirs, files in os.walk(metadata_dir):
             for f in files:
                 try:
-                    f = _unicode_decode(f, encoding=_encodings["fs"], errors="strict")
-                except UnicodeDecodeError:
+                    f.encode("utf-8", "strict")
+                except UnicodeEncodeError:
                     continue
                 with open(os.path.join(parent, f), "rb") as metafile:
                     metadata[f] = metafile.read()
@@ -1965,16 +2025,16 @@ class gpkg:
         Check the pre image files size and path, return the longest
         path length, largest single file size, and total files size.
         """
-        image_prefix_length = len(image_prefix) + 1
+        image_prefix_length = len(os.fsencode(image_prefix)) + 1
         root_dir = os.path.join(
             normalize_path(
-                _unicode_decode(root_dir, encoding=_encodings["fs"], errors="strict")
+                root_dir.decode("utf-8", "strict")
+                if isinstance(root_dir, bytes)
+                else root_dir
             ),
             "",
         )
-        root_dir_length = len(
-            _unicode_encode(root_dir, encoding=_encodings["fs"], errors="strict")
-        )
+        root_dir_length = len(os.fsencode(root_dir))
 
         image_max_prefix_length = 0
         image_max_name_length = 0
@@ -1983,67 +2043,45 @@ class gpkg:
         image_total_size = 0
 
         for parent, dirs, files in os.walk(root_dir):
-            if portage.utf8_mode:
-                parent = os.fsencode(parent)
-                dirs = [os.fsencode(value) for value in dirs]
-                files = [os.fsencode(value) for value in files]
-
-            parent = _unicode_decode(parent, encoding=_encodings["fs"], errors="strict")
             for d in dirs:
                 try:
-                    d = _unicode_decode(d, encoding=_encodings["fs"], errors="strict")
-                except UnicodeDecodeError as err:
+                    d.encode("utf-8", "strict")
+                except UnicodeEncodeError as err:
                     writemsg(colorize("BAD", f"\n*** {err}\n\n"), noiselevel=-1)
                     raise
 
                 d = os.path.join(parent, d)
                 prefix_length = (
-                    len(_unicode_encode(d, encoding=_encodings["fs"], errors="strict"))
-                    - root_dir_length
-                    + image_prefix_length
+                    len(os.fsencode(d)) - root_dir_length + image_prefix_length
                 )
 
                 if os.path.islink(d):
                     path_link = os.readlink(d)
-                    path_link_length = len(
-                        _unicode_encode(
-                            path_link, encoding=_encodings["fs"], errors="strict"
-                        )
-                    )
+                    path_link_length = len(os.fsencode(path_link))
                     image_max_link_length = max(image_max_link_length, path_link_length)
 
                 image_max_prefix_length = max(image_max_prefix_length, prefix_length)
 
             for f in files:
                 try:
-                    f = _unicode_decode(f, encoding=_encodings["fs"], errors="strict")
-                except UnicodeDecodeError as err:
+                    f.encode("utf-8", "strict")
+                except UnicodeEncodeError as err:
                     writemsg(colorize("BAD", f"\n*** {err}\n\n"), noiselevel=-1)
                     raise
 
-                filename_length = len(
-                    _unicode_encode(f, encoding=_encodings["fs"], errors="strict")
-                )
+                filename_length = len(os.fsencode(f))
                 image_max_name_length = max(image_max_name_length, filename_length)
 
                 f = os.path.join(parent, f)
                 path_length = (
-                    len(_unicode_encode(f, encoding=_encodings["fs"], errors="strict"))
-                    - root_dir_length
-                    + image_prefix_length
+                    len(os.fsencode(f)) - root_dir_length + image_prefix_length
                 )
 
                 file_stat = os.lstat(f)
 
                 if stat.S_ISLNK(file_stat.st_mode):
                     path_link = os.readlink(f)
-                    path_link_length = len(
-                        os.fsencode(path_link)
-                        if portage.utf8_mode
-                        else _unicode_encode(
-                            path_link, encoding=_encodings["fs"], errors="strict"
-                        )
-                    )
+                    path_link_length = len(os.fsencode(path_link))
                 elif file_stat.st_nlink > 1:
                     # Hardlink exists
                     path_link_length = path_length
@@ -2077,13 +2115,11 @@ class gpkg:
         image_prefix_length = len(image_prefix) + 1
         root_dir = os.path.join(
             normalize_path(
-                _unicode_decode(root, encoding=_encodings["fs"], errors="strict")
+                root.decode("utf-8", "strict") if isinstance(root, bytes) else root
             ),
             "",
         )
-        root_dir_length = len(
-            _unicode_encode(root_dir, encoding=_encodings["fs"], errors="strict")
-        )
+        root_dir_length = len(root_dir.encode("utf-8", "strict"))
 
         image_max_prefix_length = 0
         image_max_name_length = 0
@@ -2094,7 +2130,9 @@ class gpkg:
         paths = list(contents)
         for path in paths:
             try:
-                path = _unicode_decode(path, encoding=_encodings["fs"], errors="strict")
+                path = (
+                    path.decode("utf-8", "strict") if isinstance(path, bytes) else path
+                )
             except UnicodeDecodeError as err:
                 writemsg(colorize("BAD", f"\n*** {err}\n\n"), noiselevel=-1)
                 raise
@@ -2102,19 +2140,15 @@ class gpkg:
             d, f = os.path.split(path)
 
             prefix_length = (
-                len(_unicode_encode(d, encoding=_encodings["fs"], errors="strict"))
-                - root_dir_length
-                + image_prefix_length
+                len(d.encode("utf-8", "strict")) - root_dir_length + image_prefix_length
             )
             image_max_prefix_length = max(image_max_prefix_length, prefix_length)
 
-            filename_length = len(
-                _unicode_encode(f, encoding=_encodings["fs"], errors="strict")
-            )
+            filename_length = len(f.encode("utf-8", "strict"))
             image_max_name_length = max(image_max_name_length, filename_length)
 
             path_length = (
-                len(_unicode_encode(path, encoding=_encodings["fs"], errors="strict"))
+                len(path.encode("utf-8", "strict"))
                 - root_dir_length
                 + image_prefix_length
             )
@@ -2129,11 +2163,7 @@ class gpkg:
 
             if stat.S_ISLNK(file_stat.st_mode):
                 path_link = os.readlink(path)
-                path_link_length = len(
-                    _unicode_encode(
-                        path_link, encoding=_encodings["fs"], errors="strict"
-                    )
-                )
+                path_link_length = len(path_link.encode("utf-8", "strict"))
             elif file_stat.st_nlink > 1:
                 # Hardlink exists
                 path_link_length = path_length
@@ -2148,8 +2178,7 @@ class gpkg:
 
                 file_size = file_stat.st_size
                 image_total_size += file_size
-                if file_size > image_max_file_size:
-                    image_max_file_size = file_size
+                image_max_file_size = max(image_max_file_size, file_size)
 
         return (
             image_max_prefix_length,

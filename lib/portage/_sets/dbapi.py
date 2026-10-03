@@ -2,17 +2,17 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import glob
+import os
 import shlex
 import time
 
-from portage import os
-from portage.exception import PortageKeyError
-from portage.versions import best, catsplit, vercmp
+from portage._sets import SetConfigError, get_boolean
+from portage._sets.base import PackageSet
 from portage.dep import Atom, use_reduce
 from portage.dep._slot_operator import strip_slots
+from portage.exception import PortageKeyError
 from portage.localization import _
-from portage._sets.base import PackageSet
-from portage._sets import SetConfigError, get_boolean
+from portage.versions import best, catsplit, vercmp
 
 __all__ = [
     "CategorySet",
@@ -128,7 +128,7 @@ class OwnerSet(PackageSet):
         )
 
     def singleBuilder(cls, options, settings, trees):
-        if not "files" in options:
+        if "files" not in options:
             raise SetConfigError(_("no files given"))
 
         exclude_files = options.get("exclude-files")
@@ -177,7 +177,6 @@ class VariableSet(EverythingSet):
         if "DEPEND" in self._variable:
             include_atoms = []
             exclude_atoms = []
-            exclude_output_atoms = []
 
             # 'exclude_output' here refers to filtering out any packages
             # matching the 'includes' criteria
@@ -237,7 +236,7 @@ class VariableSet(EverythingSet):
             )
 
         metadatadb = options.get("metadata-source", "vartree")
-        if not metadatadb in trees:
+        if metadatadb not in trees:
             raise SetConfigError(
                 _("invalid value '%s' for option metadata-source") % metadatadb
             )
@@ -346,42 +345,7 @@ class UnavailableSet(EverythingSet):
 
     def singleBuilder(cls, options, settings, trees):
         metadatadb = options.get("metadata-source", "porttree")
-        if not metadatadb in trees:
-            raise SetConfigError(
-                _("invalid value '%s' for option " "metadata-source") % (metadatadb,)
-            )
-
-        return cls(trees["vartree"].dbapi, metadatadb=trees[metadatadb].dbapi)
-
-    singleBuilder = classmethod(singleBuilder)
-
-
-class UnavailableBinaries(EverythingSet):
-    _operations = (
-        "merge",
-        "unmerge",
-    )
-
-    description = (
-        "Package set which contains all installed "
-        + "packages for which corresponding binary packages "
-        + "are not available."
-    )
-
-    def __init__(self, vardb, metadatadb=None):
-        super().__init__(vardb)
-        self._metadatadb = metadatadb
-
-    def _filter(self, atom):
-        inst_pkg = self._db.match(atom)
-        if not inst_pkg:
-            return False
-        inst_cpv = inst_pkg[0]
-        return not self._metadatadb.cpv_exists(inst_cpv)
-
-    def singleBuilder(cls, options, settings, trees):
-        metadatadb = options.get("metadata-source", "bintree")
-        if not metadatadb in trees:
+        if metadatadb not in trees:
             raise SetConfigError(
                 _("invalid value '%s' for option " "metadata-source") % (metadatadb,)
             )
@@ -403,9 +367,8 @@ class CategorySet(PackageSet):
             s = "visible"
         else:
             s = "all"
-        self.description = "Package set containing {} packages of category {}".format(
-            s,
-            self._category,
+        self.description = (
+            f"Package set containing {s} packages of category {self._category}"
         )
 
     def load(self):
@@ -418,7 +381,7 @@ class CategorySet(PackageSet):
 
     def _builderGetRepository(cls, options, repositories):
         repository = options.get("repository", "porttree")
-        if not repository in repositories:
+        if repository not in repositories:
             raise SetConfigError(_("invalid repository class '%s'") % repository)
         return repository
 
@@ -430,11 +393,11 @@ class CategorySet(PackageSet):
     _builderGetVisible = classmethod(_builderGetVisible)
 
     def singleBuilder(cls, options, settings, trees):
-        if not "category" in options:
+        if "category" not in options:
             raise SetConfigError(_("no category given"))
 
         category = options["category"]
-        if not category in settings.categories:
+        if category not in settings.categories:
             raise SetConfigError(_("invalid category name '%s'") % category)
 
         repository = cls._builderGetRepository(options, trees.keys())
@@ -463,7 +426,7 @@ class CategorySet(PackageSet):
         visible = cls._builderGetVisible(options)
         name_pattern = options.get("name_pattern", "$category/*")
 
-        if not "$category" in name_pattern and not "${category}" in name_pattern:
+        if "$category" not in name_pattern and "${category}" not in name_pattern:
             raise SetConfigError(
                 _("name_pattern doesn't include $category placeholder")
             )
@@ -509,7 +472,7 @@ class AgeSet(EverythingSet):
             )
         try:
             age = int(options.get("age", "7"))
-        except ValueError as e:
+        except ValueError:
             raise SetConfigError(_("value of option 'age' is not an integer"))
         return AgeSet(vardb=trees["vartree"].dbapi, mode=mode, age=age)
 

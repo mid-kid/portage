@@ -5,7 +5,6 @@ from portage.dep import Atom, ExtendedAtomDict, best_match_to_list, match_from_l
 from portage.exception import InvalidAtom
 from portage.versions import cpv_getkey
 
-
 OPERATIONS = ["merge", "unmerge"]
 
 
@@ -42,7 +41,7 @@ class PackageSet:
         return bool(self._atoms or self._nonatoms)
 
     def supportsOperation(self, op):
-        if not op in OPERATIONS:
+        if op not in OPERATIONS:
             raise ValueError(op)
         return op in self._operations
 
@@ -60,6 +59,10 @@ class PackageSet:
     def getNonAtoms(self):
         self._load()
         return self._nonatoms.copy()
+
+    def isEmpty(self):
+        self._load()
+        return len(self._atoms) == 0 and len(self._nonatoms) == 0
 
     def _setAtoms(self, atoms):
         self._atoms.clear()
@@ -127,13 +130,7 @@ class PackageSet:
             if atom.cp == pkg.cp:
                 rev_transform[atom] = atom
             else:
-                rev_transform[
-                    Atom(
-                        atom.replace(atom.cp, pkg.cp, 1),
-                        allow_wildcard=True,
-                        allow_repo=True,
-                    )
-                ] = atom
+                rev_transform[atom.with_cp(pkg.cp)] = atom
         best_match = best_match_to_list(pkg, iter(rev_transform))
         if best_match:
             return rev_transform[best_match]
@@ -248,3 +245,19 @@ class DummyPackageSet(PackageSet):
         return DummyPackageSet(atoms=atoms)
 
     singleBuilder = classmethod(singleBuilder)
+
+
+class WildcardPackageSet(InternalPackageSet):
+    def __init__(self, initial_atoms, allow_repo=False):
+        super().__init__(initial_atoms, allow_wildcard=True, allow_repo=allow_repo)
+
+    def _implicitWildcarding(self, atom):
+        if isinstance(atom, Atom):
+            return atom
+        try:
+            return Atom(atom, allow_wildcard=True, allow_repo=self._allow_repo)
+        except InvalidAtom:
+            return Atom("*/" + atom, allow_wildcard=True, allow_repo=self._allow_repo)
+
+    def update(self, atoms):
+        super().update(self._implicitWildcarding(a) for a in atoms)

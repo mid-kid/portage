@@ -3,6 +3,7 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import syslog
+
 from portage.const import EBUILD_PHASES
 
 _pri = {
@@ -21,7 +22,7 @@ def process(mysettings, key, logentries, fulltext):
         syslog.LOG_LOCAL5,
     )
     for phase in EBUILD_PHASES:
-        if not phase in logentries:
+        if phase not in logentries:
             continue
         for msgtype, msgcontent in logentries[phase]:
             if isinstance(msgcontent, str):

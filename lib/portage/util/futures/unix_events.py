@@ -4,14 +4,12 @@
 __all__ = ("DefaultEventLoopPolicy",)
 
 import asyncio as _real_asyncio
-
 import fcntl
 import os
 
 from portage.util._eventloop.global_event_loop import (
     global_event_loop as _global_event_loop,
 )
-
 
 if hasattr(os, "set_blocking"):
 

@@ -3,24 +3,20 @@
 
 import codecs
 import operator
-import portage
+import os
 import re
 import sys
 import xml.dom.minidom
-
 from functools import reduce
-
 from io import StringIO
+from urllib.request import urlopen as urllib_request_urlopen
 
-from portage import _encodings, _unicode_decode, _unicode_encode
-from portage import os
+import portage
 from portage.const import PRIVATE_PATH
 from portage.dep import _slot_separator
 from portage.localization import _
 from portage.util import grabfile
 from portage.versions import pkgsplit, vercmp
-
-from urllib.request import urlopen as urllib_request_urlopen
 
 # Note: the space for rgt and rlt is important !!
 # FIXME: use slot deps instead, requires GLSA format versioning
@@ -151,7 +147,7 @@ def getListElements(listnode):
     @rtype:		List of Strings
     @return:	a list that contains the value of the <li> elements
     """
-    if not listnode.nodeName in ("ul", "ol"):
+    if listnode.nodeName not in ("ul", "ol"):
         raise GlsaFormatException("Invalid function call: listnode is not <ul> or <ol>")
     rValue = [
         getText(li, format="strip")
@@ -331,7 +327,7 @@ def match(atom, dbapi, match_type="default"):
     @rtype:		list of strings
     @return:	a list with the matching versions
     """
-    if atom[2] == "~":
+    if str(atom)[2] == "~":
         return revisionMatch(atom, dbapi, match_type=match_type)
     if match_type == "default" or not hasattr(dbapi, "xmatch"):
         return dbapi.match(atom)
@@ -469,9 +465,7 @@ def format_date(datestr):
         return datestr
 
     # TODO We could format to local date format '%x' here?
-    return _unicode_decode(
-        d.strftime("%B %d, %Y"), encoding=_encodings["content"], errors="replace"
-    )
+    return d.strftime("%B %d, %Y")
 
 
 # simple Exception classes to catch specific errors
@@ -515,7 +509,6 @@ class Glsa:
         @type	portdbapi: portage.dbapi.porttree.portdbapi
         @param	portdbapi: ebuild repository
         """
-        myid = _unicode_decode(myid, encoding=_encodings["content"], errors="strict")
         if re.match(r"\d{6}-\d{2}", myid):
             self.type = "id"
         elif os.path.exists(myid):
@@ -761,13 +754,13 @@ class Glsa:
                     for v in path["vul_atoms"]:
                         rValue = rValue or (
                             len(match(v, self.vardbapi)) > 0
-                            and None
-                            != getMinUpgrade(
+                            and getMinUpgrade(
                                 path["vul_atoms"],
                                 path["unaff_atoms"],
                                 self.portdbapi,
                                 self.vardbapi,
                             )
+                            is not None
                         )
         return rValue
 
@@ -796,16 +789,12 @@ class Glsa:
         """
         if not self.isInjected():
             checkfile = open(
-                _unicode_encode(
-                    os.path.join(self.config["EROOT"], PRIVATE_PATH, "glsa_injected"),
-                    encoding=_encodings["fs"],
-                    errors="strict",
-                ),
+                os.path.join(self.config["EROOT"], PRIVATE_PATH, "glsa_injected"),
                 mode="a+",
-                encoding=_encodings["content"],
+                encoding="utf-8",
                 errors="strict",
             )
-            checkfile.write(_unicode_decode(self.nr + "\n"))
+            checkfile.write(self.nr + "\n")
             checkfile.close()
 
     def getMergeList(self, least_change=True):

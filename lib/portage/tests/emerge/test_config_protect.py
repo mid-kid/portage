@@ -1,17 +1,15 @@
 # Copyright 2014-2015, 2023 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
-from functools import partial
+import os
 import shlex
 import shutil
-import stat
 import subprocess
 import sys
 import time
+from functools import partial
 
 import portage
-from portage import os
-from portage import _encodings, _unicode_decode
 from portage.const import BASH_BINARY, PORTAGE_PYM_PATH
 from portage.process import find_binary
 from portage.tests import TestCase
@@ -130,16 +128,17 @@ src_install() {
         config_protect = "/etc"
 
         def modify_files(dir_path):
-            for name in os.listdir(dir_path):
-                path = os.path.join(dir_path, name)
-                st = os.lstat(path)
-                if stat.S_ISREG(st.st_mode):
-                    with open(path, mode="a", encoding=_encodings["stdio"]) as f:
-                        f.write("modified at %d\n" % time.time())
-                elif stat.S_ISLNK(st.st_mode):
-                    old_dest = os.readlink(path)
-                    os.unlink(path)
-                    os.symlink(old_dest + " modified at %d" % time.time(), path)
+            with os.scandir(dir_path) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False):
+                        with open(entry.path, mode="a", encoding="utf-8") as f:
+                            f.write("modified at %d\n" % time.time())
+                    elif entry.is_symlink():
+                        old_dest = os.readlink(entry.path)
+                        os.unlink(entry.path)
+                        os.symlink(
+                            old_dest + " modified at %d" % time.time(), entry.path
+                        )
 
         def updated_config_files(count):
             self.assertEqual(
@@ -291,7 +290,7 @@ src_install() {
                     proc.stdout.close()
                     if proc.returncode != os.EX_OK:
                         for line in output:
-                            sys.stderr.write(_unicode_decode(line))
+                            sys.stderr.write(line.decode("utf-8", "replace"))
 
                 self.assertEqual(
                     os.EX_OK, proc.returncode, f"emerge failed with args {args}"

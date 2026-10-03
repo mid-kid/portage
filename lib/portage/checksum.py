@@ -6,16 +6,14 @@
 import errno
 import functools
 import hashlib
-import portage
+import os
+import queue
 import stat
-import subprocess
-import tempfile
+import threading
 
-from portage import _encodings, _unicode_decode, _unicode_encode
-from portage import os
-from portage.const import HASHING_BLOCKSIZE, PRELINK_BINARY
+import portage
+from portage.const import HASHING_BLOCKSIZE
 from portage.localization import _
-
 
 # Summary of all available hashes and their implementations,
 # most preferred first. Please keep this in sync with logic below.
@@ -32,7 +30,6 @@ from portage.localization import _
 # SHA3_256: hashlib
 # SHA3_512: hashlib
 
-
 # Dict of all available hash functions
 hashfunc_map = {}
 hashorigin_map = {}
@@ -40,11 +37,9 @@ hashorigin_map = {}
 
 def _open_file(filename):
     try:
-        return open(
-            _unicode_encode(filename, encoding=_encodings["fs"], errors="strict"), "rb"
-        )
+        return open(filename, "rb")
     except OSError as e:
-        func_call = f"open('{_unicode_decode(filename)}')"
+        func_call = f"open('{filename}')"
         if e.errno == errno.EPERM:
             raise portage.exception.OperationNotPermitted(func_call)
         elif e.errno == errno.EACCES:
@@ -129,7 +124,6 @@ for local_name, hash_name in (
             local_name, functools.partial(hashlib.new, hash_name), origin="hashlib"
         )
 
-
 # Use pycrypto when available, prefer it over the internal fallbacks
 # Check for 'new' attributes, since they can be missing if the module
 # is broken somehow.
@@ -162,7 +156,6 @@ if "RMD160" not in hashfunc_map:
         except ImportError:
             pass
 
-
 _whirlpool_unaccelerated = False
 if "WHIRLPOOL" not in hashfunc_map:
     # Bundled WHIRLPOOL implementation
@@ -190,41 +183,102 @@ hashfunc_keys = frozenset(hashfunc_map)
 # end actual hash functions
 
 
-prelink_capable = False
-if os.path.exists(PRELINK_BINARY):
-    cmd = [PRELINK_BINARY, "--version"]
-    cmd = [_unicode_encode(x, encoding=_encodings["fs"], errors="strict") for x in cmd]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    proc.communicate()
-    status = proc.wait()
-    if os.WIFEXITED(status) and os.WEXITSTATUS(status) == os.EX_OK:
-        prelink_capable = True
-    del cmd, proc, status
+def _raise_checksum_oserror(e, filename):
+    if e.errno in (errno.ENOENT, errno.ESTALE):
+        raise portage.exception.FileNotFound(filename)
+    elif e.errno == portage.exception.PermissionDenied.errno:
+        raise portage.exception.PermissionDenied(filename)
+    raise e
 
 
-def is_prelinkable_elf(filename):
+def _checksum_file_serial(filename, hashnames):
+    checksums = {name: hashfunc_map[name]._hashobject() for name in hashnames}
     with _open_file(filename) as f:
-        magic = f.read(17)
-    return (
-        len(magic) == 17
-        and magic.startswith(b"\x7fELF")
-        and magic[16:17] in (b"\x02", b"\x03")
-    )  # 2=ET_EXEC, 3=ET_DYN
+        blocksize = HASHING_BLOCKSIZE
+        data = f.read(blocksize)
+        while data:
+            for checksum in checksums.values():
+                checksum.update(data)
+            data = f.read(blocksize)
+    return {name: checksum.hexdigest() for name, checksum in checksums.items()}
 
 
-def perform_md5(x, calc_prelink=0):
-    return perform_checksum(x, "MD5", calc_prelink)[0]
+# hashlib releases the GIL during update(), so feeding one read to a
+# thread per hash runs the hashes on separate cores. Only worth the
+# thread/queue overhead above this size and with more than one hash.
+_CHECKSUM_PARALLEL_MIN_SIZE = 1024 * 1024
+# Bounded per-hash queue: a slow consumer applies backpressure instead of
+# buffering the whole file (depth * HASHING_BLOCKSIZE per hash).
+_CHECKSUM_PARALLEL_QUEUE_DEPTH = 32
+
+
+def _checksum_file_parallel(filename, hashnames):
+    results = {}
+    queues = []
+    threads = []
+
+    def worker(name, q):
+        checksum = hashfunc_map[name]._hashobject()
+        data = q.get()
+        while data is not None:
+            checksum.update(data)
+            data = q.get()
+        results[name] = checksum.hexdigest()
+
+    for name in hashnames:
+        q = queue.Queue(_CHECKSUM_PARALLEL_QUEUE_DEPTH)
+        t = threading.Thread(target=worker, args=(name, q))
+        queues.append(q)
+        threads.append(t)
+        t.start()
+
+    try:
+        with _open_file(filename) as f:
+            blocksize = HASHING_BLOCKSIZE
+            data = f.read(blocksize)
+            while data:
+                for q in queues:
+                    q.put(data)
+                data = f.read(blocksize)
+    finally:
+        for q in queues:
+            q.put(None)
+        for t in threads:
+            t.join()
+
+    return results
+
+
+def _perform_checksums(filename, hashes):
+    hashnames = [x for x in hashes if x != "size"]
+    want_size = "size" in hashes
+
+    rVal = {}
+    try:
+        statsize = os.stat(filename).st_size
+        if hashnames:
+            if len(hashnames) > 1 and statsize >= _CHECKSUM_PARALLEL_MIN_SIZE:
+                rVal.update(_checksum_file_parallel(filename, hashnames))
+            else:
+                rVal.update(_checksum_file_serial(filename, hashnames))
+    except OSError as e:
+        _raise_checksum_oserror(e, filename)
+
+    if want_size:
+        rVal["size"] = statsize
+    return rVal
+
+
+def perform_md5(x):
+    return perform_checksum(x, "MD5")[0]
 
 
 def _perform_md5_merge(x, **kwargs):
-    return perform_md5(
-        _unicode_encode(x, encoding=_encodings["merge"], errors="strict"), **kwargs
-    )
+    return perform_md5(x, **kwargs)
 
 
-def perform_all(x, calc_prelink=0):
-    mydict = {k: perform_checksum(x, k, calc_prelink)[0] for k in hashfunc_keys}
-    return mydict
+def perform_all(x):
+    return perform_multiple_checksums(x, hashes=hashfunc_keys)
 
 
 def get_valid_checksum_keys():
@@ -262,8 +316,8 @@ class _hash_filter:
     """
 
     __slots__ = (
-        "transparent",
         "_tokens",
+        "transparent",
     )
 
     def __init__(self, filter_str):
@@ -321,14 +375,12 @@ def _apply_hash_filter(digests, hash_filter):
     return digests
 
 
-def verify_all(filename, mydict, calc_prelink=0, strict=0):
+def verify_all(filename, mydict, strict=0):
     """
     Verify all checksums against a file.
 
     @param filename: File to run the checksums against
     @type filename: String
-    @param calc_prelink: Whether or not to reverse prelink before running the checksum
-    @type calc_prelink: Integer
     @param strict: Enable/Disable strict checking (which stops exactly at a checksum failure and throws an exception)
     @type strict: Integer
     @rtype: Tuple
@@ -370,25 +422,24 @@ def verify_all(filename, mydict, calc_prelink=0, strict=0):
         got = " ".join(got)
         return False, (_("Insufficient data for checksum verification"), got, expected)
 
-    for x in sorted(mydict):
-        if x == "size":
-            continue
-        elif x in hashfunc_keys:
-            myhash = perform_checksum(filename, x, calc_prelink=calc_prelink)[0]
-            if mydict[x] != myhash:
-                if strict:
-                    raise portage.exception.DigestException(
-                        f"Failed to verify '{filename}' on checksum type '{x}'"
-                    )
-                else:
-                    file_is_ok = False
-                    reason = (f"Failed on {x} verification", myhash, mydict[x])
-                    break
+    mychecksums = perform_multiple_checksums(filename, verifiable_hash_types)
+
+    for x in sorted(verifiable_hash_types):
+        myhash = mychecksums[x]
+        if mydict[x] != myhash:
+            if strict:
+                raise portage.exception.DigestException(
+                    f"Failed to verify '{filename}' on checksum type '{x}'"
+                )
+            else:
+                file_is_ok = False
+                reason = (f"Failed on {x} verification", myhash, mydict[x])
+                break
 
     return file_is_ok, reason
 
 
-def perform_checksum(filename, hashname="MD5", calc_prelink=0):
+def perform_checksum(filename, hashname="MD5"):
     """
     Run a specific checksum against a file. The filename can
     be either unicode or an encoded byte string. If filename
@@ -399,58 +450,21 @@ def perform_checksum(filename, hashname="MD5", calc_prelink=0):
     @type filename: String
     @param hashname: The type of hash function to run
     @type hashname: String
-    @param calc_prelink: Whether or not to reverse prelink before running the checksum
-    @type calc_prelink: Integer
     @rtype: Tuple
     @return: The hash and size of the data
     """
-    global prelink_capable
-    # Make sure filename is encoded with the correct encoding before
-    # it is passed to spawn (for prelink) and/or the hash function.
-    filename = _unicode_encode(filename, encoding=_encodings["fs"], errors="strict")
-    myfilename = filename
-    prelink_tmpfile = None
+    if hashname not in hashfunc_keys:
+        raise portage.exception.DigestException(
+            f"{hashname} hash function not available (needs dev-python/pycrypto)"
+        )
     try:
-        if calc_prelink and prelink_capable and is_prelinkable_elf(filename):
-            # Create non-prelinked temporary file to checksum.
-            # Files rejected by prelink are summed in place.
-            try:
-                tmpfile_fd, prelink_tmpfile = tempfile.mkstemp()
-                try:
-                    retval = portage.process.spawn(
-                        [PRELINK_BINARY, "--verify", filename], fd_pipes={1: tmpfile_fd}
-                    )
-                finally:
-                    os.close(tmpfile_fd)
-                if retval == os.EX_OK:
-                    myfilename = prelink_tmpfile
-            except portage.exception.CommandNotFound:
-                # This happens during uninstallation of prelink.
-                prelink_capable = False
-        try:
-            if hashname not in hashfunc_keys:
-                raise portage.exception.DigestException(
-                    f"{hashname} hash function not available (needs dev-python/pycrypto)"
-                )
-            myhash, mysize = hashfunc_map[hashname].checksum_file(myfilename)
-        except OSError as e:
-            if e.errno in (errno.ENOENT, errno.ESTALE):
-                raise portage.exception.FileNotFound(myfilename)
-            elif e.errno == portage.exception.PermissionDenied.errno:
-                raise portage.exception.PermissionDenied(myfilename)
-            raise
-        return myhash, mysize
-    finally:
-        if prelink_tmpfile:
-            try:
-                os.unlink(prelink_tmpfile)
-            except OSError as e:
-                if e.errno != errno.ENOENT:
-                    raise
-                del e
+        myhash, mysize = hashfunc_map[hashname].checksum_file(filename)
+    except OSError as e:
+        _raise_checksum_oserror(e, filename)
+    return myhash, mysize
 
 
-def perform_multiple_checksums(filename, hashes=["MD5"], calc_prelink=0):
+def perform_multiple_checksums(filename, hashes=["MD5"]):
     """
     Run a group of checksums against a file.
 
@@ -458,21 +472,17 @@ def perform_multiple_checksums(filename, hashes=["MD5"], calc_prelink=0):
     @type filename: String
     @param hashes: A list of checksum functions to run against the file
     @type hashname: List
-    @param calc_prelink: Whether or not to reverse prelink before running the checksum
-    @type calc_prelink: Integer
     @rtype: Tuple
     @return: A dictionary in the form:
             return_value[hash_name] = (hash_result,size)
             for each given checksum
     """
-    rVal = {}
     for x in hashes:
         if x not in hashfunc_keys:
             raise portage.exception.DigestException(
                 f"{x} hash function not available (needs dev-python/pycrypto)"
             )
-        rVal[x] = perform_checksum(filename, x, calc_prelink)[0]
-    return rVal
+    return _perform_checksums(filename, hashes)
 
 
 def checksum_str(data, hashname="MD5"):

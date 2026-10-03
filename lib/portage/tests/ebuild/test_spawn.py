@@ -2,15 +2,15 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import errno
+import os
 import tempfile
+
+from _emerge.SpawnProcess import SpawnProcess
+
 import portage
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
 from portage.const import BASH_BINARY
 from portage.tests import TestCase
 from portage.util._eventloop.global_event_loop import global_event_loop
-from _emerge.SpawnProcess import SpawnProcess
 
 
 class SpawnTestCase(TestCase):
@@ -32,8 +32,8 @@ class SpawnTestCase(TestCase):
             os.close(null_fd)
             self.assertEqual(proc.wait(), os.EX_OK)
             f = open(
-                _unicode_encode(logfile, encoding=_encodings["fs"], errors="strict"),
-                encoding=_encodings["content"],
+                logfile,
+                encoding="utf-8",
                 errors="strict",
             )
             log_content = f.read()

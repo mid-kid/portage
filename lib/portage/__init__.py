@@ -1,4 +1,4 @@
-# Copyright 1998-2025 Gentoo Authors
+# Copyright 1998-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 # pylint: disable=ungrouped-imports
 
@@ -10,57 +10,37 @@ from portage import installation
 
 try:
     import asyncio
-    import sys
     import errno
+    import sys
 
     if not hasattr(errno, "ESTALE"):
         # ESTALE may not be defined on some systems, such as interix.
         errno.ESTALE = -1
     import functools
-    import re
-    import types
     import platform
-
-    # Temporarily delete these imports, to ensure that only the
-    # wrapped versions are imported by portage internals.
-    import os
-
-    del os
-    import shutil
-
-    del shutil
+    import re
 
 except ImportError as e:
-    sys.stderr.write("\n\n")
     sys.stderr.write(
+        "\n\n"
         "!!! Failed to complete python imports. These are internal modules for\n"
-    )
-    sys.stderr.write(
         "!!! python and failure here indicates that you have a problem with python\n"
-    )
-    sys.stderr.write(
         "!!! itself and thus portage is not able to continue processing.\n\n"
-    )
-
-    sys.stderr.write(
         "!!! You might consider starting python with verbose flags to see what has\n"
-    )
-    sys.stderr.write(
         "!!! gone wrong. Here is the information we got for this exception:\n"
+        f"    {e}\n\n"
     )
-    sys.stderr.write(f"    {e}\n\n")
     raise
 
 try:
     import portage.proxy.lazyimport
-    import portage.proxy as proxy
+    from portage import proxy
 
     proxy.lazyimport.lazyimport(
         globals(),
         "portage.cache.cache_errors:CacheError",
         "portage.checksum",
-        "portage.checksum:perform_checksum,perform_md5,prelink_capable",
-        "portage.cvstree",
+        "portage.checksum:perform_checksum,perform_md5",
         "portage.data",
         "portage.data:lchown,ostype,portage_gid,portage_uid,secpass,"
         + "uid,userland,userpriv_groups,wheelgid",
@@ -90,8 +70,7 @@ try:
         "portage.output:bold,colorize",
         "portage.package.ebuild.doebuild:doebuild,"
         + "doebuild_environment,spawn,spawnebuild",
-        "portage.package.ebuild.config:autouse,best_from_dict,"
-        + "check_config_instance,config",
+        "portage.package.ebuild.config:best_from_dict,check_config_instance,config",
         "portage.package.ebuild.deprecated_profile_check:deprecated_profile_check",
         "portage.package.ebuild.digestcheck:digestcheck",
         "portage.package.ebuild.digestgen:digestgen",
@@ -101,7 +80,7 @@ try:
         "portage.package.ebuild.prepare_build_dirs:prepare_build_dirs",
         "portage.process",
         "portage.process:atexit_register,run_exitfuncs",
-        "portage.update:dep_transform,fixdbentries,grab_updates,"
+        "portage.update:dep_transform,grab_updates,"
         + "parse_updates,update_config_files,update_dbentries,"
         + "update_dbentry",
         "portage.util",
@@ -109,7 +88,7 @@ try:
         + "apply_recursive_permissions,dump_traceback,getconfig,"
         + "grabdict,grabdict_package,grabfile,grabfile_package,"
         + "map_dictlist_vals,new_protect_filename,normalize_path,"
-        + "pickle_read,pickle_write,stack_dictlist,stack_dicts,"
+        + "stack_dictlist,stack_dicts,"
         + "stack_lists,unique_array,varexpand,writedict,writemsg,"
         + "writemsg_stdout,write_atomic",
         "portage.util.digraph:digraph",
@@ -124,7 +103,6 @@ try:
         + "suffix_value@endversion,pkgcmp,pkgsplit,vercmp,ververify",
         "portage.xpak",
         "portage.gpkg",
-        "subprocess",
         "time",
     )
 
@@ -132,37 +110,36 @@ try:
 
     import portage.const
     from portage.const import (
-        VDB_PATH,
-        PRIVATE_PATH,
+        BASH_BINARY,
         CACHE_PATH,
-        DEPCACHE_PATH,
-        USER_CONFIG_PATH,
-        MODULES_FILE_PATH,
+        CONFIG_MEMORY_FILE,
+        CUSTOM_MIRRORS_FILE,
         CUSTOM_PROFILE_PATH,
+        DEPCACHE_PATH,
+        DEPRECATED_PROFILE_FILE,
+        EAPI,
+        EBUILD_SH_BINARY,
+        EBUILD_SH_ENV_FILE,
+        INCREMENTALS,
+        INVALID_ENV_FILE,
+        LOCALE_DATA_PATH,
+        MAKE_CONF_FILE,
+        MAKE_DEFAULTS_FILE,
+        MISC_SH_BINARY,
+        MODULES_FILE_PATH,
+        MOVE_BINARY,
         PORTAGE_BASE_PATH,
         PORTAGE_BIN_PATH,
         PORTAGE_PYM_PATH,
+        PRIVATE_PATH,
         PROFILE_PATH,
-        LOCALE_DATA_PATH,
-        EBUILD_SH_BINARY,
-        SANDBOX_BINARY,
-        BASH_BINARY,
-        MOVE_BINARY,
-        PRELINK_BINARY,
-        WORLD_FILE,
-        MAKE_CONF_FILE,
-        MAKE_DEFAULTS_FILE,
-        DEPRECATED_PROFILE_FILE,
-        USER_VIRTUALS_FILE,
-        EBUILD_SH_ENV_FILE,
-        INVALID_ENV_FILE,
-        CUSTOM_MIRRORS_FILE,
-        CONFIG_MEMORY_FILE,
-        INCREMENTALS,
-        EAPI,
-        MISC_SH_BINARY,
-        REPO_NAME_LOC,
         REPO_NAME_FILE,
+        REPO_NAME_LOC,
+        SANDBOX_BINARY,
+        USER_CONFIG_PATH,
+        USER_VIRTUALS_FILE,
+        VDB_PATH,
+        WORLD_FILE,
     )
 
 except ImportError as e:
@@ -186,29 +163,9 @@ except ImportError as e:
     sys.stderr.write(f"    {e}\n\n")
     raise
 
-utf8_mode = sys.getfilesystemencoding() == "utf-8"
+import os
 
-# We use utf_8 encoding everywhere. Previously, we used
-# sys.getfilesystemencoding() for the 'merge' encoding, but that had
-# various problems:
-#
-#   1) If the locale is ever changed then it can cause orphan files due
-#      to changed character set translation.
-#
-#   2) Ebuilds typically install files with utf_8 encoded file names,
-#      and then portage would be forced to rename those files to match
-#      sys.getfilesystemencoding(), possibly breaking things.
-#
-#   3) Automatic translation between encodings can lead to nonsensical
-#      file names when the source encoding is unknown by portage.
-#
-#   4) It's inconvenient for ebuilds to convert the encodings of file
-#      names to match the current locale, and upstreams typically encode
-#      file names with utf_8 encoding.
-#
-# So, instead of relying on sys.getfilesystemencoding(), we avoid the above
-# problems by using a constant utf_8 'merge' encoding for all locales, as
-# discussed in bug #382199 and bug #381509.
+# Deprecated: retained for third-party compatibility.
 _encodings = {
     "content": "utf_8",
     "fs": "utf_8",
@@ -218,21 +175,27 @@ _encodings = {
 }
 
 
-def _decode_argv(argv):
-    # With Python 3, the surrogateescape encoding error handler makes it
-    # possible to access the original argv bytes, which can be useful
-    # if their actual encoding does no match the filesystem encoding.
-    fs_encoding = sys.getfilesystemencoding()
-    return [_unicode_decode(x.encode(fs_encoding, "surrogateescape")) for x in argv]
-
-
 def _unicode_encode(s, encoding=_encodings["content"], errors="backslashreplace"):
+    import warnings
+
+    warnings.warn(
+        "portage._unicode_encode is deprecated",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if isinstance(s, str):
         s = s.encode(encoding, errors)
     return s
 
 
 def _unicode_decode(s, encoding=_encodings["content"], errors="replace"):
+    import warnings
+
+    warnings.warn(
+        "portage._unicode_decode is deprecated",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if isinstance(s, bytes):
         s = str(s, encoding=encoding, errors=errors)
     return s
@@ -241,153 +204,17 @@ def _unicode_decode(s, encoding=_encodings["content"], errors="replace"):
 _native_string = _unicode_decode
 
 
-class _unicode_func_wrapper:
-    """
-    Wraps a function, converts arguments from unicode to bytes,
-    and return values to unicode from bytes. Function calls
-    will raise UnicodeEncodeError if an argument fails to be
-    encoded with the required encoding. Return values that
-    are single strings are decoded with errors='replace'. Return
-    values that are lists of strings are decoded with errors='strict'
-    and elements that fail to be decoded are omitted from the returned
-    list.
-    """
-
-    __slots__ = ("_func", "_encoding")
-
-    def __init__(self, func, encoding=_encodings["fs"]):
-        self._func = func
-        self._encoding = encoding
-
-    def _process_args(self, args, kwargs):
-        encoding = self._encoding
-        wrapped_args = [
-            _unicode_encode(x, encoding=encoding, errors="strict") for x in args
-        ]
-        if kwargs:
-            wrapped_kwargs = {
-                k: _unicode_encode(v, encoding=encoding, errors="strict")
-                for k, v in kwargs.items()
-            }
-        else:
-            wrapped_kwargs = {}
-
-        return (wrapped_args, wrapped_kwargs)
-
-    def __call__(self, *args, **kwargs):
-        encoding = self._encoding
-        wrapped_args, wrapped_kwargs = self._process_args(args, kwargs)
-
-        rval = self._func(*wrapped_args, **wrapped_kwargs)
-
-        # Don't use isinstance() since we don't want to convert subclasses
-        # of tuple such as posix.stat_result in Python >=3.2.
-        if rval.__class__ in (list, tuple):
-            decoded_rval = []
-            for x in rval:
-                try:
-                    x = _unicode_decode(x, encoding=encoding, errors="strict")
-                except UnicodeDecodeError:
-                    pass
-                else:
-                    decoded_rval.append(x)
-
-            if isinstance(rval, tuple):
-                rval = tuple(decoded_rval)
-            else:
-                rval = decoded_rval
-        else:
-            rval = _unicode_decode(rval, encoding=encoding, errors="replace")
-
-        return rval
-
-
-class _unicode_module_wrapper:
-    """
-    Wraps a module and wraps all functions with _unicode_func_wrapper.
-    """
-
-    __slots__ = ("_mod", "_encoding", "_overrides", "_cache")
-
-    def __init__(self, mod, encoding=_encodings["fs"], overrides=None, cache=True):
-        object.__setattr__(self, "_mod", mod)
-        object.__setattr__(self, "_encoding", encoding)
-        object.__setattr__(self, "_overrides", overrides)
-        if cache:
-            cache = {}
-        else:
-            cache = None
-        object.__setattr__(self, "_cache", cache)
-
-    def __getattribute__(self, attr):
-        if utf8_mode:
-            return getattr(object.__getattribute__(self, "_mod"), attr)
-
-        cache = object.__getattribute__(self, "_cache")
-        if cache is not None:
-            result = cache.get(attr)
-            if result is not None:
-                return result
-        result = getattr(object.__getattribute__(self, "_mod"), attr)
-        encoding = object.__getattribute__(self, "_encoding")
-        overrides = object.__getattribute__(self, "_overrides")
-        override = None
-        if overrides is not None:
-            override = overrides.get(id(result))
-        if override is not None:
-            result = override
-        elif isinstance(result, type):
-            pass
-        elif type(result) is types.ModuleType:
-            result = _unicode_module_wrapper(
-                result, encoding=encoding, overrides=overrides
-            )
-        elif hasattr(result, "__call__"):
-            result = _unicode_func_wrapper(result, encoding=encoding)
-        if cache is not None:
-            cache[attr] = result
-        return result
-
-
-import os as _os
-
-_os_overrides = {
-    id(_os.fdopen): _os.fdopen,
-    id(_os.popen): _os.popen,
-    id(_os.read): _os.read,
-    id(_os.system): _os.system,
-    id(_os.waitpid): _os.waitpid,
-}
-
-
-_os_overrides[id(_os.mkfifo)] = _os.mkfifo
-
-if hasattr(_os, "statvfs"):
-    _os_overrides[id(_os.statvfs)] = _os.statvfs
-
-os = _unicode_module_wrapper(_os, overrides=_os_overrides, encoding=_encodings["fs"])
-_os_merge = _unicode_module_wrapper(
-    _os, encoding=_encodings["merge"], overrides=_os_overrides
-)
-
-import shutil as _shutil
-
-shutil = _unicode_module_wrapper(_shutil, encoding=_encodings["fs"])
-
-# Imports below this point rely on the above unicode wrapper definitions.
 try:
     __import__("selinux")
     import portage._selinux
 
-    selinux = _unicode_module_wrapper(_selinux, encoding=_encodings["fs"])
-    _selinux_merge = _unicode_module_wrapper(_selinux, encoding=_encodings["merge"])
+    selinux = _selinux
 except (ImportError, OSError) as e:
     if isinstance(e, OSError):
         sys.stderr.write(f"!!! SELinux not loaded: {e}\n")
     del e
     _selinux = None
     selinux = None
-    _selinux_merge = None
 
 # ===========================================================================
 # END OF IMPORTS -- END OF IMPORTS -- END OF IMPORTS -- END OF IMPORTS -- END
@@ -409,6 +236,30 @@ _internal_caller = False
 
 _sync_mode = False
 
+if sys.getfilesystemencoding().lower().replace("-", "") not in ("utf8",):
+    import warnings
+
+    warnings.warn(
+        "portage requires a UTF-8 locale. "
+        "Set PYTHONUTF8=1 or configure a UTF-8 locale.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+import multiprocessing
+
+# Prefer the environment variable if set. Otherwise, change away from
+# forkserver if in use.
+_multiprocessing_method = os.environ.get("PORTAGE_MULTIPROCESSING_START_METHOD")
+if not _multiprocessing_method:
+    _multiprocessing_method = multiprocessing.get_start_method(allow_none=False)
+    if _multiprocessing_method == "forkserver":
+        # Undo the Python 3.14 default change on Linux from fork->forkserver
+        # because of various problems (bug #973043, bug #973571).
+        _multiprocessing_method = "fork"
+if _multiprocessing_method:
+    multiprocessing.set_start_method(_multiprocessing_method, force=True)
+
 
 class _ForkWatcher:
     @staticmethod
@@ -424,13 +275,15 @@ _ForkWatcher.hook(_ForkWatcher)
 
 os.register_at_fork(after_in_child=functools.partial(_ForkWatcher.hook, _ForkWatcher))
 
+portage._uname = None
+
 
 def getpid():
     """
     Cached version of os.getpid(). ForkProcess updates the cache.
     """
     if _ForkWatcher.current_pid is None:
-        _ForkWatcher.current_pid = _os.getpid()
+        _ForkWatcher.current_pid = os.getpid()
     return _ForkWatcher.current_pid
 
 
@@ -444,6 +297,15 @@ def _get_stdin():
     if not sys.__stdin__.closed:
         return sys.__stdin__
     return sys.stdin
+
+
+def uname():
+    """
+    Cached version of os.uname().
+    """
+    if portage._uname is None:
+        portage._uname = os.uname()
+    return portage._uname
 
 
 bsd_chflags = None
@@ -601,15 +463,14 @@ class _trees_dict(dict):
 def create_trees(
     config_root=None, target_root=None, trees=None, env=None, sysroot=None, eprefix=None
 ):
-    if utf8_mode:
-        config_root = (
-            os.fsdecode(config_root) if isinstance(config_root, bytes) else config_root
-        )
-        target_root = (
-            os.fsdecode(target_root) if isinstance(target_root, bytes) else target_root
-        )
-        sysroot = os.fsdecode(sysroot) if isinstance(sysroot, bytes) else sysroot
-        eprefix = os.fsdecode(eprefix) if isinstance(eprefix, bytes) else eprefix
+    config_root = (
+        os.fsdecode(config_root) if isinstance(config_root, bytes) else config_root
+    )
+    target_root = (
+        os.fsdecode(target_root) if isinstance(target_root, bytes) else target_root
+    )
+    sysroot = os.fsdecode(sysroot) if isinstance(sysroot, bytes) else sysroot
+    eprefix = os.fsdecode(eprefix) if isinstance(eprefix, bytes) else eprefix
 
     if trees is None:
         trees = _trees_dict()
@@ -700,17 +561,34 @@ if installation.TYPE == installation.TYPES.SOURCE:
                 return VERSION
             VERSION = "HEAD"
             if os.path.isdir(os.path.join(PORTAGE_BASE_PATH, ".git")):
+                import subprocess
+
                 try:
                     result = subprocess.run(
-                        ["git", "describe", "--dirty", "--match", "portage-*"],
+                        [
+                            "git",
+                            "describe",
+                            "--dirty",
+                            "--long",
+                            "--match",
+                            "portage-*",
+                        ],
                         capture_output=True,
                         cwd=PORTAGE_BASE_PATH,
-                        encoding=_encodings["stdio"],
+                        encoding="utf-8",
                     )
                     if result.returncode == 0:
-                        VERSION = (
-                            result.stdout.lstrip("portage-").strip().replace("-g", "+g")
-                        )
+                        # https://peps.python.org/pep-0440/
+                        VERSION, commits_since_tag, commit, dirty = re.fullmatch(
+                            "portage-([0-9.]*)-([0-9]*)-(g[0-9a-z]*)(-dirty)?",
+                            result.stdout.strip(),
+                        ).groups()
+                        if commits_since_tag != "0":
+                            VERSION += f".dev{commits_since_tag}+{commit}"
+                            if dirty is not None:
+                                VERSION += "-dirty"
+                        elif dirty is not None:
+                            VERSION += "+dirty"
                 except OSError:
                     pass
             return VERSION

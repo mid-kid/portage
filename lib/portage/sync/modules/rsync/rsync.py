@@ -3,6 +3,7 @@
 
 import datetime
 import logging
+import os
 import random
 import re
 import shlex
@@ -15,10 +16,8 @@ import time
 from _emerge.UserQuery import UserQuery
 
 import portage
-from portage import _unicode_decode
-from portage import os
-from portage.const import VCS_DIRS, TIMESTAMP_FORMAT, RSYNC_PACKAGE_ATOM
-from portage.output import create_color_func, yellow, blue, bold
+from portage.const import RSYNC_PACKAGE_ATOM, TIMESTAMP_FORMAT, VCS_DIRS
+from portage.output import blue, bold, create_color_func, yellow
 from portage.process import has_ipv6
 from portage.sync.getaddrinfo_validate import getaddrinfo_validate
 from portage.sync.syncbase import NewBase
@@ -30,12 +29,11 @@ bad = create_color_func("BAD")
 warn = create_color_func("WARN")
 
 try:
-    from gemato.exceptions import GematoException
     import gemato.openpgp
     import gemato.recursiveloader
+    from gemato.exceptions import GematoException
 except ImportError:
     gemato = None
-
 
 SERVER_OUT_OF_DATE = -1
 EXCEEDED_MAX_RETRIES = -2
@@ -200,7 +198,7 @@ class RsyncSync(NewBase):
 
             try:
                 maxretries = int(self.settings["PORTAGE_RSYNC_RETRIES"])
-            except SystemExit as e:
+            except SystemExit:
                 raise  # Needed else can't exit
             except:
                 maxretries = -1  # default number of retries
@@ -268,8 +266,7 @@ class RsyncSync(NewBase):
                     )
                 except OSError as e:
                     writemsg_level(
-                        "!!! getaddrinfo failed for '%s': %s\n"
-                        % (_unicode_decode(hostname), str(e)),
+                        f"!!! getaddrinfo failed for '{hostname}': {e!s}\n",
                         noiselevel=-1,
                         level=logging.ERROR,
                     )
@@ -335,7 +332,7 @@ class RsyncSync(NewBase):
                     dosyncuri = uris.pop()
                 elif maxretries < 0 or retries > maxretries:
                     writemsg(
-                        f"!!! Exhausted addresses for {_unicode_decode(hostname)}\n",
+                        f"!!! Exhausted addresses for {hostname}\n",
                         noiselevel=-1,
                     )
                     return (1, False)
@@ -478,6 +475,7 @@ class RsyncSync(NewBase):
                         )
                         exitcode = 1
                         verify_failure = True
+                        out.eend(1)
 
             if exitcode == 0 and not local_state_unchanged:
                 self.repo_storage.commit_update()

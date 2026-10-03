@@ -1,17 +1,17 @@
 # Copyright 2012-2023 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 import sys
 import textwrap
 
 import portage
-from portage import os
+from portage._global_updates import _do_global_updates
 from portage.const import SUPPORTED_GENTOO_BINPKG_FORMATS
+from portage.output import colorize
 from portage.tests import TestCase
 from portage.tests.resolver.ResolverPlayground import ResolverPlayground
 from portage.util import ensure_dirs
-from portage._global_updates import _do_global_updates
-from portage.output import colorize
 
 
 class MoveSlotEntTestCase(TestCase):
@@ -69,13 +69,11 @@ class MoveSlotEntTestCase(TestCase):
             },
         }
 
-        updates = textwrap.dedent(
-            """
+        updates = textwrap.dedent("""
 			slotmove dev-libs/A 0 2
 			slotmove dev-libs/B 0 1
 			slotmove dev-libs/C 0 1
-		"""
-        )
+		""")
 
         for binpkg_format in SUPPORTED_GENTOO_BINPKG_FORMATS:
             with self.subTest(binpkg_format=binpkg_format):
@@ -212,13 +210,11 @@ class MoveSlotEntTestCase(TestCase):
             },
         }
 
-        updates = textwrap.dedent(
-            """
+        updates = textwrap.dedent("""
 			slotmove dev-libs/A 0 2
 			slotmove dev-libs/B 0 1
 			slotmove dev-libs/C 0 1
-		"""
-        )
+		""")
 
         for binpkg_format in ("gpkg",):
             with self.subTest(binpkg_format=binpkg_format):

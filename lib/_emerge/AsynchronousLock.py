@@ -3,14 +3,15 @@
 
 import fcntl
 import logging
+import os
 import sys
 import threading
 
 import portage
-from portage import os
 from portage.exception import TryAgain
 from portage.locks import lockfile, unlockfile
 from portage.util import writemsg_level
+
 from _emerge.AbstractPollTask import AbstractPollTask
 from _emerge.AsynchronousTask import AsynchronousTask
 from _emerge.SpawnProcess import SpawnProcess

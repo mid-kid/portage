@@ -1,4 +1,4 @@
-# Copyright 2004-2023 Gentoo Authors
+# Copyright 2004-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 """
@@ -6,21 +6,22 @@ Portage: Lock management code
 """
 
 __all__ = [
-    "lockdir",
-    "unlockdir",
-    "lockfile",
-    "unlockfile",
-    "hardlock_name",
     "hardlink_is_mine",
     "hardlink_lockfile",
-    "unhardlink_lockfile",
     "hardlock_cleanup",
+    "hardlock_name",
+    "lockdir",
+    "lockfile",
+    "unhardlink_lockfile",
+    "unlockdir",
+    "unlockfile",
 ]
 
 import errno
 import fcntl
 import functools
 import multiprocessing
+import os
 import sys
 import tempfile
 import time
@@ -28,20 +29,18 @@ import typing
 import warnings
 
 import portage
-from portage import os, _encodings, _unicode_decode
 from portage.exception import (
     DirectoryNotFound,
     FileNotFound,
     InvalidData,
-    TryAgain,
     OperationNotPermitted,
     PermissionDenied,
     ReadOnlyFileSystem,
+    TryAgain,
 )
+from portage.localization import _
 from portage.util import writemsg
 from portage.util.install_mask import _raise_exc
-from portage.localization import _
-
 
 HARDLINK_FD = -2
 _HARDLINK_POLL_LATENCY = 3  # seconds
@@ -49,7 +48,6 @@ _HARDLINK_POLL_LATENCY = 3  # seconds
 # Used by emerge in order to disable the "waiting for lock" message
 # so that it doesn't interfere with the status display.
 _quiet = False
-
 
 _lock_fn = None
 _open_fds = {}
@@ -380,9 +378,9 @@ def _lockfile_iteration(
                 # to close the file descriptor because it may
                 # still be in use.
                 os.close(myfd)
-            lockfilename_path = _unicode_decode(
-                lockfilename_path, encoding=_encodings["fs"], errors="strict"
-            )
+            if isinstance(lockfilename_path, bytes):
+                if isinstance(lockfilename_path, bytes):
+                    lockfilename_path = lockfilename_path.decode("utf-8", "strict")
             if not isinstance(lockfilename_path, str):
                 raise
             link_success = hardlink_lockfile(
@@ -399,7 +397,7 @@ def _lockfile_iteration(
     fstat_result = None
     if isinstance(lockfilename, str) and myfd != HARDLINK_FD and unlinkfile:
         try:
-            (removed, fstat_result) = _lockfile_was_removed(myfd, lockfilename)
+            removed, fstat_result = _lockfile_was_removed(myfd, lockfilename)
         except Exception:
             # Do not leak the file descriptor here.
             os.close(myfd)
@@ -580,10 +578,10 @@ def unlockfile(mytuple):
 
 def hardlock_name(path):
     base, tail = os.path.split(path)
+    myhost = portage.uname()[1]
     return os.path.join(
         base,
-        ".%s.hardlock-%s-%s"
-        % (tail, portage._decode_argv([os.uname()[1]])[0], portage.getpid()),
+        f".{tail}.hardlock-{myhost}-{portage.getpid()}",
     )
 
 
@@ -753,16 +751,18 @@ def unhardlink_lockfile(lockfilename, unlinkfile=True):
 
 
 def hardlock_cleanup(path, remove_all_locks=False):
-    myhost = portage._decode_argv([os.uname()[1]])[0]
-    mydl = os.listdir(path)
+    myhost = portage.uname()[1]
 
     results = []
     mycount = 0
 
     mylist = {}
-    for x in mydl:
-        if os.path.isfile(path + "/" + x):
-            parts = x.split(".hardlock-")
+    with os.scandir(path) as mydl:
+        for x in mydl:
+            if not x.is_file():
+                continue
+
+            parts = x.name.split(".hardlock-")
             if len(parts) == 2:
                 filename = parts[0][1:]
                 hostpid = parts[1].split("-")
@@ -777,7 +777,7 @@ def hardlock_cleanup(path, remove_all_locks=False):
 
                 mycount += 1
 
-    results.append(_("Found %(count)s locks") % {"count": mycount})
+        results.append(_("Found %(count)s locks") % {"count": mycount})
 
     for x in mylist:
         if myhost in mylist[x] or remove_all_locks:

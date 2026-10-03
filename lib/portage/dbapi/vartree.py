@@ -3,53 +3,6 @@
 
 __all__ = ["vardbapi", "vartree", "dblink"] + ["write_contents", "tar_contents"]
 
-import portage
-
-from portage.const import (
-    CACHE_PATH,
-    CONFIG_MEMORY_FILE,
-    MERGING_IDENTIFIER,
-    PACKDEBUG_PATH,
-    PORTAGE_PACKAGE_ATOM,
-    PRIVATE_PATH,
-    VDB_PATH,
-    SUPPORTED_GENTOO_BINPKG_FORMATS,
-)
-from portage.dbapi import dbapi
-from portage.exception import (
-    CommandNotFound,
-    CorruptionKeyError,
-    InvalidData,
-    InvalidLocation,
-    InvalidPackageName,
-    InvalidBinaryPackageFormat,
-    FileNotFound,
-    PermissionDenied,
-    UnsupportedAPIException,
-)
-from portage.localization import _
-from portage.util.futures import asyncio
-
-from portage import abssymlink, _movefile, bsd_chflags
-
-# This is a special version of the os module, wrapped for unicode support.
-from portage import os
-from portage import shutil
-from portage import _encodings
-from portage import _os_merge
-from portage import _selinux_merge
-from portage import _unicode_decode
-from portage import _unicode_encode
-from portage.util.futures.executor.fork import ForkExecutor
-from ._VdbMetadataDelta import VdbMetadataDelta
-
-from _emerge.EbuildBuildDir import EbuildBuildDir
-from _emerge.EbuildPhase import EbuildPhase
-from _emerge.emergelog import emergelog
-from _emerge.MiscFunctionsProcess import MiscFunctionsProcess
-from _emerge.SpawnProcess import SpawnProcess
-from ._ContentsCaseSensitivityManager import ContentsCaseSensitivityManager
-
 import argparse
 import errno
 import filecmp
@@ -58,21 +11,356 @@ import functools
 import gc
 import grp
 import io
-from itertools import chain
 import logging
 import multiprocessing
-import os as _os
 import operator
-import pickle
+import os
 import platform
 import pwd
 import re
 import shlex
+import shutil
 import stat
 import tempfile
 import textwrap
 import time
 import warnings
+from enum import Enum, auto
+from itertools import chain
+
+from _emerge.EbuildBuildDir import EbuildBuildDir
+from _emerge.EbuildPhase import EbuildPhase
+from _emerge.emergelog import emergelog
+from _emerge.MiscFunctionsProcess import MiscFunctionsProcess
+from _emerge.SpawnProcess import SpawnProcess
+
+import portage
+from portage import _movefile, abssymlink, bsd_chflags
+from portage import selinux as _selinux_merge
+from portage.const import (
+    CACHE_PATH,
+    CONFIG_MEMORY_FILE,
+    MERGING_IDENTIFIER,
+    PACKDEBUG_PATH,
+    PORTAGE_PACKAGE_ATOM,
+    PRIVATE_PATH,
+    SUPPORTED_GENTOO_BINPKG_FORMATS,
+    VDB_PATH,
+)
+from portage.dbapi import dbapi
+from portage.exception import (
+    CommandNotFound,
+    CorruptionKeyError,
+    FileNotFound,
+    InvalidBinaryPackageFormat,
+    InvalidData,
+    InvalidLocation,
+    InvalidPackageName,
+    PermissionDenied,
+    UnsupportedAPIException,
+)
+from portage.localization import _
+from portage.util.futures import asyncio
+from portage.util.futures.executor.fork import ForkExecutor
+from portage.util.movefile import _cmpxattr, movefile
+
+from ._ContentsCaseSensitivityManager import ContentsCaseSensitivityManager
+
+_METADATA_FILE = "metadata"
+# The exact set of fields the consolidated metadata file carries, and the set
+# vardbapi caches. Membership is bounded by what _aux_get() may serve as "" on
+# a missing individual file: a field outside this set and outside
+# _aux_cache_keys_re falls back to an environment.bz2 search instead (see
+# bug 395463), which the file must not silently replace with "". Keeping the
+# two sets identical is what makes that bound hold by construction.
+#
+# Line-oriented fields (CONTENTS, NEEDED, NEEDED.ELF.2) are absent, which the
+# one-line-per-field format requires anyway.
+_METADATA_FILE_FIELDS = frozenset(
+    (
+        "BDEPEND",
+        "BUILD_ID",
+        "BUILD_TIME",
+        "CHOST",
+        "COUNTER",
+        "DEFINED_PHASES",
+        "DEPEND",
+        "DESCRIPTION",
+        "EAPI",
+        "HOMEPAGE",
+        "IDEPEND",
+        "IUSE",
+        "KEYWORDS",
+        "LICENSE",
+        "PDEPEND",
+        "PROPERTIES",
+        "PROVIDES",
+        "RDEPEND",
+        "REQUIRES",
+        "RESTRICT",
+        "SLOT",
+        "USE",
+        "repository",
+    )
+)
+_METADATA_FILE_FORMAT_VERSION = 1
+_METADATA_FORMAT_PREFIX = "#format="
+_METADATA_DIR_MTIME_PREFIX = "#dir_mtime="
+
+
+def _in_metadata_file(fname):
+    """True if fname is a field the consolidated metadata file carries."""
+    return fname in _METADATA_FILE_FIELDS
+
+
+def _read_metadata_file(path, dir_st=None):
+    """Parse KEY=value\\n metadata file.
+
+    Returns dict[str, str], or None if the file is not a snapshot this
+    portage version can use.
+
+    A returned dict is treated as a *complete* snapshot: every field accepted
+    by _in_metadata_file() that existed when the file was written is present,
+    so a field missing from it is served as empty rather than falling back to
+    a per-field read. Two things must hold for that to be sound, and a file
+    failing either is rejected so the caller falls back to the individual
+    files:
+
+    - Reader and writer must agree on which fields get written, so the
+      "#format=" header must match _METADATA_FILE_FORMAT_VERSION. The field
+      set is therefore part of the format: bump that constant on any change to
+      _METADATA_FILE_FIELDS, in either direction. Adding a field would
+      otherwise make an older file lacking it read as saying it is empty, and
+      dropping one would do the same to an older portage reading a newer file.
+      A version this portage does not know is rejected, so both skews fall
+      back to the individual files rather than serving a wrong answer.
+    - The package directory must not have changed since the file was written,
+      so the recorded "#dir_mtime=" must match the directory's st_mtime_ns.
+      This is the same freshness signal vdb_metadata.pickle validated against,
+      and it is what makes a stale file fall back rather than lie. Pass dir_st
+      when the caller already stat()ed the directory; otherwise it is stat()ed
+      here.
+
+    "#dir_mtime=" is written last, so a file left truncated by an interrupted
+    write lacks it and is rejected rather than read as a short snapshot.
+
+    Other lines beginning with '#' are ignored.
+    """
+    from portage import _encodings
+
+    result = {}
+    version = None
+    dir_mtime = None
+    with open(path, encoding=_encodings["repo.content"], errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                if line.startswith(_METADATA_FORMAT_PREFIX):
+                    try:
+                        version = int(line[len(_METADATA_FORMAT_PREFIX) :])
+                    except ValueError:
+                        return None
+                    # Written first, so a file we cannot use is abandoned
+                    # before parsing the rest of it.
+                    if version != _METADATA_FILE_FORMAT_VERSION:
+                        return None
+                elif line.startswith(_METADATA_DIR_MTIME_PREFIX):
+                    try:
+                        dir_mtime = int(line[len(_METADATA_DIR_MTIME_PREFIX) :])
+                    except ValueError:
+                        return None
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            result[k] = v
+    if version is None or dir_mtime is None:
+        return None
+    if dir_st is None:
+        try:
+            dir_st = os.stat(os.path.dirname(path))
+        except OSError:
+            return None
+    if dir_mtime != dir_st.st_mtime_ns:
+        return None
+    return result
+
+
+def _stamp_metadata_file(dbdir):
+    """Append the "#dir_mtime=" line the reader validates against.
+
+    Kept separate from writing the body because it has to happen after the
+    last change to dbdir's contents: write_atomic() renames into place, and
+    that rename bumps dbdir's mtime, so a value recorded before it would never
+    match. Appending does not create or remove a directory entry, so it leaves
+    dbdir's mtime alone and the recorded value stays true.
+
+    A caller that changes dbdir further between the body write and this call
+    must call it afterwards, or it will stamp an mtime its own later change
+    invalidates.
+    """
+    from portage import _encodings
+
+    path = os.path.join(dbdir, _METADATA_FILE)
+    with open(path, mode="a", encoding=_encodings["repo.content"]) as f:
+        f.write(f"{_METADATA_DIR_MTIME_PREFIX}{os.stat(dbdir).st_mtime_ns}\n")
+
+
+def _write_metadata_file(dbdir, data, stamp=True):
+    """Atomically write metadata dict to dbdir/metadata.
+
+    The one-line-per-field format cannot represent an embedded newline, so
+    values are whitespace-normalized here (the same normalization _aux_get
+    applies to single-line fields). Doing it here stops a caller that passes a
+    raw multi-line value from silently truncating the file.
+
+    Pass stamp=False when the caller still has to change dbdir before the file
+    can be stamped; it must then call _stamp_metadata_file() itself. Until it
+    does, the file lacks "#dir_mtime=" and the reader rejects it, so an
+    interrupted sequence falls back rather than serving a stale snapshot.
+    """
+    from portage import _encodings
+    from portage.util import write_atomic
+
+    path = os.path.join(dbdir, _METADATA_FILE)
+    content = f"{_METADATA_FORMAT_PREFIX}{_METADATA_FILE_FORMAT_VERSION}\n"
+    content += "".join(f"{k}={' '.join(v.split())}\n" for k, v in sorted(data.items()))
+    write_atomic(path, content, mode="w", encoding=_encodings["repo.content"])
+    if stamp:
+        _stamp_metadata_file(dbdir)
+
+
+def _consolidate_to_metadata_file(dbdir, delete_individual=False):
+    """Build the metadata file from individual per-field VDB files.
+
+    Reads every file in dbdir that _in_metadata_file() accepts and writes them
+    to the metadata file. By default individual files are kept for backward
+    compatibility with tools that read the VDB directly. Pass
+    delete_individual=True to remove them after writing.
+
+    The deletions change dbdir, so the metadata file is stamped after them
+    rather than as part of writing it; stamping first would record an mtime
+    the unlinks immediately invalidate, leaving the package with neither its
+    individual files nor a usable metadata file. The body is written before
+    the unlinks so no field is ever absent from disk.
+
+    A metadata file that still validates is an accurate snapshot of dbdir, so
+    rewriting it would produce the same content and there is nothing to do.
+    That shortcut does not apply to delete_individual, which has work left
+    whenever the per-field files are still present.
+    """
+    from portage import _encodings
+
+    if not delete_individual:
+        try:
+            current = _read_metadata_file(os.path.join(dbdir, _METADATA_FILE))
+        except OSError:
+            current = None
+        if current is not None:
+            return
+
+    data = {}
+    for fname in os.listdir(dbdir):
+        if not _in_metadata_file(fname):
+            continue
+        fpath = os.path.join(dbdir, fname)
+        try:
+            with open(
+                fpath, encoding=_encodings["repo.content"], errors="replace"
+            ) as f:
+                # Normalize whitespace to match what _aux_get previously did
+                # for single-line fields via " ".join(myd.split()).
+                data[fname] = " ".join(f.read().split())
+        except OSError:
+            pass
+    if data:
+        _write_metadata_file(dbdir, data, stamp=not delete_individual)
+        if delete_individual:
+            for fname in data:
+                try:
+                    os.unlink(os.path.join(dbdir, fname))
+                except OSError:
+                    pass
+            _stamp_metadata_file(dbdir)
+
+
+def _explode_metadata_file(dbdir):
+    """Remove the metadata file, restoring any field it alone still holds.
+
+    The inverse of _consolidate_to_metadata_file(). Normally the individual
+    files are still there and this just unlinks the metadata file, but after a
+    delete_individual=True run the metadata file is the only copy of the
+    fields it carries, so those are written back to their own files first.
+
+    Restoring before unlinking means a field is never absent from disk. An
+    interrupted run leaves the metadata file in place; it is stale by then, so
+    the reader rejects it and falls back to the individual files that now
+    exist.
+
+    Refuses to unlink a metadata file that is the only copy of some field but
+    is not a snapshot this portage version can trust, since deleting it would
+    destroy that field and restoring from it could write a stale value. That
+    means a corrupted or downgraded VDB, and guessing is worse than stopping.
+
+    Returns the sorted list of field names restored. Raises PortageException
+    if the metadata file cannot be safely removed.
+    """
+    from portage import _encodings
+    from portage.exception import PortageException
+
+    path = os.path.join(dbdir, _METADATA_FILE)
+
+    # Parsed without validating format version or dir mtime, only to learn
+    # which fields the file claims. Values from it are used solely to restore
+    # fields the validated read below also vouches for.
+    claimed = {}
+    try:
+        with open(path, encoding=_encodings["repo.content"], errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                claimed[k] = v
+    except FileNotFoundError:
+        return []
+
+    missing = sorted(k for k in claimed if not os.path.exists(os.path.join(dbdir, k)))
+
+    if missing:
+        trusted = _read_metadata_file(path)
+        if trusted is None:
+            raise PortageException(
+                f"{path}: refusing to remove, it is the only copy of "
+                f"{', '.join(missing)} and is not a usable snapshot"
+            )
+        for fname in missing:
+            with open(
+                os.path.join(dbdir, fname),
+                mode="w",
+                encoding=_encodings["repo.content"],
+            ) as f:
+                f.write(f"{trusted.get(fname, '')}\n")
+
+    os.unlink(path)
+    return missing
+
+
+class MoveReason(Enum):
+    # Falsy reasons (Move not needed)
+    VDB_HASH_MATCHES = auto()
+    CONTENT_MATCHES = auto()
+
+    # Truthy reasons (Move needed)
+    FILE_MISSING_OR_NOT_REGULAR = auto()
+    MODE_DIFFERS = auto()
+    VDB_HASH_DIFFERS = auto()
+    XATTR_DIFFERS = auto()
+    CONTENT_DIFFERS = auto()
+    COMPARISON_EXCEPTION = auto()
+
+    def __bool__(self):
+        return self.value >= self.__class__.FILE_MISSING_OR_NOT_REGULAR.value
 
 
 class vardbapi(dbapi):
@@ -82,20 +370,12 @@ class vardbapi(dbapi):
         r"^(\..*|" + MERGING_IDENTIFIER + ".*|" + "|".join(_excluded_dirs) + r")$"
     )
 
-    _aux_cache_version = "1"
-    _owners_cache_version = "1"
-
-    # Number of uncached packages to trigger cache update, since
-    # it's wasteful to update it for every vdb change.
-    _aux_cache_threshold = 5
-
     _aux_cache_keys_re = re.compile(r"^NEEDED\..*$")
     _aux_multi_line_re = re.compile(r"^(CONTENTS|NEEDED\..*)$")
     _pkg_str_aux_keys = dbapi._pkg_str_aux_keys + ("BUILD_ID", "BUILD_TIME", "_mtime_")
 
     def __init__(
         self,
-        _unused_param=DeprecationWarning,
         categories=None,
         settings=None,
         vartree=None,
@@ -105,17 +385,12 @@ class vardbapi(dbapi):
         now has a categories property that is generated from the
         available packages.
         """
-        from portage.util._dyn_libs.PreservedLibsRegistry import PreservedLibsRegistry
         from portage.util._dyn_libs.LinkageMapELF import LinkageMapELF as LinkageMap
+        from portage.util._dyn_libs.PreservedLibsRegistry import PreservedLibsRegistry
 
         # Used by emerge to check whether any packages
         # have been added or removed.
         self._pkgs_changed = False
-
-        # The _aux_cache_threshold doesn't work as designed
-        # if the cache is flushed from a subprocess, so we
-        # use this to avoid waste vdb cache updates.
-        self._flush_cache_enabled = True
 
         # cache for category directory mtimes
         self.mtdircache = {}
@@ -131,16 +406,6 @@ class vardbapi(dbapi):
             settings = portage.settings
         self.settings = settings
 
-        if _unused_param is not DeprecationWarning:
-            warnings.warn(
-                "The first parameter of the "
-                "portage.dbapi.vartree.vardbapi"
-                " constructor is now unused. Instead "
-                "settings['ROOT'] is used.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         self._eroot = settings["EROOT"]
         self._dbroot = self._eroot + VDB_PATH
         self._lock = None
@@ -154,39 +419,11 @@ class vardbapi(dbapi):
         if vartree is None:
             vartree = portage.db[settings["EROOT"]]["vartree"]
         self.vartree = vartree
-        self._aux_cache_keys = {
-            "BDEPEND",
-            "BUILD_TIME",
-            "CHOST",
-            "COUNTER",
-            "DEPEND",
-            "DESCRIPTION",
-            "EAPI",
-            "HOMEPAGE",
-            "BUILD_ID",
-            "IDEPEND",
-            "IUSE",
-            "KEYWORDS",
-            "LICENSE",
-            "PDEPEND",
-            "PROPERTIES",
-            "RDEPEND",
-            "repository",
-            "RESTRICT",
-            "SLOT",
-            "USE",
-            "DEFINED_PHASES",
-            "PROVIDES",
-            "REQUIRES",
-        }
+        # Same set as the consolidated metadata file carries; see
+        # _METADATA_FILE_FIELDS for why the two must not drift apart. Copied
+        # because callers such as FakeVartree replace it per instance.
+        self._aux_cache_keys = set(_METADATA_FILE_FIELDS)
         self._aux_cache_obj = None
-        self._aux_cache_filename = os.path.join(
-            self._eroot, CACHE_PATH, "vdb_metadata.pickle"
-        )
-        self._cache_delta_filename = os.path.join(
-            self._eroot, CACHE_PATH, "vdb_metadata_delta.json"
-        )
-        self._cache_delta = VdbMetadataDelta(self)
         self._counter_path = os.path.join(self._eroot, CACHE_PATH, "counter")
 
         self._plib_registry = PreservedLibsRegistry(
@@ -211,26 +448,14 @@ class vardbapi(dbapi):
 
         return os.access(first_existing(self._dbroot), os.W_OK)
 
-    @property
-    def root(self):
-        warnings.warn(
-            "The root attribute of "
-            "portage.dbapi.vartree.vardbapi"
-            " is deprecated. Use "
-            "settings['ROOT'] instead.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return self.settings["ROOT"]
-
     def getpath(self, mykey, filename=None):
         # This is an optimized hotspot, so don't use unicode-wrapped
         # os module and don't use os.path.join().
-        rValue = self._eroot + VDB_PATH + _os.sep + mykey
+        rValue = self._eroot + VDB_PATH + os.sep + mykey
         if filename is not None:
             # If filename is always relative, we can do just
-            # rValue += _os.sep + filename
-            rValue = _os.path.join(rValue, filename)
+            # rValue += os.sep + filename
+            rValue = os.path.join(rValue, filename)
         return rValue
 
     def lock(self):
@@ -240,8 +465,8 @@ class vardbapi(dbapi):
         to reenter a lock that was acquired by a parent process. However,
         a lock can be released only by the same process that acquired it.
         """
-        from portage.util import ensure_dirs
         from portage.locks import lockdir
+        from portage.util import ensure_dirs
 
         if self._lock_count:
             self._lock_count += 1
@@ -311,8 +536,8 @@ class vardbapi(dbapi):
         of problem, this method should be called in a subprocess
         (typically spawned by the MergeProcess class).
         """
-        from portage.util import ensure_dirs
         from portage.locks import lockfile
+        from portage.util import ensure_dirs
 
         lock, counter = self._slot_locks.get(slot_atom, (None, 0))
         if lock is None:
@@ -347,7 +572,7 @@ class vardbapi(dbapi):
 
         base = self._eroot + VDB_PATH
         cat = catsplit(cpv)[0]
-        catdir = base + _os.sep + cat
+        catdir = base + os.sep + cat
         t = time.time()
         t = (t, t)
         try:
@@ -395,8 +620,8 @@ class vardbapi(dbapi):
 
     def move_ent(self, mylist, repo_match=None):
         from portage.dep import isjustname, isvalidatom
-        from portage.versions import catsplit
         from portage.util import ensure_dirs, write_atomic
+        from portage.versions import catsplit
 
         origcp = mylist[1]
         newcp = mylist[2]
@@ -457,28 +682,44 @@ class vardbapi(dbapi):
 
         return moves
 
-    def cp_list(self, mycp, use_cache=1):
-        from portage.versions import catsplit, pkgsplit, _pkg_str
+    def cp_list(self, mycp, use_cache=1, _cat_mtime=None):
+        """
+        @param _cat_mtime: st_mtime_ns of the category directory, for internal
+                callers that have already stat()ed it. Saves a redundant stat()
+                of the same directory.
+        """
+        from portage.versions import _pkg_str, catsplit, pkgsplit
 
         mysplit = catsplit(mycp)
         if mysplit[0] == "*":
             mysplit[0] = mysplit[0][1:]
-        try:
-            mystat = os.stat(self.getpath(mysplit[0])).st_mtime_ns
-        except OSError:
-            mystat = 0
+        cat_dir = self.getpath(mysplit[0])
+        cat_missing = False
+        if _cat_mtime is not None:
+            mystat = _cat_mtime
+        else:
+            try:
+                mystat = os.stat(cat_dir).st_mtime_ns
+            except OSError as e:
+                mystat = 0
+                cat_missing = e.errno == errno.ENOENT
         if use_cache and mycp in self.cpcache:
             cpc = self.cpcache[mycp]
             if cpc[0] == mystat:
                 return cpc[1][:]
-        cat_dir = self.getpath(mysplit[0])
-        try:
-            dir_list = os.listdir(cat_dir)
-        except OSError as e:
-            if e.errno == PermissionDenied.errno:
-                raise PermissionDenied(cat_dir)
-            del e
+        if cat_missing:
+            # The stat() above already reported ENOENT, so listdir() can only
+            # report it again. Any other stat() failure falls through, since
+            # listdir() is what turns EACCES into PermissionDenied.
             dir_list = []
+        else:
+            try:
+                dir_list = os.listdir(cat_dir)
+            except OSError as e:
+                if e.errno == PermissionDenied.errno:
+                    raise PermissionDenied(cat_dir)
+                del e
+                dir_list = []
 
         returnme = []
         for x in dir_list:
@@ -509,37 +750,23 @@ class vardbapi(dbapi):
             del self.cpcache[mycp]
         return returnme
 
-    def cpv_all(self, use_cache=1):
-        """
-        Set use_cache=0 to bypass the portage.cachedir() cache in cases
-        when the accuracy of mtime staleness checks should not be trusted
-        (generally this is only necessary in critical sections that
-        involve merge or unmerge of packages).
-        """
-        return list(self._iter_cpv_all(use_cache=use_cache))
+    def cpv_all(self):
+        return list(self._iter_cpv_all())
 
-    def _iter_cpv_all(self, use_cache=True, sort=False):
+    def _iter_cpv_all(self, use_cache=None, sort=False):
+        from portage import listdir
         from portage.versions import _pkg_str
 
-        returnme = []
         basepath = os.path.join(self._eroot, VDB_PATH) + os.path.sep
 
         if use_cache:
-            from portage import listdir
-        else:
+            warnings.warn(
+                "_iter_cpv_all's use_cache param is a noop and is always false, please remove it",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
-            def listdir(p, **kwargs):
-                try:
-                    return [
-                        x for x in os.listdir(p) if os.path.isdir(os.path.join(p, x))
-                    ]
-                except OSError as e:
-                    if e.errno == PermissionDenied.errno:
-                        raise PermissionDenied(p)
-                    del e
-                    return []
-
-        catdirs = listdir(basepath, EmptyOnError=1, ignorecvs=1, dirsonly=1)
+        catdirs = listdir(basepath, ignorecvs=1, dirsonly=1)
         if sort:
             catdirs.sort()
 
@@ -549,7 +776,7 @@ class vardbapi(dbapi):
             if not self._category_re.match(x):
                 continue
 
-            pkgdirs = listdir(basepath + x, EmptyOnError=1, dirsonly=1)
+            pkgdirs = listdir(basepath + x, dirsonly=1)
             if sort:
                 pkgdirs.sort()
 
@@ -566,10 +793,10 @@ class vardbapi(dbapi):
 
                 yield subpath
 
-    def cp_all(self, use_cache=1, sort=False):
+    def cp_all(self, sort=False):
         from portage.versions import catpkgsplit
 
-        mylist = self.cpv_all(use_cache=use_cache)
+        mylist = self.cpv_all()
         d = {}
         for y in mylist:
             if y[0] == "*":
@@ -603,15 +830,12 @@ class vardbapi(dbapi):
         self._clear_pkg_cache(pkg_dblink)
 
     def _clear_pkg_cache(self, pkg_dblink):
-        from portage.util.listdir import dircache
-
         # Due to 1 second mtime granularity in <python-2.5, mtime checks
         # are not always sufficient to invalidate vardbapi caches. Therefore,
         # the caches need to be actively invalidated here.
         self.mtdircache.pop(pkg_dblink.cat, None)
         self.matchcache.pop(pkg_dblink.cat, None)
         self.cpcache.pop(pkg_dblink.mysplit[0], None)
-        dircache.pop(pkg_dblink.dbcatdir, None)
 
     def match(self, origdep, use_cache=1):
         "caching match function"
@@ -632,19 +856,31 @@ class vardbapi(dbapi):
             return list(
                 self._iter_match(mydep, self.cp_list(mydep.cp, use_cache=use_cache))
             )
+        cat_missing = False
         try:
             curmtime = os.stat(os.path.join(self._eroot, VDB_PATH, mycat)).st_mtime_ns
-        except OSError:
+        except OSError as e:
             curmtime = 0
+            cat_missing = e.errno == errno.ENOENT
 
         if mycat not in self.matchcache or self.mtdircache[mycat] != curmtime:
             # clear cache entry
             self.mtdircache[mycat] = curmtime
             self.matchcache[mycat] = {}
-        if mydep not in self.matchcache[mycat]:
-            mymatch = list(
-                self._iter_match(mydep, self.cp_list(mydep.cp, use_cache=use_cache))
-            )
+        if cache_key not in self.matchcache[mycat]:
+            if cat_missing:
+                # Nothing is installed in a category that has no directory,
+                # so there is nothing for cp_list() to list.
+                mymatch = []
+            else:
+                mymatch = list(
+                    self._iter_match(
+                        mydep,
+                        self.cp_list(
+                            mydep.cp, use_cache=use_cache, _cat_mtime=curmtime
+                        ),
+                    )
+                )
             self.matchcache[mycat][cache_key] = mymatch
         return self.matchcache[mycat][cache_key][:]
 
@@ -653,47 +889,6 @@ class vardbapi(dbapi):
 
         return self.getpath(str(mycpv), filename=catsplit(mycpv)[1] + ".ebuild")
 
-    def flush_cache(self):
-        """If the current user has permission and the internal aux_get cache has
-        been updated, save it to disk and mark it unmodified.  This is called
-        by emerge after it has loaded the full vdb for use in dependency
-        calculations.  Currently, the cache is only written if the user has
-        superuser privileges (since that's required to obtain a lock), but all
-        users have read access and benefit from faster metadata lookups (as
-        long as at least part of the cache is still valid)."""
-        from portage.data import secpass
-        from portage.util import ensure_dirs, atomic_ofstream, apply_secpass_permissions
-
-        if (
-            self._flush_cache_enabled
-            and self._aux_cache is not None
-            and secpass >= 2
-            and (
-                len(self._aux_cache["modified"]) >= self._aux_cache_threshold
-                or not os.path.exists(self._cache_delta_filename)
-            )
-        ):
-            ensure_dirs(os.path.dirname(self._aux_cache_filename))
-
-            self._owners.populate()  # index any unindexed contents
-            valid_nodes = set(self.cpv_all())
-            for cpv in list(self._aux_cache["packages"]):
-                if cpv not in valid_nodes:
-                    del self._aux_cache["packages"][cpv]
-            del self._aux_cache["modified"]
-            timestamp = time.time()
-            self._aux_cache["timestamp"] = timestamp
-
-            with atomic_ofstream(self._aux_cache_filename, "wb") as f:
-                pickle.dump(self._aux_cache, f, protocol=2)
-
-            apply_secpass_permissions(self._aux_cache_filename, mode=0o644)
-
-            self._cache_delta.initialize(timestamp)
-            apply_secpass_permissions(self._cache_delta_filename, mode=0o644)
-
-            self._aux_cache["modified"] = set()
-
     @property
     def _aux_cache(self):
         if self._aux_cache_obj is None:
@@ -701,81 +896,15 @@ class vardbapi(dbapi):
         return self._aux_cache_obj
 
     def _aux_cache_init(self):
-        from portage.util import writemsg
-
-        aux_cache = None
-        open_kwargs = {}
-        try:
-            with open(
-                _unicode_encode(
-                    self._aux_cache_filename, encoding=_encodings["fs"], errors="strict"
-                ),
-                mode="rb",
-                **open_kwargs,
-            ) as f:
-                mypickle = pickle.Unpickler(f)
-                try:
-                    mypickle.find_global = None
-                except AttributeError:
-                    # TODO: If py3k, override Unpickler.find_class().
-                    pass
-                aux_cache = mypickle.load()
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except Exception as e:
-            if isinstance(e, EnvironmentError) and getattr(e, "errno", None) in (
-                errno.ENOENT,
-                errno.EACCES,
-            ):
-                pass
-            else:
-                writemsg(
-                    _("!!! Error loading '%s': %s\n") % (self._aux_cache_filename, e),
-                    noiselevel=-1,
-                )
-            del e
-
-        if (
-            not aux_cache
-            or not isinstance(aux_cache, dict)
-            or aux_cache.get("version") != self._aux_cache_version
-            or not aux_cache.get("packages")
-        ):
-            aux_cache = {"version": self._aux_cache_version}
-            aux_cache["packages"] = {}
-
-        owners = aux_cache.get("owners")
-        if owners is not None:
-            if not isinstance(owners, dict):
-                owners = None
-            elif "version" not in owners:
-                owners = None
-            elif owners["version"] != self._owners_cache_version:
-                owners = None
-            elif "base_names" not in owners:
-                owners = None
-            elif not isinstance(owners["base_names"], dict):
-                owners = None
-
-        if owners is None:
-            owners = {"base_names": {}, "version": self._owners_cache_version}
-            aux_cache["owners"] = owners
-
-        aux_cache["modified"] = set()
-        self._aux_cache_obj = aux_cache
+        self._aux_cache_obj = {
+            "packages": {},
+            "owners": {"base_names": {}},
+        }
 
     def aux_get(self, mycpv, wants, myrepo=None):
-        """This automatically caches selected keys that are frequently needed
-        by emerge for dependency calculations.  The cached metadata is
-        considered valid if the mtime of the package directory has not changed
-        since the data was cached.  The cache is stored in a pickled dict
-        object with the following format:
-
-        {version:"1", "packages":{cpv1:(mtime,{k1,v1, k2,v2, ...}), cpv2...}}
-
-        If an error occurs while loading the cache pickle or the version is
-        unrecognized, the cache will simple be recreated from scratch (it is
-        completely disposable).
+        """Return requested metadata for mycpv, using an in-session cache keyed
+        by package directory mtime. Metadata is re-read from the VDB when the
+        directory mtime changes (e.g. after a merge or aux_update).
         """
         from portage.eapi import _get_eapi_attrs
         from portage.versions import _get_slot_re
@@ -806,39 +935,17 @@ class vardbapi(dbapi):
         pull_me = cache_these.union(wants)
         mydata = {"_mtime_": mydir_mtime}
         cache_valid = False
-        cache_mtime = None
         metadata = None
         if pkg_data is not None:
-            if not isinstance(pkg_data, tuple) or len(pkg_data) != 2:
-                pkg_data = None
-            else:
-                cache_mtime, metadata = pkg_data
-                if not isinstance(cache_mtime, (float, int)) or not isinstance(
-                    metadata, dict
-                ):
-                    pkg_data = None
-
-        if pkg_data:
             cache_mtime, metadata = pkg_data
-            if isinstance(cache_mtime, float):
-                if cache_mtime == mydir_stat.st_mtime:
-                    cache_valid = True
-
-                # Handle truncated mtime in order to avoid cache
-                # invalidation for livecd squashfs (bug 564222).
-                elif int(cache_mtime) == mydir_stat.st_mtime:
-                    cache_valid = True
-            else:
-                # Cache may contain integer mtime.
-                cache_valid = cache_mtime == mydir_stat[stat.ST_MTIME]
+            # Handle truncated mtime for livecd squashfs (bug 564222).
+            if (
+                cache_mtime == mydir_stat.st_mtime
+                or int(cache_mtime) == mydir_stat.st_mtime
+            ):
+                cache_valid = True
 
         if cache_valid:
-            # Migrate old metadata to unicode.
-            for k, v in metadata.items():
-                metadata[k] = _unicode_decode(
-                    v, encoding=_encodings["repo.content"], errors="replace"
-                )
-
             mydata.update(metadata)
             pull_me.difference_update(mydata)
 
@@ -853,7 +960,6 @@ class vardbapi(dbapi):
                 for aux_key in cache_these:
                     cache_data[aux_key] = mydata[aux_key]
                 self._aux_cache["packages"][str(mycpv)] = (mydir_mtime, cache_data)
-                self._aux_cache["modified"].add(mycpv)
 
         eapi_attrs = _get_eapi_attrs(mydata["EAPI"])
         if _get_slot_re(eapi_attrs).match(mydata["SLOT"]) is None:
@@ -877,20 +983,40 @@ class vardbapi(dbapi):
                     raise
         if not stat.S_ISDIR(st.st_mode):
             raise KeyError(mycpv)
+
+        metadata_data = None
+        try:
+            metadata_data = _read_metadata_file(
+                os.path.join(mydir, _METADATA_FILE), dir_st=st
+            )
+        except OSError:
+            pass
+
         results = {}
         env_keys = []
         for x in wants:
             if x == "_mtime_":
-                results[x] = st[stat.ST_MTIME]
+                # Float, matching the value aux_get() seeds itself with. The
+                # pickle cache used to supply this on a warm cache, so reading
+                # it from disk had only ever produced the truncated int on a
+                # cache miss; with the pickle gone that would have become the
+                # value callers always see.
+                results[x] = st.st_mtime
                 continue
+
+            # _read_metadata_file only returns a dict for a file whose format
+            # version matches, and such a file is a complete snapshot of the
+            # matching fields. A field missing from it therefore had no
+            # individual file either, so serve it as empty instead of paying
+            # an open() that would just fail.
+            if metadata_data is not None and _in_metadata_file(x):
+                results[x] = metadata_data.get(x, "")
+                continue
+
             try:
                 with open(
-                    _unicode_encode(
-                        os.path.join(mydir, x),
-                        encoding=_encodings["fs"],
-                        errors="strict",
-                    ),
-                    encoding=_encodings["repo.content"],
+                    os.path.join(mydir, x),
+                    encoding="utf-8",
                     errors="replace",
                 ) as f:
                     myd = f.read()
@@ -965,9 +1091,8 @@ class vardbapi(dbapi):
         variables = frozenset(variables)
         results = {}
         for line in proc.stdout:
-            line = _unicode_decode(
-                line, encoding=_encodings["content"], errors="replace"
-            )
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", "replace")
             var_assign_match = var_assign_re.match(line)
             if var_assign_match is not None:
                 key = var_assign_match.group(2)
@@ -978,9 +1103,8 @@ class vardbapi(dbapi):
                     else:
                         value = [var_assign_match.group(4)]
                         for line in proc.stdout:
-                            line = _unicode_decode(
-                                line, encoding=_encodings["content"], errors="replace"
-                            )
+                            if isinstance(line, bytes):
+                                line = line.decode("utf-8", "replace")
                             value.append(line)
                             if have_end_quote(quote, line):
                                 break
@@ -1013,6 +1137,17 @@ class vardbapi(dbapi):
                     os.unlink(os.path.join(self.getpath(cpv), k))
                 except OSError:
                     pass
+        # Writing or removing an individual file changes the package
+        # directory, so a metadata file it had no longer validates. Rebuild it
+        # once here rather than patching each field: a rejected file is only
+        # ignored, but leaving it that way would cost a per-field read on
+        # every later aux_get() for this package.
+        pkgdir = self.getpath(cpv)
+        if os.path.exists(os.path.join(pkgdir, _METADATA_FILE)):
+            try:
+                _consolidate_to_metadata_file(pkgdir)
+            except OSError:
+                pass
         self._bump_mtime(cpv)
 
     @staticmethod
@@ -1185,10 +1320,8 @@ class vardbapi(dbapi):
         counter = -1
         try:
             with open(
-                _unicode_encode(
-                    self._counter_path, encoding=_encodings["fs"], errors="strict"
-                ),
-                encoding=_encodings["repo.content"],
+                self._counter_path,
+                encoding="utf-8",
                 errors="replace",
             ) as f:
                 try:
@@ -1207,7 +1340,7 @@ class vardbapi(dbapi):
                     _("!!! Unable to read COUNTER file: '%s'\n") % self._counter_path,
                     noiselevel=-1,
                 )
-                writemsg(f"!!! {str(e)}\n", noiselevel=-1)
+                writemsg(f"!!! {e!s}\n", noiselevel=-1)
             del e
 
         if self._cached_counter == counter:
@@ -1227,8 +1360,7 @@ class vardbapi(dbapi):
                     pkg_counter = int(self.aux_get(cpv, ["COUNTER"])[0])
                 except (KeyError, OverflowError, ValueError):
                     continue
-                if pkg_counter > max_counter:
-                    max_counter = pkg_counter
+                max_counter = max(max_counter, pkg_counter)
 
         return max_counter + 1
 
@@ -1257,12 +1389,6 @@ class vardbapi(dbapi):
                     self.settings._init_dirs()
                     write_atomic(self._counter_path, str(counter))
             self._cached_counter = counter
-
-            # Since we hold a lock, this is a good opportunity
-            # to flush the cache. Note that this will only
-            # flush the cache periodically in the main process
-            # when _aux_cache_threshold is exceeded.
-            self.flush_cache()
         finally:
             self.unlock()
 
@@ -1287,9 +1413,9 @@ class vardbapi(dbapi):
         @param paths: paths of files to remove from contents
         @type paths: iterable
         """
+        from portage.util import normalize_path, writemsg_level
         from portage.util._dyn_libs.LinkageMapELF import LinkageMapELF as LinkageMap
         from portage.util._dyn_libs.NeededEntry import NeededEntry
-        from portage.util import normalize_path, writemsg_level
 
         if not hasattr(pkg, "getcontents"):
             pkg = self._dblink(pkg)
@@ -1299,9 +1425,8 @@ class vardbapi(dbapi):
         removed = 0
 
         for filename in paths:
-            filename = _unicode_decode(
-                filename, encoding=_encodings["content"], errors="strict"
-            )
+            if isinstance(filename, bytes):
+                filename = filename.decode("utf-8", "strict")
             filename = normalize_path(filename)
             if relative_paths:
                 relative_filename = filename
@@ -1323,10 +1448,8 @@ class vardbapi(dbapi):
             new_needed = None
             try:
                 with open(
-                    _unicode_encode(
-                        needed_filename, encoding=_encodings["fs"], errors="strict"
-                    ),
-                    encoding=_encodings["repo.content"],
+                    needed_filename,
+                    encoding="utf-8",
                     errors="replace",
                 ) as f:
                     needed_lines = f.readlines()
@@ -1405,8 +1528,6 @@ class vardbapi(dbapi):
             for x in db._contents.keys():
                 self._add_path(x[eroot_len:], pkg_hash)
 
-            self._vardb._aux_cache["modified"].add(cpv)
-
         def _add_path(self, path, pkg_hash):
             """
             Empty path is a code that represents empty contents.
@@ -1429,11 +1550,7 @@ class vardbapi(dbapi):
             h = self._new_hash()
             # Always use a constant utf_8 encoding here, since
             # the "default" encoding can change.
-            h.update(
-                _unicode_encode(
-                    s, encoding=_encodings["repo.content"], errors="backslashreplace"
-                )
-            )
+            h.update(s.encode("utf-8", "backslashreplace"))
             h = h.hexdigest()
             h = h[-self._hex_chars :]
             h = int(h, 16)
@@ -1664,46 +1781,13 @@ class vardbapi(dbapi):
 class vartree:
     "this tree will scan a var/db/pkg database located at root (passed to init)"
 
-    def __init__(
-        self, root=None, virtual=DeprecationWarning, categories=None, settings=None
-    ):
+    def __init__(self, categories=None, settings=None):
         if settings is None:
             settings = portage.settings
-
-        if root is not None and root != settings["ROOT"]:
-            warnings.warn(
-                "The 'root' parameter of the "
-                "portage.dbapi.vartree.vartree"
-                " constructor is now unused. Use "
-                "settings['ROOT'] instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-        if virtual is not DeprecationWarning:
-            warnings.warn(
-                "The 'virtual' parameter of the "
-                "portage.dbapi.vartree.vartree"
-                " constructor is unused",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
         self.settings = settings
         self.dbapi = vardbapi(settings=settings, vartree=self)
         self.populated = 1
-
-    @property
-    def root(self):
-        warnings.warn(
-            "The root attribute of "
-            "portage.dbapi.vartree.vartree"
-            " is deprecated. Use "
-            "settings['ROOT'] instead.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return self.settings["ROOT"]
 
     def getpath(self, mykey, filename=None):
         return self.dbapi.getpath(mykey, filename=filename)
@@ -1721,9 +1805,10 @@ class vartree:
         return {}
 
     def dep_bestmatch(self, mydep, use_cache=1):
-        from portage.versions import best
         from portage.dbapi.dep_expand import dep_expand
+        from portage.versions import best
 
+        # FIXME: DeprecationWarning?
         "compatibility method -- all matches, not just visible ones"
         # mymatch=best(match(dep_expand(mydep,self.dbapi),self.dbapi))
         mymatch = best(
@@ -1737,6 +1822,7 @@ class vartree:
         return mymatch
 
     def dep_match(self, mydep, use_cache=1):
+        # FIXME: DeprecationWarning?
         "compatibility method -- we want to see all matches, not just visible ones"
         # mymatch = match(mydep,self.dbapi)
         mymatch = self.dbapi.match(mydep, use_cache=use_cache)
@@ -1750,6 +1836,7 @@ class vartree:
     def getallcpv(self):
         """temporary function, probably to be renamed --- Gets a list of all
         category/package-versions installed on the system."""
+        # FIXME: DeprecationWarning?
         return self.dbapi.cpv_all()
 
     def getallnodes(self):
@@ -1772,6 +1859,50 @@ class vartree:
 
     def populate(self):
         self.populated = 1
+
+
+def _find_unneeded_preserved_nodes(lib_graph, preserved_nodes):
+    """
+    Given a graph of libraries in which the parents of a node are its
+    consumers, find the preserved libraries which are not needed by
+    anything.
+
+    A preserved library is needed if it has a consumer which is not itself
+    a preserved library, or if it has a consumer which is a preserved
+    library that is needed. Anything else is unneeded, including a group of
+    preserved libraries which consume each other in a cycle but which
+    nothing outside of the group consumes (bug 652382).
+
+    @param lib_graph: graph in which an edge from a consumer (parent) to a
+            library (child) means that the consumer links against the library
+    @type lib_graph: digraph
+    @param preserved_nodes: the subset of nodes in lib_graph which are
+            preserved libraries
+    @type preserved_nodes: set
+    @rtype: set
+    @return: the subset of preserved_nodes which is not needed
+    """
+    needed_nodes = set()
+    stack = []
+
+    for preserved_node in preserved_nodes:
+        for consumer_node in lib_graph.parent_nodes(preserved_node):
+            if consumer_node not in preserved_nodes:
+                needed_nodes.add(preserved_node)
+                stack.append(preserved_node)
+                break
+
+    # Anything consumed by a needed preserved library is needed as well.
+    # This is what keeps a cycle alive when something outside of it still
+    # consumes part of it.
+    while stack:
+        node = stack.pop()
+        for child_node in lib_graph.child_nodes(node):
+            if child_node in preserved_nodes and child_node not in needed_nodes:
+                needed_nodes.add(child_node)
+                stack.append(child_node)
+
+    return preserved_nodes.difference(needed_nodes)
 
 
 class dblink:
@@ -1837,8 +1968,8 @@ class dblink:
         @param vartree: an instance of vartree corresponding to myroot.
         @type vartree: vartree
         """
-        from portage.versions import _pkg_str
         from portage.util import normalize_path
+        from portage.versions import _pkg_str
 
         if settings is None:
             raise TypeError("settings argument is required")
@@ -1959,7 +2090,7 @@ class dblink:
         # Sort atoms so that locks are acquired in a predictable
         # order, preventing deadlocks with competitors that may
         # be trying to acquire overlapping locks.
-        slot_atoms.sort()
+        slot_atoms.sort(key=str)
         for slot_atom in slot_atoms:
             self.vartree.dbapi._slot_lock(slot_atom)
             self._slot_locks.append(slot_atom)
@@ -2000,12 +2131,6 @@ class dblink:
             )
             return
 
-        if self.dbdir is self.dbpkgdir:
-            (counter,) = self.vartree.dbapi.aux_get(self.mycpv, ["COUNTER"])
-            self.vartree.dbapi._cache_delta.recordEvent(
-                "remove", self.mycpv, self.settings["SLOT"].split("/")[0], counter
-            )
-
         shutil.rmtree(self.dbdir)
         # If empty, remove parent category directory.
         try:
@@ -2043,8 +2168,7 @@ class dblink:
         """
         Get the installed files of a given package (aka what that package installed)
         """
-        from portage.util import normalize_path
-        from portage.util import writemsg
+        from portage.util import normalize_path, writemsg
 
         if self.contentscache is not None:
             return self.contentscache
@@ -2052,10 +2176,8 @@ class dblink:
         pkgfiles = {}
         try:
             with open(
-                _unicode_encode(
-                    contents_file, encoding=_encodings["fs"], errors="strict"
-                ),
-                encoding=_encodings["repo.content"],
+                contents_file,
+                encoding="utf-8",
                 errors="replace",
             ) as f:
                 mylines = f.readlines()
@@ -2172,6 +2294,7 @@ class dblink:
         @return: Paths of protected configuration files which have been omitted.
         """
         import tarfile
+
         from portage.checksum import _perform_md5_merge as perform_md5
         from portage.util import ConfigProtect
 
@@ -2200,7 +2323,7 @@ class dblink:
                     file_data = contents[filename]
                     if file_data[0] == "obj":
                         orig_md5 = file_data[2].lower()
-                        cur_md5 = perform_md5(filename, calc_prelink=1)
+                        cur_md5 = perform_md5(filename)
                         if orig_md5 == cur_md5:
                             return False
                 excluded_config_files.append(filename)
@@ -2244,25 +2367,36 @@ class dblink:
             try:
                 plib_registry.load()
 
-                unmerge_with_replacement = unmerge and preserve_paths is not None
-                if unmerge_with_replacement:
-                    # If self.mycpv is about to be unmerged and we
-                    # have a replacement package, we want to exclude
-                    # the irrelevant NEEDED data that belongs to
-                    # files which are being unmerged now.
-                    exclude_pkgs = (self.mycpv,)
-                else:
-                    exclude_pkgs = None
+                # An instance that owns no files (e.g. empty/virtual
+                # packages) has no libraries of its own to preserve and
+                # removes no files, so it cannot drop the last consumer of an
+                # already-preserved library and leave that library orphaned.
+                # The expensive system-wide linkmap rebuild and the
+                # preserve/prune scans below are therefore guaranteed no-ops.
+                # Registry unregistration on unmerge is still performed so any
+                # (empty) entry is cleaned up.
+                instance_owns_files = bool(self.getcontents())
 
-                self._linkmap_rebuild(
-                    exclude_pkgs=exclude_pkgs,
-                    include_file=needed,
-                    preserve_paths=preserve_paths,
-                )
+                unmerge_with_replacement = unmerge and preserve_paths is not None
+                if instance_owns_files:
+                    if unmerge_with_replacement:
+                        # If self.mycpv is about to be unmerged and we
+                        # have a replacement package, we want to exclude
+                        # the irrelevant NEEDED data that belongs to
+                        # files which are being unmerged now.
+                        exclude_pkgs = (self.mycpv,)
+                    else:
+                        exclude_pkgs = None
+
+                    self._linkmap_rebuild(
+                        exclude_pkgs=exclude_pkgs,
+                        include_file=needed,
+                        preserve_paths=preserve_paths,
+                    )
 
                 if unmerge:
                     unmerge_preserve = None
-                    if not unmerge_with_replacement:
+                    if instance_owns_files and not unmerge_with_replacement:
                         unmerge_preserve = self._find_libs_to_preserve(unmerge=True)
                     counter = self.vartree.dbapi.cpv_counter(self.mycpv)
                     try:
@@ -2288,7 +2422,11 @@ class dblink:
                         self.vartree.dbapi.removeFromContents(self, unmerge_preserve)
 
                 unmerge_no_replacement = unmerge and not unmerge_with_replacement
-                cpv_lib_map = self._find_unused_preserved_libs(unmerge_no_replacement)
+                cpv_lib_map = (
+                    self._find_unused_preserved_libs(unmerge_no_replacement)
+                    if instance_owns_files
+                    else None
+                )
                 if cpv_lib_map:
                     self._remove_preserved_libs(cpv_lib_map)
                     self.vartree.dbapi.lock()
@@ -2309,7 +2447,6 @@ class dblink:
     def unmerge(
         self,
         pkgfiles=None,
-        trimworld=None,
         cleanup=True,
         ldpath_mtimes=None,
         others_in_slot=None,
@@ -2325,8 +2462,6 @@ class dblink:
 
         @param pkgfiles: files to unmerge (generally self.getcontents() )
         @type pkgfiles: Dictionary
-        @param trimworld: Unused
-        @type trimworld: Boolean
         @param cleanup: cleanup to pass to doebuild (see doebuild)
         @type cleanup: Boolean
         @param ldpath_mtimes: mtimes to pass to env_update (see env_update)
@@ -2353,15 +2488,6 @@ class dblink:
         from portage.util._async.SchedulerInterface import SchedulerInterface
         from portage.util.env_update import env_update
         from portage.versions import catsplit, cpv_getkey
-
-        if trimworld is not None:
-            warnings.warn(
-                "The trimworld parameter of the "
-                + "portage.dbapi.vartree.dblink.unmerge()"
-                + " method is now unused.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
         background = False
         log_path = self.settings.get("PORTAGE_LOG_FILE")
@@ -2668,7 +2794,7 @@ class dblink:
     def _display_merge(self, msg, level=0, noiselevel=0):
         from portage.util import writemsg_level
 
-        if not self._verbose and noiselevel >= 0 and level < logging.WARN:
+        if not self._verbose and noiselevel >= 0 and level < logging.WARNING:
             return
         if self._scheduler is None:
             writemsg_level(msg, level=level, noiselevel=noiselevel)
@@ -2679,7 +2805,7 @@ class dblink:
             background = self.settings.get("PORTAGE_BACKGROUND") == "1"
 
             if background and log_path is None:
-                if level >= logging.WARN:
+                if level >= logging.WARNING:
                     writemsg_level(msg, level=level, noiselevel=noiselevel)
             else:
                 self._scheduler.output(
@@ -2709,7 +2835,6 @@ class dblink:
         from portage.util import grabdict, normalize_path, writedict
         from portage.versions import catsplit, cpv_getkey
 
-        os = _os_merge
         perf_md5 = perform_md5
         showMessage = self._display_merge
         show_unmerge = self._show_unmerge
@@ -2739,7 +2864,6 @@ class dblink:
         protected_symlinks = {}
 
         unmerge_orphans = "unmerge-orphans" in self.settings.features
-        calc_prelink = "prelink-checksums" in self.settings.features
 
         pkgfiles = pkgfiles if pkgfiles else self.getcontents()
         if pkgfiles:
@@ -2838,25 +2962,6 @@ class dblink:
 
             for i, objkey in enumerate(mykeys):
                 obj = normalize_path(objkey)
-                if os is _os_merge:
-                    try:
-                        _unicode_encode(
-                            obj, encoding=_encodings["merge"], errors="strict"
-                        )
-                    except UnicodeEncodeError:
-                        # The package appears to have been merged with a
-                        # different value of sys.getfilesystemencoding(),
-                        # so fall back to utf_8 if appropriate.
-                        try:
-                            _unicode_encode(
-                                obj, encoding=_encodings["fs"], errors="strict"
-                            )
-                        except UnicodeEncodeError:
-                            pass
-                        else:
-                            os = portage.os
-                            perf_md5 = portage.checksum.perform_md5
-
                 file_data = pkgfiles[objkey]
                 file_type = file_data[0]
 
@@ -3051,8 +3156,8 @@ class dblink:
                         continue
                     mymd5 = None
                     try:
-                        mymd5 = perf_md5(obj, calc_prelink=calc_prelink)
-                    except FileNotFound as e:
+                        mymd5 = perf_md5(obj)
+                    except FileNotFound:
                         # the file has disappeared between now and our stat call
                         show_unmerge("---", unmerge_desc["!obj"], file_type, obj)
                         continue
@@ -3170,7 +3275,6 @@ class dblink:
         self.lockdb()
         try:
             owners = self.vartree.dbapi._owners.get_owners(flat_list)
-            self.vartree.dbapi.flush_cache()
         finally:
             self.unlockdb()
 
@@ -3341,7 +3445,7 @@ class dblink:
                         for parent in sorted(set(recursive_parents)):
                             dirs.append((parent, revisit.pop(parent)))
 
-    def isowner(self, filename, destroot=None):
+    def isowner(self, filename):
         """
         Check if a file belongs to this package. This may
         result in a stat call for the parent directory of
@@ -3353,27 +3457,14 @@ class dblink:
 
         @param filename:
         @type filename:
-        @param destroot:
-        @type destroot:
         @rtype: Boolean
         @return:
         1. True if this package owns the file.
         2. False if this package does not own the file.
         """
-
-        if destroot is not None and destroot != self._eroot:
-            warnings.warn(
-                "The second parameter of the "
-                + "portage.dbapi.vartree.dblink.isowner()"
-                + " is now unused. Instead "
-                + "self.settings['EROOT'] will be used.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         return bool(self._match_contents(filename))
 
-    def _match_contents(self, filename, destroot=None):
+    def _match_contents(self, filename):
         """
         The matching contents entry is returned, which is useful
         since the path may differ from the one given by the caller,
@@ -3385,49 +3476,16 @@ class dblink:
         """
         from portage.util import normalize_path
 
-        filename = _unicode_decode(
-            filename, encoding=_encodings["content"], errors="strict"
-        )
-
-        if destroot is not None and destroot != self._eroot:
-            warnings.warn(
-                "The second parameter of the "
-                + "portage.dbapi.vartree.dblink._match_contents()"
-                + " is now unused. Instead "
-                + "self.settings['ROOT'] will be used.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        if isinstance(filename, bytes):
+            filename = filename.decode("utf-8", "strict")
 
         # don't use EROOT here, image already contains EPREFIX
         destroot = self.settings["ROOT"]
 
         # The given filename argument might have a different encoding than the
         # the filenames contained in the contents, so use separate wrapped os
-        # modules for each. The basename is more likely to contain non-ascii
-        # characters than the directory path, so use os_filename_arg for all
-        # operations involving the basename of the filename arg.
-        os_filename_arg = _os_merge
-        os = _os_merge
 
-        try:
-            _unicode_encode(filename, encoding=_encodings["merge"], errors="strict")
-        except UnicodeEncodeError:
-            # The package appears to have been merged with a
-            # different value of sys.getfilesystemencoding(),
-            # so fall back to utf_8 if appropriate.
-            try:
-                _unicode_encode(filename, encoding=_encodings["fs"], errors="strict")
-            except UnicodeEncodeError:
-                pass
-            else:
-                os_filename_arg = portage.os
-
-        destfile = normalize_path(
-            os_filename_arg.path.join(
-                destroot, filename.lstrip(os_filename_arg.path.sep)
-            )
-        )
+        destfile = normalize_path(os.path.join(destroot, filename.lstrip(os.sep)))
 
         if "case-insensitive-fs" in self.settings.features:
             destfile = destfile.lower()
@@ -3436,27 +3494,8 @@ class dblink:
             return self._contents.unmap_key(destfile)
 
         if self.getcontents():
-            basename = os_filename_arg.path.basename(destfile)
+            basename = os.path.basename(destfile)
             if self._contents_basenames is None:
-                try:
-                    for x in self._contents.keys():
-                        _unicode_encode(
-                            x, encoding=_encodings["merge"], errors="strict"
-                        )
-                except UnicodeEncodeError:
-                    # The package appears to have been merged with a
-                    # different value of sys.getfilesystemencoding(),
-                    # so fall back to utf_8 if appropriate.
-                    try:
-                        for x in self._contents.keys():
-                            _unicode_encode(
-                                x, encoding=_encodings["fs"], errors="strict"
-                            )
-                    except UnicodeEncodeError:
-                        pass
-                    else:
-                        os = portage.os
-
                 self._contents_basenames = {
                     os.path.basename(x) for x in self._contents.keys()
                 }
@@ -3468,35 +3507,15 @@ class dblink:
 
             # Use stat rather than lstat since we want to follow
             # any symlinks to the real parent directory.
-            parent_path = os_filename_arg.path.dirname(destfile)
+            parent_path = os.path.dirname(destfile)
             try:
-                parent_stat = os_filename_arg.stat(parent_path)
+                parent_stat = os.stat(parent_path)
             except OSError as e:
                 if e.errno != errno.ENOENT:
                     raise
                 del e
                 return False
             if self._contents_inodes is None:
-                if os is _os_merge:
-                    try:
-                        for x in self._contents.keys():
-                            _unicode_encode(
-                                x, encoding=_encodings["merge"], errors="strict"
-                            )
-                    except UnicodeEncodeError:
-                        # The package appears to have been merged with a
-                        # different value of sys.getfilesystemencoding(),
-                        # so fall back to utf_8 if appropriate.
-                        try:
-                            for x in self._contents.keys():
-                                _unicode_encode(
-                                    x, encoding=_encodings["fs"], errors="strict"
-                                )
-                        except UnicodeEncodeError:
-                            pass
-                        else:
-                            os = portage.os
-
                 self._contents_inodes = {}
                 parent_paths = set()
                 for x in self._contents.keys():
@@ -3524,7 +3543,7 @@ class dblink:
             )
             if p_path_list:
                 for p_path in p_path_list:
-                    x = os_filename_arg.path.join(p_path, basename)
+                    x = os.path.join(p_path, basename)
                     if self._contents.contains(x):
                         return self._contents.unmap_key(x)
 
@@ -3567,8 +3586,8 @@ class dblink:
         self._installed_instance. Otherwise, paths are selected from
         self.
         """
-        from portage.util.digraph import digraph
         from portage.util._dyn_libs.LinkageMapELF import LinkageMapELF as LinkageMap
+        from portage.util.digraph import digraph
 
         if (
             self._linkmap_broken
@@ -3579,7 +3598,6 @@ class dblink:
         ):
             return set()
 
-        os = _os_merge
         linkmap = self.vartree.dbapi._linkmap
         if unmerge:
             installed_instance = self
@@ -3606,24 +3624,6 @@ class dblink:
         provider_nodes = set()
         # Create provider nodes and add them to the graph.
         for f_abs in old_contents:
-            if os is _os_merge:
-                try:
-                    _unicode_encode(
-                        f_abs, encoding=_encodings["merge"], errors="strict"
-                    )
-                except UnicodeEncodeError:
-                    # The package appears to have been merged with a
-                    # different value of sys.getfilesystemencoding(),
-                    # so fall back to utf_8 if appropriate.
-                    try:
-                        _unicode_encode(
-                            f_abs, encoding=_encodings["fs"], errors="strict"
-                        )
-                    except UnicodeEncodeError:
-                        pass
-                    else:
-                        os = portage.os
-
             f = f_abs[root_len:]
             try:
                 consumers = linkmap.findConsumers(
@@ -3711,7 +3711,6 @@ class dblink:
         if not preserve_paths:
             return
 
-        os = _os_merge
         showMessage = self._display_merge
         root = self.settings["ROOT"]
 
@@ -3719,7 +3718,8 @@ class dblink:
         new_contents = self.getcontents().copy()
         old_contents = self._installed_instance.getcontents()
         for f in sorted(preserve_paths):
-            f = _unicode_decode(f, encoding=_encodings["content"], errors="strict")
+            if isinstance(f, bytes):
+                f = f.decode("utf-8", "strict")
             f_abs = os.path.join(root, f.lstrip(os.sep))
             contents_entry = old_contents.get(f_abs)
             if contents_entry is None:
@@ -3759,8 +3759,8 @@ class dblink:
         """
         Find preserved libraries that don't have any consumers left.
         """
-        from portage.util.digraph import digraph
         from portage.util._dyn_libs.LinkageMapELF import LinkageMapELF as LinkageMap
+        from portage.util.digraph import digraph
 
         if (
             self._linkmap_broken
@@ -3853,35 +3853,30 @@ class dblink:
                     break
 
         cpv_lib_map = {}
-        while lib_graph:
-            root_nodes = preserved_nodes.intersection(lib_graph.root_nodes())
-            if not root_nodes:
-                break
-            lib_graph.difference_update(root_nodes)
-            unlink_list = set()
-            for node in root_nodes:
-                unlink_list.update(node.alt_paths)
-            unlink_list = sorted(unlink_list)
-            for obj in unlink_list:
-                cpv = path_cpv_map.get(obj)
-                if cpv is None:
-                    # This means that a symlink is in the preserved libs
-                    # registry, but the actual lib it points to is not.
-                    self._display_merge(
-                        _(
-                            "!!! symlink to lib is preserved, "
-                            "but not the lib itself:\n!!! '%s'\n"
-                        )
-                        % (obj,),
-                        level=logging.ERROR,
-                        noiselevel=-1,
+        unlink_list = set()
+        for node in _find_unneeded_preserved_nodes(lib_graph, preserved_nodes):
+            unlink_list.update(node.alt_paths)
+
+        for obj in sorted(unlink_list):
+            cpv = path_cpv_map.get(obj)
+            if cpv is None:
+                # This means that a symlink is in the preserved libs
+                # registry, but the actual lib it points to is not.
+                self._display_merge(
+                    _(
+                        "!!! symlink to lib is preserved, "
+                        "but not the lib itself:\n!!! '%s'\n"
                     )
-                    continue
-                removed = cpv_lib_map.get(cpv)
-                if removed is None:
-                    removed = set()
-                    cpv_lib_map[cpv] = removed
-                removed.add(obj)
+                    % (obj,),
+                    level=logging.ERROR,
+                    noiselevel=-1,
+                )
+                continue
+            removed = cpv_lib_map.get(cpv)
+            if removed is None:
+                removed = set()
+                cpv_lib_map[cpv] = removed
+            removed.add(obj)
 
         return cpv_lib_map
 
@@ -3889,8 +3884,6 @@ class dblink:
         """
         Remove files returned from _find_unused_preserved_libs().
         """
-
-        os = _os_merge
 
         files_to_remove = set()
         for files in cpv_lib_map.values():
@@ -3934,10 +3927,8 @@ class dblink:
     def _collision_protect(self, srcroot, destroot, mypkglist, file_list, symlink_list):
         from portage.output import colorize
         from portage.util import normalize_path
-        from portage.util.path import iter_parents
         from portage.util._compare_files import compare_files
-
-        os = _os_merge
+        from portage.util.path import iter_parents
 
         real_relative_paths = {}
 
@@ -4138,8 +4129,6 @@ class dblink:
         All lstat() calls are relative to self.myroot.
         """
 
-        os = _os_merge
-
         root = self.settings["ROOT"]
         inode_map = {}
         for f in path_iter:
@@ -4163,8 +4152,6 @@ class dblink:
         if not installed_instances:
             return 0
 
-        os = _os_merge
-
         showMessage = self._display_merge
 
         file_paths = set()
@@ -4173,22 +4160,6 @@ class dblink:
         inode_map = {}
         real_paths = set()
         for i, path in enumerate(file_paths):
-            if os is _os_merge:
-                try:
-                    _unicode_encode(path, encoding=_encodings["merge"], errors="strict")
-                except UnicodeEncodeError:
-                    # The package appears to have been merged with a
-                    # different value of sys.getfilesystemencoding(),
-                    # so fall back to utf_8 if appropriate.
-                    try:
-                        _unicode_encode(
-                            path, encoding=_encodings["fs"], errors="strict"
-                        )
-                    except UnicodeEncodeError:
-                        pass
-                    else:
-                        os = portage.os
-
             try:
                 s = os.lstat(path)
             except OSError as e:
@@ -4256,8 +4227,12 @@ class dblink:
             self._scheduler.output(msg, background=background, log_path=log_path)
 
     def _elog_process(self, phasefilter=None):
-        from portage.elog import elog_process, collect_ebuild_messages, collect_messages
-        from portage.elog import _merge_logentries
+        from portage.elog import (
+            _merge_logentries,
+            collect_ebuild_messages,
+            collect_messages,
+            elog_process,
+        )
 
         cpv = self.mycpv
         if self._pipe is None:
@@ -4291,7 +4266,7 @@ class dblink:
                             str_buffer.append(" ".join(fields))
                             str_buffer.append("\n")
             if str_buffer:
-                str_buffer = _unicode_encode("".join(str_buffer))
+                str_buffer = "".join(str_buffer).encode("utf-8", "backslashreplace")
                 while str_buffer:
                     str_buffer = str_buffer[os.write(self._pipe.fileno(), str_buffer) :]
 
@@ -4350,11 +4325,12 @@ class dblink:
         secondhand is a list of symlinks that have been skipped due to their target
         not existing; we will merge these symlinks at a later time.
         """
-        from portage.dep import match_from_list, _slot_separator, _repo_separator
+        from portage.dep import _repo_separator, _slot_separator, match_from_list
         from portage.package.ebuild.doebuild import (
-            doebuild_environment,
             _merge_unicode_error,
+            doebuild_environment,
         )
+        from portage.package.ebuild.prepare_build_dirs import prepare_build_dirs
         from portage.util import (
             ensure_dirs,
             grabdict,
@@ -4364,7 +4340,6 @@ class dblink:
         from portage.util.env_update import env_update
         from portage.util.install_mask import InstallMask, install_mask_dir
         from portage.util.writeable_check import get_ro_checker
-        from portage.package.ebuild.prepare_build_dirs import prepare_build_dirs
         from portage.versions import (
             _pkg_str,
             _unknown_repo,
@@ -4373,18 +4348,13 @@ class dblink:
             vercmp,
         )
 
-        os = _os_merge
-
-        srcroot = _unicode_decode(
-            srcroot, encoding=_encodings["content"], errors="strict"
-        )
+        if isinstance(srcroot, bytes):
+            srcroot = srcroot.decode("utf-8", "strict")
         destroot = self.settings["ROOT"]
-        inforoot = _unicode_decode(
-            inforoot, encoding=_encodings["content"], errors="strict"
-        )
-        myebuild = _unicode_decode(
-            myebuild, encoding=_encodings["content"], errors="strict"
-        )
+        if isinstance(inforoot, bytes):
+            inforoot = inforoot.decode("utf-8", "strict")
+        if isinstance(myebuild, bytes):
+            myebuild = myebuild.decode("utf-8", "strict")
 
         showMessage = self._display_merge
         srcroot = normalize_path(srcroot).rstrip(os.path.sep) + os.path.sep
@@ -4415,12 +4385,8 @@ class dblink:
         for var_name in ("CHOST", "SLOT"):
             try:
                 with open(
-                    _unicode_encode(
-                        os.path.join(inforoot, var_name),
-                        encoding=_encodings["fs"],
-                        errors="strict",
-                    ),
-                    encoding=_encodings["repo.content"],
+                    os.path.join(inforoot, var_name),
+                    encoding="utf-8",
                     errors="replace",
                 ) as f:
                     val = f.readline().strip()
@@ -4557,12 +4523,8 @@ class dblink:
         phase.wait()
         try:
             with open(
-                _unicode_encode(
-                    os.path.join(inforoot, "INSTALL_MASK"),
-                    encoding=_encodings["fs"],
-                    errors="strict",
-                ),
-                encoding=_encodings["repo.content"],
+                os.path.join(inforoot, "INSTALL_MASK"),
+                encoding="utf-8",
                 errors="replace",
             ) as f:
                 install_mask = InstallMask(f.read())
@@ -4610,24 +4572,10 @@ class dblink:
                     eagain_error = True
                     break
 
-                if portage.utf8_mode:
-                    parent = os.fsencode(parent)
-                    dirs = [os.fsencode(value) for value in dirs]
-                    files = [os.fsencode(value) for value in files]
                 try:
-                    parent = _unicode_decode(
-                        parent, encoding=_encodings["merge"], errors="strict"
-                    )
-                except UnicodeDecodeError:
-                    new_parent = _unicode_decode(
-                        parent, encoding=_encodings["merge"], errors="replace"
-                    )
-                    new_parent = _unicode_encode(
-                        new_parent, encoding="ascii", errors="backslashreplace"
-                    )
-                    new_parent = _unicode_decode(
-                        new_parent, encoding=_encodings["merge"], errors="replace"
-                    )
+                    parent.encode("utf-8", "strict")
+                except UnicodeEncodeError:
+                    new_parent = parent.encode("utf-8", "replace").decode("utf-8")
                     os.rename(parent, new_parent)
                     unicode_error = True
                     unicode_errors.append(new_parent[ed_len:])
@@ -4635,22 +4583,10 @@ class dblink:
 
                 for fname in files:
                     try:
-                        fname = _unicode_decode(
-                            fname, encoding=_encodings["merge"], errors="strict"
-                        )
-                    except UnicodeDecodeError:
-                        fpath = portage._os.path.join(
-                            parent.encode(_encodings["merge"]), fname
-                        )
-                        new_fname = _unicode_decode(
-                            fname, encoding=_encodings["merge"], errors="replace"
-                        )
-                        new_fname = _unicode_encode(
-                            new_fname, encoding="ascii", errors="backslashreplace"
-                        )
-                        new_fname = _unicode_decode(
-                            new_fname, encoding=_encodings["merge"], errors="replace"
-                        )
+                        fname.encode("utf-8", "strict")
+                    except UnicodeEncodeError:
+                        fpath = os.path.join(parent, fname)
+                        new_fname = fname.encode("utf-8", "replace").decode("utf-8")
                         new_fpath = os.path.join(parent, new_fname)
                         os.rename(fpath, new_fpath)
                         unicode_error = True
@@ -4674,15 +4610,7 @@ class dblink:
                         # to an infinite recursion loop.
                         linklist.append(relative_path)
 
-                        myto = _unicode_decode(
-                            _os.readlink(
-                                _unicode_encode(
-                                    fpath, encoding=_encodings["merge"], errors="strict"
-                                )
-                            ),
-                            encoding=_encodings["merge"],
-                            errors="replace",
-                        )
+                        myto = os.readlink(fpath)
                         if line_ending_re.search(myto) is not None:
                             paths_with_newlines.append(relative_path)
 
@@ -4950,7 +4878,6 @@ class dblink:
                 self.lockdb()
                 try:
                     owners = self.vartree.dbapi._owners.get_owners(collisions)
-                    self.vartree.dbapi.flush_cache()
 
                     for pkg in owners:
                         pkg = self.vartree.dbapi._pkg_str(pkg.mycpv, None)
@@ -4994,13 +4921,7 @@ class dblink:
             if symlink_collisions:
                 abort = True
                 msg = symlink_abort_msg % (self.settings.mycpv,)
-            elif collision_protect:
-                abort = True
-                msg = (
-                    _("Package '%s' NOT merged due to file collisions.")
-                    % self.settings.mycpv
-                )
-            elif protect_owned and owners:
+            elif collision_protect or protect_owned and owners:
                 abort = True
                 msg = (
                     _("Package '%s' NOT merged due to file collisions.")
@@ -5085,13 +5006,9 @@ class dblink:
         if counter is None:
             counter = self.vartree.dbapi.counter_tick()
         with open(
-            _unicode_encode(
-                os.path.join(self.dbtmpdir, "COUNTER"),
-                encoding=_encodings["fs"],
-                errors="strict",
-            ),
+            os.path.join(self.dbtmpdir, "COUNTER"),
             mode="w",
-            encoding=_encodings["repo.content"],
+            encoding="utf-8",
             errors="backslashreplace",
         ) as f:
             f.write(f"{counter}")
@@ -5155,14 +5072,28 @@ class dblink:
             try:
                 plib_registry.load()
                 needed = os.path.join(inforoot, linkmap._needed_aux_key)
-                self._linkmap_rebuild(include_file=needed)
 
-                # Preserve old libs if they are still in use
-                # TODO: Handle cases where the previous instance
-                # has already been uninstalled but it still has some
-                # preserved libraries in the registry that we may
-                # want to preserve here.
-                preserve_paths = self._find_libs_to_preserve()
+                # preserve-libs can only preserve libraries owned by the
+                # instance being replaced (see _find_libs_to_preserve, which
+                # selects paths from self._installed_instance). If there is no
+                # replaced instance, or it owns no files (e.g. empty/virtual
+                # packages), then _find_libs_to_preserve() is guaranteed to
+                # return an empty set, so the expensive system-wide linkmap
+                # rebuild here would be a waste. Skip it.
+                installed_instance = self._installed_instance
+                if (
+                    self._preserve_libs
+                    and installed_instance is not None
+                    and installed_instance.getcontents()
+                ):
+                    self._linkmap_rebuild(include_file=needed)
+
+                    # Preserve old libs if they are still in use
+                    # TODO: Handle cases where the previous instance
+                    # has already been uninstalled but it still has some
+                    # preserved libraries in the registry that we may
+                    # want to preserve here.
+                    preserve_paths = self._find_libs_to_preserve()
             finally:
                 plib_registry.unlock()
                 self.vartree.dbapi._fs_unlock()
@@ -5220,6 +5151,15 @@ class dblink:
                 self.unlockdb()
             showMessage(_(">>> Original instance of package unmerged safely.\n"))
 
+        # Consolidate the per-field metadata files into a single metadata
+        # file. This has to be the last write into dbtmpdir: the file records
+        # the directory's mtime and is rejected if the directory changes
+        # afterwards, and CONTENTS is written above via a rename that would
+        # otherwise invalidate it for every freshly merged package. Renaming
+        # dbtmpdir into place below does not alter its own mtime, so the
+        # recorded value survives the move.
+        _consolidate_to_metadata_file(self.dbtmpdir)
+
         # We hold both directory locks.
         self.dbdir = self.dbpkgdir
         self.lockdb()
@@ -5227,9 +5167,6 @@ class dblink:
             self.delete()
             _movefile(self.dbtmpdir, self.dbpkgdir, mysettings=self.settings)
             self._merged_path(self.dbpkgdir, os.lstat(self.dbpkgdir))
-            self.vartree.dbapi._cache_delta.recordEvent(
-                "add", self.mycpv, slot, counter
-            )
         finally:
             self.unlockdb()
 
@@ -5367,10 +5304,10 @@ class dblink:
             )
             self._send_mtimes(prev_mtimes)
 
-        # For gcc upgrades, preserved libs have to be removed after the
-        # the library path has been updated.
-        self._prune_plib_registry()
-        self._post_merge_sync()
+            # For gcc upgrades, preserved libs have to be removed after the
+            # the library path has been updated.
+            self._prune_plib_registry()
+            self._post_merge_sync()
 
         return os.EX_OK
 
@@ -5381,7 +5318,6 @@ class dblink:
         The returned filename is of the form p + '.backup.' + x, where
         x guarantees that the returned path does not exist yet.
         """
-        os = _os_merge
 
         x = -1
         while True:
@@ -5405,17 +5341,9 @@ class dblink:
         # to TextIOWrapper with python2.
         contents_tmp_path = os.path.join(self.dbtmpdir, "CONTENTS")
         outfile = atomic_ofstream(
-            (
-                contents_tmp_path
-                if portage.utf8_mode
-                else _unicode_encode(
-                    contents_tmp_path,
-                    encoding=_encodings["fs"],
-                    errors="strict",
-                )
-            ),
+            contents_tmp_path,
             mode="w",
-            encoding=_encodings["repo.content"],
+            encoding="utf-8",
             errors="backslashreplace",
         )
 
@@ -5526,21 +5454,19 @@ class dblink:
 
         """
         from hashlib import md5
+
         from portage.checksum import _perform_md5_merge as perform_md5
         from portage.eapi import eapi_rewrites_symlinks
         from portage.util import normalize_path
-        from portage.util.movefile import movefile
         from portage.versions import pkgsplit
 
         showMessage = self._display_merge
         writemsg = self._display_merge
 
-        os = _os_merge
         sep = os.sep
         join = os.path.join
         srcroot = normalize_path(srcroot).rstrip(sep) + sep
         destroot = normalize_path(destroot).rstrip(sep) + sep
-        calc_prelink = "prelink-checksums" in self.settings.features
 
         protect_if_modified = (
             "config-protect-if-modified" in self.settings.features
@@ -5572,35 +5498,22 @@ class dblink:
             mymtime = mystat.st_mtime_ns
 
             if stat.S_ISREG(mymode):
-                mymd5 = perform_md5(mysrc, calc_prelink=calc_prelink)
+                mymd5 = perform_md5(mysrc)
             elif stat.S_ISLNK(mymode):
                 # The file name of mysrc and the actual file that it points to
                 # will have earlier been forcefully converted to the 'merge'
                 # encoding if necessary, but the content of the symbolic link
                 # may need to be forcefully converted here.
-                myto = _os.readlink(
-                    _unicode_encode(
-                        mysrc, encoding=_encodings["merge"], errors="strict"
-                    )
-                )
+                myto = os.readlink(mysrc.encode("utf-8", "strict"))
                 try:
-                    myto = _unicode_decode(
-                        myto, encoding=_encodings["merge"], errors="strict"
-                    )
+                    myto = myto.decode("utf-8", "strict")
                 except UnicodeDecodeError:
-                    myto = _unicode_decode(
-                        myto, encoding=_encodings["merge"], errors="replace"
-                    )
-                    myto = _unicode_encode(
-                        myto, encoding="ascii", errors="backslashreplace"
-                    )
-                    myto = _unicode_decode(
-                        myto, encoding=_encodings["merge"], errors="replace"
-                    )
+                    myto = myto.decode("utf-8", "replace")
+                    myto = myto.encode("ascii", "backslashreplace").decode("utf-8")
                     os.unlink(mysrc)
                     os.symlink(myto, mysrc)
 
-                mymd5 = md5(_unicode_encode(myto)).hexdigest()
+                mymd5 = md5(myto.encode("utf-8", "backslashreplace")).hexdigest()
 
             protected = False
             if stat.S_ISLNK(mymode) or stat.S_ISREG(mymode):
@@ -5624,23 +5537,39 @@ class dblink:
                     if stat.S_ISLNK(mydmode):
                         # Read symlink target as bytes, in case the
                         # target path has a bad encoding.
-                        mydest_link = _os.readlink(
-                            _unicode_encode(
-                                mydest, encoding=_encodings["merge"], errors="strict"
-                            )
-                        )
-                        mydest_link = _unicode_decode(
-                            mydest_link, encoding=_encodings["merge"], errors="replace"
-                        )
+                        mydest_link = os.readlink(mydest.encode("utf-8", "strict"))
+                        if isinstance(mydest_link, bytes):
+                            mydest_link = mydest_link.decode("utf-8", "replace")
 
                         # For protection of symlinks, the md5
                         # of the link target path string is used
                         # for cfgfiledict (symlinks are
                         # protected since bug #485598).
-                        destmd5 = md5(_unicode_encode(mydest_link)).hexdigest()
+                        destmd5 = md5(
+                            mydest_link.encode("utf-8", "backslashreplace")
+                        ).hexdigest()
 
                     elif stat.S_ISREG(mydmode):
-                        destmd5 = perform_md5(mydest, calc_prelink=calc_prelink)
+                        destmd5 = None
+                        # If the file hasn't been modified since it was installed, we can safely
+                        # reuse the MD5 hash recorded in the var database (VDB) instead of
+                        # reading the file from disk to compute it.
+                        if (
+                            "merge-use-vdb" in self.settings.features
+                            and self._installed_instance is not None
+                        ):
+                            k = self._installed_instance._match_contents(myrealdest)
+                            if k is not False:
+                                data = self._installed_instance.getcontents()[k]
+                                if data[0] == "obj":
+                                    vdb_mtime = data[1]
+                                    if (
+                                        str(mydstat.st_mtime_ns // 1000000000)
+                                        == vdb_mtime
+                                    ):
+                                        destmd5 = data[2]
+                        if destmd5 is None:
+                            destmd5 = perform_md5(mydest)
             except (FileNotFound, OSError) as e:
                 if isinstance(e, OSError) and e.errno != errno.ENOENT:
                     raise
@@ -5679,8 +5608,7 @@ class dblink:
                 # or utf_8 (see bug #382021).
                 myabsto = abssymlink(mysrc, target=myto)
 
-                if myabsto.startswith(srcroot):
-                    myabsto = myabsto[len(srcroot) :]
+                myabsto = myabsto.removeprefix(srcroot)
                 myabsto = myabsto.lstrip(sep)
                 if (
                     self.settings
@@ -5738,7 +5666,6 @@ class dblink:
                         newmtime=thismtime,
                         sstat=mystat,
                         mysettings=self.settings,
-                        encoding=_encodings["merge"],
                     )
 
                 try:
@@ -5849,7 +5776,6 @@ class dblink:
                                 mydest,
                                 backup_dest,
                                 mysettings=self.settings,
-                                encoding=_encodings["merge"],
                             )
                             is None
                         ):
@@ -5869,9 +5795,7 @@ class dblink:
                             # Error handling should be equivalent to
                             # portage.util.ensure_dirs() for cases
                             # like bug #187518.
-                            if e.errno in (errno.EEXIST,):
-                                pass
-                            elif os.path.isdir(mydest):
+                            if e.errno in (errno.EEXIST,) or os.path.isdir(mydest):
                                 pass
                             else:
                                 raise
@@ -5893,9 +5817,7 @@ class dblink:
                         # Error handling should be equivalent to
                         # portage.util.ensure_dirs() for cases
                         # like bug #187518.
-                        if e.errno in (errno.EEXIST,):
-                            pass
-                        elif os.path.isdir(mydest):
+                        if e.errno in (errno.EEXIST,) or os.path.isdir(mydest):
                             pass
                         else:
                             raise
@@ -5940,7 +5862,10 @@ class dblink:
                 # same way.  Unless moveme=0 (blocking directory)
                 if moveme:
                     # only replace the existing file if it differs, see #722270
-                    if self._needs_move(mysrc, mydest, mymode, mydmode):
+                    needs_move_reason = self._needs_move(
+                        mysrc, mydest, mymode, mydmode, mymd5, myrealdest
+                    )
+                    if needs_move_reason:
                         # Create hardlinks only for source files that already exist
                         # as hardlinks (having identical st_dev and st_ino).
                         hardlink_key = (mystat.st_dev, mystat.st_ino)
@@ -5957,7 +5882,6 @@ class dblink:
                             sstat=mystat,
                             mysettings=self.settings,
                             hardlink_candidates=hardlink_candidates,
-                            encoding=_encodings["merge"],
                         )
                         if mymtime is None:
                             return 1
@@ -5970,7 +5894,11 @@ class dblink:
                         except OSError:
                             # utime can fail here with EPERM
                             pass
-                        zing = "==="
+                        zing = (
+                            "=V="
+                            if needs_move_reason == MoveReason.VDB_HASH_MATCHES
+                            else "==="
+                        )
 
                     try:
                         self._merged_path(mydest, os.lstat(mydest))
@@ -5999,7 +5927,6 @@ class dblink:
                             newmtime=thismtime,
                             sstat=mystat,
                             mysettings=self.settings,
-                            encoding=_encodings["merge"],
                         )
                         is not None
                     ):
@@ -6054,9 +5981,9 @@ class dblink:
 
             elif protect_if_modified:
                 data = self._installed_instance.getcontents()[k]
-                if data[0] == "obj" and data[2] == dest_md5:
-                    protected = False
-                elif data[0] == "sym" and data[2] == dest_link:
+                if (data[0] == "obj" and data[2] == dest_md5) or (
+                    data[0] == "sym" and data[2] == dest_link
+                ):
                     protected = False
 
         if protected and dest_mode is not None:
@@ -6127,7 +6054,6 @@ class dblink:
         disk and avoid data-loss in the event of a power failure. This method
         does nothing if FEATURES=merge-sync is disabled.
         """
-        import subprocess
         from portage.dbapi._SyncfsProcess import SyncfsProcess
 
         if not self._device_path_map or "merge-sync" not in self.settings.features:
@@ -6148,12 +6074,7 @@ class dblink:
             returncode = proc.wait()
 
         if returncode is None or returncode != os.EX_OK:
-            try:
-                proc = subprocess.Popen(["sync"])
-            except OSError:
-                pass
-            else:
-                proc.wait()
+            os.sync()
 
     @_slot_locked
     def merge(
@@ -6253,12 +6174,8 @@ class dblink:
         if not os.path.exists(self.dbdir + "/" + name):
             return ""
         with open(
-            _unicode_encode(
-                os.path.join(self.dbdir, name),
-                encoding=_encodings["fs"],
-                errors="strict",
-            ),
-            encoding=_encodings["repo.content"],
+            os.path.join(self.dbdir, name),
+            encoding="utf-8",
             errors="replace",
         ) as f:
             mydata = f.read().split()
@@ -6271,12 +6188,8 @@ class dblink:
         if not os.path.exists(self.dbdir + "/" + fname):
             return ""
         with open(
-            _unicode_encode(
-                os.path.join(self.dbdir, fname),
-                encoding=_encodings["fs"],
-                errors="strict",
-            ),
-            encoding=_encodings["repo.content"],
+            os.path.join(self.dbdir, fname),
+            encoding="utf-8",
             errors="replace",
         ) as f:
             return f.read()
@@ -6289,19 +6202,15 @@ class dblink:
             kwargs["mode"] = "wb"
         else:
             kwargs["mode"] = "w"
-            kwargs["encoding"] = _encodings["repo.content"]
+            kwargs["encoding"] = "utf-8"
         write_atomic(os.path.join(self.dbdir, fname), data, **kwargs)
 
     def getelements(self, ename):
         if not os.path.exists(self.dbdir + "/" + ename):
             return []
         with open(
-            _unicode_encode(
-                os.path.join(self.dbdir, ename),
-                encoding=_encodings["fs"],
-                errors="strict",
-            ),
-            encoding=_encodings["repo.content"],
+            os.path.join(self.dbdir, ename),
+            encoding="utf-8",
             errors="replace",
         ) as f:
             mylines = f.readlines()
@@ -6313,17 +6222,12 @@ class dblink:
 
     def setelements(self, mylist, ename):
         with open(
-            _unicode_encode(
-                os.path.join(self.dbdir, ename),
-                encoding=_encodings["fs"],
-                errors="strict",
-            ),
+            os.path.join(self.dbdir, ename),
             mode="w",
-            encoding=_encodings["repo.content"],
+            encoding="utf-8",
             errors="backslashreplace",
         ) as f:
-            for x in mylist:
-                f.write(f"{x}\n")
+            f.writelines(f"{x}\n" for x in mylist)
 
     def isregular(self):
         "Is this a regular package (does it have a CATEGORY file?  A dblink can be virtual *and* regular)"
@@ -6412,7 +6316,7 @@ class dblink:
         finally:
             self.unlockdb()
 
-    def _needs_move(self, mysrc, mydest, mymode, mydmode):
+    def _needs_move(self, mysrc, mydest, mymode, mydmode, mymd5=None, myrealdest=None):
         """
         Checks whether the given file at |mysrc| needs to be moved to |mydest| or if
         they are identical.
@@ -6421,21 +6325,46 @@ class dblink:
         Should only be used for regular files.
         """
         from portage.util import writemsg
-        from portage.util.movefile import _cmpxattr
 
-        if mydmode is None or not stat.S_ISREG(mydmode) or mymode != mydmode:
-            return True
+        if mydmode is None or not stat.S_ISREG(mydmode):
+            return MoveReason.FILE_MISSING_OR_NOT_REGULAR
+        if mymode != mydmode:
+            return MoveReason.MODE_DIFFERS
 
-        src_bytes = _unicode_encode(mysrc, encoding=_encodings["fs"], errors="strict")
-        dest_bytes = _unicode_encode(mydest, encoding=_encodings["fs"], errors="strict")
+        # Instead of doing a full file content comparison, we can check if the file's
+        # modification time matches the one recorded in the var database (VDB).
+        # If it does, we assume the file hasn't been modified and can simply compare
+        # the incoming file's MD5 hash with the one in the VDB.
+        if (
+            "merge-use-vdb" in self.settings.features
+            and myrealdest is not None
+            and mymd5 is not None
+            and self._installed_instance is not None
+        ):
+            k = self._installed_instance._match_contents(myrealdest)
+            if k is not False:
+                data = self._installed_instance.getcontents()[k]
+                if data[0] == "obj":
+                    vdb_mtime = data[1]
+                    try:
+                        mydest_mtime = str(os.lstat(mydest).st_mtime_ns // 1000000000)
+                    except OSError:
+                        mydest_mtime = None
+                    if mydest_mtime == vdb_mtime:
+                        vdb_md5 = data[2]
+                        return (
+                            MoveReason.VDB_HASH_DIFFERS
+                            if mymd5 != vdb_md5
+                            else MoveReason.VDB_HASH_MATCHES
+                        )
 
         if "xattr" in self.settings.features:
             excluded_xattrs = self.settings.get("PORTAGE_XATTR_EXCLUDE", "")
-            if not _cmpxattr(src_bytes, dest_bytes, exclude=excluded_xattrs):
-                return True
+            if not _cmpxattr(mysrc, mydest, exclude=excluded_xattrs):
+                return MoveReason.XATTR_DIFFERS
 
         try:
-            files_equal = filecmp.cmp(src_bytes, dest_bytes, shallow=False)
+            files_equal = filecmp.cmp(mysrc, mydest, shallow=False)
         except Exception as e:
             writemsg(
                 _(
@@ -6444,9 +6373,13 @@ class dblink:
                 % (e, mysrc, mydest),
                 noiselevel=-1,
             )
-            return True
+            return MoveReason.COMPARISON_EXCEPTION
 
-        return not files_equal
+        return (
+            MoveReason.CONTENT_DIFFERS
+            if not files_equal
+            else MoveReason.CONTENT_MATCHES
+        )
 
 
 def merge(
@@ -6575,27 +6508,26 @@ def write_contents(contents, root, f):
 
 def tar_contents(contents, root, tar, protect=None, onProgress=None, xattrs=False):
     import tarfile
+
     from portage.util import normalize_path
     from portage.util._xattr import xattr
 
-    os = _os_merge
-    encoding = _encodings["merge"]
+    encoding = "utf-8"
 
     try:
         for x in contents:
-            _unicode_encode(x, encoding=_encodings["merge"], errors="strict")
+            x
     except UnicodeEncodeError:
         # The package appears to have been merged with a
         # different value of sys.getfilesystemencoding(),
         # so fall back to utf_8 if appropriate.
         try:
             for x in contents:
-                _unicode_encode(x, encoding=_encodings["fs"], errors="strict")
+                x
         except UnicodeEncodeError:
             pass
         else:
-            os = portage.os
-            encoding = _encodings["fs"]
+            encoding = "utf-8"
 
     tar.encoding = encoding
     root = normalize_path(root).rstrip(os.path.sep) + os.path.sep
@@ -6687,10 +6619,7 @@ def tar_contents(contents, root, tar, protect=None, onProgress=None, xattrs=Fals
                 # potential collision-protect issues.
                 f = tempfile.TemporaryFile()
                 f.write(
-                    _unicode_encode(
-                        "# empty file because --include-config=n "
-                        + "when `quickpkg` was used\n"
-                    )
+                    b"# empty file because --include-config=n when `quickpkg` was used\n"
                 )
                 f.flush()
                 f.seek(0)
@@ -6698,14 +6627,24 @@ def tar_contents(contents, root, tar, protect=None, onProgress=None, xattrs=Fals
                 tar.addfile(tarinfo, f)
                 f.close()
             else:
-                path_bytes = _unicode_encode(path, encoding=encoding, errors="strict")
+                path_bytes = path
 
                 if xattrs:
-                    # Compatible with GNU tar, which saves the xattrs
-                    # under the SCHILY.xattr namespace.
+                    # Compatible with GNU tar, which saves the xattrs under the
+                    # SCHILY.xattr namespace. The "surrogateescape" argument
+                    # ensures that the xattr value round-trips correctly.
                     for k in xattr.list(path_bytes):
-                        tarinfo.pax_headers["SCHILY.xattr." + _unicode_decode(k)] = (
-                            _unicode_decode(xattr.get(path_bytes, _unicode_encode(k)))
+                        tarinfo.pax_headers[
+                            "SCHILY.xattr."
+                            + (
+                                k.decode("utf-8", "replace")
+                                if isinstance(k, bytes)
+                                else k
+                            )
+                        ] = xattr.get(
+                            path_bytes, k.encode("utf-8", "backslashreplace")
+                        ).decode(
+                            "utf-8", "surrogateescape"
                         )
 
                 with open(path_bytes, "rb") as f:

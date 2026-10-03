@@ -1,15 +1,15 @@
 # Copyright 2005-2021 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-import portage
-from portage import os, _unicode_encode
-from portage.const import MERGING_IDENTIFIER, EPREFIX, PRIVATE_PATH, VDB_PATH
-from portage.dep import isvalidatom
-
+import os
 import shutil
 import subprocess
 import sys
 import time
+
+import portage
+from portage.const import EPREFIX, MERGING_IDENTIFIER, PRIVATE_PATH, VDB_PATH
+from portage.dep import isvalidatom
 
 
 class TrackingFile:
@@ -22,9 +22,7 @@ class TrackingFile:
         @param tracking_path: file path used to keep track of failed merges
         @type tracking_path: String
         """
-        self._tracking_path = (
-            tracking_path if portage.utf8_mode else _unicode_encode(tracking_path)
-        )
+        self._tracking_path = tracking_path
 
     def save(self, failed_pkgs):
         """
@@ -106,19 +104,20 @@ class MergesHandler:
         @return: dictionary of packages that failed to merges
         """
         failed_pkgs = {}
-        for cat in os.listdir(self._vardb_path):
-            pkgs_path = os.path.join(self._vardb_path, cat)
-            if not os.path.isdir(pkgs_path):
-                continue
-            pkgs = os.listdir(pkgs_path)
-            maxval = len(pkgs)
-            for i, pkg in enumerate(pkgs):
-                if onProgress:
-                    onProgress(maxval, i + 1)
-                if MERGING_IDENTIFIER in pkg:
-                    mtime = int(os.stat(os.path.join(pkgs_path, pkg)).st_mtime)
-                    pkg = os.path.join(cat, pkg)
-                    failed_pkgs[pkg] = mtime
+        with os.scandir(self._vardb_path) as it:
+            for cat in it:
+                if not cat.is_dir():
+                    continue
+                pkgs_path = cat
+                pkgs = os.listdir(pkgs_path)
+                maxval = len(pkgs)
+                for i, pkg in enumerate(pkgs):
+                    if onProgress:
+                        onProgress(maxval, i + 1)
+                    if MERGING_IDENTIFIER in pkg:
+                        mtime = int(os.stat(os.path.join(pkgs_path, pkg)).st_mtime)
+                        pkg = os.path.join(cat, pkg)
+                        failed_pkgs[pkg] = mtime
         return failed_pkgs
 
     def _failed_pkgs(self, onProgress=None):
@@ -254,7 +253,7 @@ class MergesHandler:
         try:
             self._tracking_file.save(failed_pkgs)
         except OSError as ex:
-            errors = [f"Unable to save failed merges to tracking file: {str(ex)}\n"]
+            errors = [f"Unable to save failed merges to tracking file: {ex!s}\n"]
             errors.append(", ".join(sorted(failed_pkgs)))
             return (False, errors)
         self._remove_failed_dirs(failed_pkgs)

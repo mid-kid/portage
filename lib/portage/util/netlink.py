@@ -1,18 +1,19 @@
 # Copyright 2019-2020 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import socket
 from io import BytesIO
 from os import strerror
-from struct import Struct
-
-import socket
 from socket import (
     AF_NETLINK,
     AF_UNSPEC,
+    MSG_PEEK,
+    MSG_TRUNC,
     NETLINK_ROUTE,
     SOCK_DGRAM,
     inet_pton,
 )
+from struct import Struct
 
 IFA_LOCAL = 2
 IFF_UP = 0x1
@@ -30,7 +31,7 @@ nlmsghdr = Struct("=IHHII")
 nlmsgerr = Struct("i")
 rtattr = Struct("HH")
 ifinfomsg = Struct("BHiII")
-ifaddrmsg = Struct("BBBBi")
+ifaddrmsg = Struct("BBBBI")
 
 
 def create_nlmsg(nlmsg_type, nlmsg_flags, nlmsg_seq, nlmsg_pid, data):
@@ -62,9 +63,10 @@ def parse_message(msg):
 class RtNetlink:
     def __init__(self):
         self.sock = socket.socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)
-        self.addr = (0, 0)
         try:
-            self.sock.bind(self.addr)
+            addr = (0, 0)
+            self.sock.bind(addr)
+            self.sock.connect(addr)
         except OSError:
             self.sock.close()
             raise
@@ -76,9 +78,17 @@ class RtNetlink:
         self.sock.close()
 
     def send_message(self, msg):
-        self.sock.sendto(msg, self.addr)
-        # Messages are variable length, but 128 is enough for the ones we care about.
-        resp = self.sock.recv(128)
+        self.sock.send(msg)
+
+        # The kernel docs say 8kB is a good buffer size.
+        # https://docs.kernel.org/7.2/userspace-api/netlink/intro.html#buffer-sizing
+        # Use MSG_PEEK|MSG_TRUNC to get the actual size in case the kernel changes.
+        resp = self.sock.recv(8192, MSG_PEEK | MSG_TRUNC)
+
+        # socket.recv() uses the passed size when allocating its buffer.
+        # It resizes the buffer based on the return value of the syscall.
+        resp = self.sock.recv(len(resp))
+
         return parse_message(resp)
 
     def get_link_ifindex(self, ifname):

@@ -3,10 +3,10 @@
 
 import functools
 import multiprocessing
+import os
 import sys
 
 import portage
-from portage import os
 from portage.tests import TestCase
 from portage.util._async.AsyncFunction import AsyncFunction
 from portage.util.futures import asyncio

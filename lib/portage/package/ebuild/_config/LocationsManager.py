@@ -1,13 +1,14 @@
-# Copyright 2010-2021 Gentoo Authors
+# Copyright 2010-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 __all__ = ("LocationsManager",)
 
+import os
 import shlex
 import warnings
 
 import portage
-from portage import os, eapi_is_supported, _encodings, _unicode_encode
+from portage import eapi_is_supported
 from portage.const import (
     CUSTOM_PROFILE_PATH,
     GLOBAL_CONFIG_PATH,
@@ -17,6 +18,11 @@ from portage.const import (
 from portage.eapi import eapi_allows_directories_on_profile_level_and_repository_level
 from portage.exception import DirectoryNotFound, InvalidLocation, ParseError
 from portage.localization import _
+from portage.repository.config import (
+    _portage1_profiles_allow_directories,
+    _profile_node,
+    parse_layout_conf,
+)
 from portage.util import (
     ensure_dirs,
     grabfile,
@@ -25,12 +31,6 @@ from portage.util import (
     writemsg,
 )
 from portage.util._path import exists_raise_eaccess, isdir_raise_eaccess
-from portage.repository.config import (
-    parse_layout_conf,
-    _portage1_profiles_allow_directories,
-    _profile_node,
-)
-
 
 _PORTAGE1_DIRECTORIES = frozenset(
     [
@@ -64,6 +64,8 @@ class LocationsManager:
         self.target_root = target_root
         self.sysroot = sysroot
         self._user_config = local_config
+        self.profiles = []
+        self.profiles_complex = []
 
         if self.eprefix is None:
             self.eprefix = portage.const.EPREFIX
@@ -160,7 +162,7 @@ class LocationsManager:
                         _("!!! Unable to parse profile: '%s'\n") % self.profile_path,
                         noiselevel=-1,
                     )
-                    writemsg(f"!!! ParseError: {str(e)}\n", noiselevel=-1)
+                    writemsg(f"!!! ParseError: {e!s}\n", noiselevel=-1)
                 self.profiles = []
                 self.profiles_complex = []
 
@@ -222,8 +224,8 @@ class LocationsManager:
         f = None
         try:
             f = open(
-                _unicode_encode(eapi_file, encoding=_encodings["fs"], errors="strict"),
-                encoding=_encodings["content"],
+                eapi_file,
+                encoding="utf-8",
                 errors="replace",
             )
             eapi = f.readline().strip()

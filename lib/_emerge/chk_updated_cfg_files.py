@@ -2,9 +2,9 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import logging
+import os
 
 import portage
-from portage import os
 from portage.localization import _
 from portage.output import bold, colorize, yellow
 from portage.util import writemsg_level

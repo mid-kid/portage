@@ -1,9 +1,10 @@
 # Copyright 2005-2020 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-from portage import os
-from portage.exception import PortageException
+import os
+
 from portage.cache.mappings import ProtectedDict
+from portage.exception import PortageException
 from portage.localization import _
 from portage.util import writemsg
 
@@ -234,7 +235,7 @@ class Modules:
 
     def _check_compat(self, module):
         if self.compat_versions:
-            if not module.module_spec["version"] in self.compat_versions:
+            if module.module_spec["version"] not in self.compat_versions:
                 raise ModuleVersionError(
                     f"Error loading '{self._namepath}' plugin module: {module.module_spec['name']}, version: {module.module_spec['version']}\n"
                     "Module is not compatible with the current application version\n"

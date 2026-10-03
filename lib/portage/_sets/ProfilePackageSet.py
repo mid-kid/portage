@@ -1,10 +1,11 @@
 # Copyright 2014-2021 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-from portage import os
+import os
+
+from portage._sets.base import PackageSet
 from portage.repository.config import allow_profile_repo_deps
 from portage.util import grabfile_package, stack_lists
-from portage._sets.base import PackageSet
 
 
 class ProfilePackageSet(PackageSet):
@@ -40,7 +41,7 @@ class ProfilePackageSet(PackageSet):
                 ],
                 incremental=1,
             )
-            if x[:1] != "*"
+            if str(x)[:1] != "*"
         )
 
     def singleBuilder(self, options, settings, trees):

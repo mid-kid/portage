@@ -1,10 +1,11 @@
-# Copyright 2005-2020 Gentoo Authors
+# Copyright 2005-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 # Author(s): Brian Harring (ferringb@gentoo.org)
 
-import os as _os
+import hashlib
+import os
+
 from portage.cache import template
-from portage import os
 
 
 class FsBased(template.database):
@@ -42,7 +43,7 @@ class FsBased(template.database):
 
     def _ensure_dirs(self, path=None):
         """with path!=None, ensure beyond self.location.  otherwise, ensure self.location"""
-        from portage.util import ensure_dirs, apply_permissions
+        from portage.util import apply_permissions, ensure_dirs
 
         if path:
             path = os.path.dirname(path)
@@ -67,10 +68,10 @@ class FsBased(template.database):
         all_dirs = []
         for parent, dirs, files in os.walk(self.location):
             for x in dirs:
-                all_dirs.append(_os.path.join(parent, x))
+                all_dirs.append(os.path.join(parent, x))
         while all_dirs:
             try:
-                _os.rmdir(all_dirs.pop())
+                os.rmdir(all_dirs.pop())
             except OSError:
                 pass
 
@@ -82,4 +83,8 @@ def gen_label(base, label):
     label = label.strip('"').strip("'")
     label = os.path.join(*(label.rstrip(os.path.sep).split(os.path.sep)))
     tail = os.path.split(label)[1]
-    return f"{tail}-{abs(label.__hash__()):X}"
+    # Not str.__hash__(), which is randomized per process.
+    digest = hashlib.md5(
+        label.encode("utf-8", "surrogateescape"), usedforsecurity=False
+    ).hexdigest()
+    return f"{tail}-{digest[:16].upper()}"

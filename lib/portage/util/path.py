@@ -2,8 +2,7 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import errno
-
-from portage import os
+import os
 
 
 def first_existing(path):

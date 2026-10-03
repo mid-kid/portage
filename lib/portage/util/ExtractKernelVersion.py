@@ -4,9 +4,9 @@
 __all__ = ["ExtractKernelVersion"]
 
 import logging
+import os
 import shlex
 
-from portage import os, _encodings, _unicode_encode
 from portage.env.loaders import KeyValuePairFileLoader
 from portage.util import grabfile, writemsg_level
 
@@ -26,8 +26,8 @@ def ExtractKernelVersion(base_dir):
     pathname = os.path.join(base_dir, "Makefile")
     try:
         f = open(
-            _unicode_encode(pathname, encoding=_encodings["fs"], errors="strict"),
-            encoding=_encodings["content"],
+            pathname,
+            encoding="utf-8",
             errors="replace",
         )
     except OSError as details:
@@ -53,9 +53,11 @@ def ExtractKernelVersion(base_dir):
         if items[0] == "VERSION" or items[0] == "PATCHLEVEL":
             version += items[1]
             version += "."
-        elif items[0] == "SUBLEVEL":
-            version += items[1]
-        elif items[0] == "EXTRAVERSION" and items[-1] != items[0]:
+        elif (
+            items[0] == "SUBLEVEL"
+            or items[0] == "EXTRAVERSION"
+            and items[-1] != items[0]
+        ):
             version += items[1]
 
     # Grab a list of files named localversion* and sort them

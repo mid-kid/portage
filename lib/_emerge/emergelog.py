@@ -1,12 +1,10 @@
 # Copyright 1999-2013 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 import time
+
 import portage
-from portage import os
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
 from portage.data import secpass
 from portage.output import xtermTitle
 
@@ -21,10 +19,12 @@ def emergelog(xterm_titles, mystr, short_msg=None):
     if _disable:
         return
 
-    mystr = _unicode_decode(mystr)
+    if isinstance(mystr, bytes):
+        mystr = mystr.decode("utf-8", "replace")
 
     if short_msg is not None:
-        short_msg = _unicode_decode(short_msg)
+        if isinstance(short_msg, bytes):
+            short_msg = short_msg.decode("utf-8", "replace")
 
     if xterm_titles and short_msg:
         xtermTitle(short_msg)
@@ -32,9 +32,9 @@ def emergelog(xterm_titles, mystr, short_msg=None):
         file_path = os.path.join(_emerge_log_dir, "emerge.log")
         existing_log = os.path.exists(file_path)
         mylogfile = open(
-            _unicode_encode(file_path, encoding=_encodings["fs"], errors="strict"),
+            file_path,
             mode="a",
-            encoding=_encodings["content"],
+            encoding="utf-8",
             errors="backslashreplace",
         )
         if not existing_log:

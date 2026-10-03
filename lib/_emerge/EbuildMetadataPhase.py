@@ -1,18 +1,17 @@
 # Copyright 1999-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-from _emerge.SubProcess import SubProcess
+import fcntl
+import os
+import shutil
 import sys
-from portage.cache.mappings import slot_dict_class
-import portage
+import tempfile
 
-from portage import os
-from portage import _encodings
-from portage import _unicode_decode
-from portage import _unicode_encode
+import portage
+from portage.cache.mappings import slot_dict_class
 from portage.util.futures import asyncio
 
-import fcntl
+from _emerge.SubProcess import SubProcess
 
 
 class EbuildMetadataPhase(SubProcess):
@@ -37,6 +36,8 @@ class EbuildMetadataPhase(SubProcess):
         "_eapi",
         "_eapi_lineno",
         "_raw_metadata",
+        "_sandbox_dir",
+        "_sandbox_log",
     )
 
     _file_names = ("ebuild",)
@@ -49,14 +50,15 @@ class EbuildMetadataPhase(SubProcess):
         self._registered = True
 
     async def _async_start(self):
+        from portage.package.ebuild.doebuild import doebuild, get_emerge_tmpdir
+
         from _emerge.EbuildPhase import _setup_locale
-        from portage.package.ebuild.doebuild import doebuild
 
         ebuild_path = self.ebuild_hash.location
 
         with open(
-            _unicode_encode(ebuild_path, encoding=_encodings["fs"], errors="strict"),
-            encoding=_encodings["repo.content"],
+            ebuild_path,
+            encoding="utf-8",
             errors="replace",
         ) as f:
             self._eapi, self._eapi_lineno = portage._parse_eapi_ebuild_head(f)
@@ -87,6 +89,25 @@ class EbuildMetadataPhase(SubProcess):
         await _setup_locale(self.settings)
 
         debug = settings.get("PORTAGE_DEBUG") == "1"
+
+        # Create the sandbox log directory before any file descriptors are
+        # opened, so that a failure here does not leak them.
+        emerge_tmpdir = get_emerge_tmpdir(settings)
+        self._sandbox_dir = tempfile.mkdtemp(prefix="sandbox-", dir=emerge_tmpdir)
+        try:
+            portage.util.apply_secpass_permissions(
+                self._sandbox_dir,
+                uid=portage.portage_uid,
+                gid=portage.portage_gid,
+                mode=0o750,
+            )
+        except Exception:
+            shutil.rmtree(self._sandbox_dir, ignore_errors=True)
+            self._sandbox_dir = None
+            raise
+        self._sandbox_log = os.path.join(self._sandbox_dir, "sandbox.log")
+        settings["SANDBOX_LOG"] = self._sandbox_log
+
         master_fd = None
         slave_fd = None
         fd_pipes = None
@@ -153,6 +174,7 @@ class EbuildMetadataPhase(SubProcess):
         if isinstance(retval, int):
             # doebuild failed before spawning
             self.returncode = retval
+            self._remove_sandbox_dir()
             self._async_wait()
             return
 
@@ -206,11 +228,9 @@ class EbuildMetadataPhase(SubProcess):
         # self._raw_metadata is None when _start returns
         # early due to an unsupported EAPI
         if self.returncode == os.EX_OK and self._raw_metadata is not None:
-            metadata_lines = _unicode_decode(
-                b"".join(self._raw_metadata),
-                encoding=_encodings["repo.content"],
-                errors="replace",
-            ).splitlines()
+            metadata_lines = (
+                b"".join(self._raw_metadata).decode("utf-8", "replace").splitlines()
+            )
             metadata = {}
             metadata_valid = True
             for l in metadata_lines:
@@ -219,6 +239,9 @@ class EbuildMetadataPhase(SubProcess):
                     break
                 key, value = l.split("=", 1)
                 metadata[key] = value
+
+            if metadata_valid and "EAPI" not in metadata:
+                metadata_valid = False
 
             if metadata_valid:
                 parsed_eapi = self._eapi
@@ -257,6 +280,26 @@ class EbuildMetadataPhase(SubProcess):
                 self.metadata = metadata
             else:
                 self.returncode = 1
+        elif self.returncode != os.EX_OK:
+            # Examine SANDBOX_LOG to determine if we have a general failure
+            # (say, a missing eclass) in which case we probably want to plough
+            # on, or if we have a sandbox violation, in which case we stop dead.
+            try:
+                if os.stat(self._sandbox_log).st_size > 0:
+                    self.returncode = 2
+            except OSError:
+                # Some other, non-sandbox problem occurred.
+                pass
+
+        self._remove_sandbox_dir()
+
+    def _remove_sandbox_dir(self):
+        if self._sandbox_dir is None:
+            return
+
+        shutil.rmtree(self._sandbox_dir, ignore_errors=True)
+        self._sandbox_dir = None
+        self._sandbox_log = None
 
     def _eapi_invalid(self, metadata):
         from portage.package.ebuild._metadata_invalid import eapi_invalid

@@ -1,20 +1,22 @@
 # Copyright Gentoo Foundation 2006-2020
 # Portage Unit Testing Functionality
 
-import tempfile
+import os
+import shutil
 import tarfile
+import tempfile
 
-from portage import os, shutil
+from portage.gpkg import gpkg
 from portage.tests import TestCase
 from portage.tests.resolver.ResolverPlayground import ResolverPlayground
-from portage.gpkg import gpkg
 
 
 class test_gpkg_large_size_case(TestCase):
     def test_gpkg_large_size(self):
         playground = ResolverPlayground(
             user_config={
-                "make.conf": ('BINPKG_COMPRESS="gzip"',),
+                # Only the container format is checked; use a cheap compressor.
+                "make.conf": ('BINPKG_COMPRESS="zstd"',),
             }
         )
         tmpdir = tempfile.mkdtemp()

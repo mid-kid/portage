@@ -2,18 +2,18 @@
 # Distributed under the terms of the GNU General Public License v2
 
 import argparse
-import logging
 import locale
+import logging
+import os
 import platform
 import shlex
+import stat
 import sys
+from typing import Optional
 
 import portage
-
-from portage import os
+from portage.repository.config import _find_bad_atoms
 from portage.sync import _SUBMODULE_PATH_MAP
-
-from typing import Optional
 
 options = [
     "--alphabetical",
@@ -31,6 +31,7 @@ options = [
     "--noconfmem",
     "--newrepo",
     "--newuse",
+    "--nobindeps",
     "--nodeps",
     "--noreplace",
     "--nospinner",
@@ -126,6 +127,14 @@ def insert_optional_args(args):
         "n",
     )
 
+    class valid_integers_or_y_or_n:
+        def __contains__(self, s):
+            if s in valid_integers:
+                return True
+            return s in y_or_n
+
+    valid_integers_or_y_or_n = valid_integers_or_y_or_n()
+
     new_args = []
 
     default_arg_opts = {
@@ -139,21 +148,23 @@ def insert_optional_args(args):
         "--autounmask-unrestricted-atoms": y_or_n,
         "--autounmask-write": y_or_n,
         "--binpkg-changed-deps": y_or_n,
+        "--binpkg-respect-use": y_or_n,
+        "--binpkg-respect-user-patches": y_or_n,
         "--buildpkg": y_or_n,
         "--changed-deps": y_or_n,
         "--changed-slot": y_or_n,
         "--changed-deps-report": y_or_n,
+        "--circular-deps-report": ("text", "json"),
         "--complete-graph": y_or_n,
         "--deep": valid_integers,
         "--depclean-lib-check": y_or_n,
         "--deselect": y_or_n,
-        "--binpkg-respect-use": y_or_n,
         "--fail-clean": y_or_n,
         "--fuzzy-search": y_or_n,
         "--getbinpkg": y_or_n,
         "--getbinpkgonly": y_or_n,
         "--ignore-world": y_or_n,
-        "--jobs": valid_integers,
+        "--jobs": valid_integers_or_y_or_n,
         "--jobs-tmpdir-require-free-gb": valid_integers,
         "--keep-going": y_or_n,
         "--load-average": valid_floats,
@@ -177,6 +188,7 @@ def insert_optional_args(args):
         "--usepkgonly": y_or_n,
         "--usepkg-exclude-live": y_or_n,
         "--verbose": y_or_n,
+        "--verbose-missing-ebuilds": y_or_n,
         "--verbose-slot-rebuilds": y_or_n,
         "--with-test-deps": y_or_n,
     }
@@ -280,35 +292,6 @@ def insert_optional_args(args):
     return new_args
 
 
-def _find_bad_atoms(atoms, less_strict=False):
-    """
-    Declares all atoms as invalid that have an operator,
-    a use dependency, a blocker or a repo spec.
-    It accepts atoms with wildcards.
-    In less_strict mode it accepts operators and repo specs.
-    """
-    from _emerge.is_valid_package_atom import insert_category_into_atom
-    from portage.dep import Atom
-
-    bad_atoms = []
-    for x in " ".join(atoms).split():
-        atom = x
-        if "/" not in x.split(":")[0]:
-            x_cat = insert_category_into_atom(x, "dummy-category")
-            if x_cat is not None:
-                atom = x_cat
-
-        bad_atom = False
-        try:
-            atom = Atom(atom, allow_wildcard=True, allow_repo=less_strict)
-        except portage.exception.InvalidAtom:
-            bad_atom = True
-
-        if bad_atom or (atom.operator and not less_strict) or atom.blocker or atom.use:
-            bad_atoms.append(x)
-    return bad_atoms
-
-
 def parse_opts(tmpcmdline, silent=False):
     myaction = None
     myopts = {}
@@ -328,6 +311,7 @@ def parse_opts(tmpcmdline, silent=False):
             "rage-clean",
             "regen",
             "search",
+            "status",
             "sync",
             "unmerge",
             "version",
@@ -406,7 +390,17 @@ def parse_opts(tmpcmdline, silent=False):
             "action": "store",
         },
         "--binpkg-changed-deps": {
-            "help": ("reject binary packages with outdated " "dependencies"),
+            "help": "ignore binary packages with outdated dependencies",
+            "choices": true_y_or_n,
+        },
+        "--binpkg-respect-use": {
+            "help": "ignore binary packages if their use flags don't match the current configuration",
+            "choices": true_y_or_n,
+        },
+        "--binpkg-respect-user-patches": {
+            "help": "ignore binary packages that would revert user patches "
+            + "in the current configuration or were built with user patches "
+            + "not in the current configuration.",
             "choices": true_y_or_n,
         },
         "--buildpkg": {
@@ -431,6 +425,12 @@ def parse_opts(tmpcmdline, silent=False):
         "--changed-slot": {
             "help": ("replace installed packages with " "outdated SLOT metadata"),
             "choices": true_y_or_n,
+        },
+        "--circular-deps-report": {
+            "help": "format of the circular dependency report",
+            # "True" is what insert_optional_args() substitutes when no
+            # format follows the option, and means the default format.
+            "choices": ("True", "text", "json"),
         },
         "--config-root": {
             "help": "specify the location for portage configuration files",
@@ -530,6 +530,20 @@ def parse_opts(tmpcmdline, silent=False):
             + "is at least LOAD (a floating-point number).",
             "action": "store",
         },
+        "--merge-wait-scope": {
+            "help": "Specifies which packages are treated as system packages "
+            + "for the purpose of merge-wait, i.e. merged only while no build "
+            + "jobs are running, and never in parallel with another merge. "
+            + "'deep' (the default) selects the @system set and its transitive "
+            + "runtime dependencies, 'system' only the @system set itself, "
+            + "'toolchain' only the core toolchain, and 'none' nothing at all. "
+            + "Narrowing the scope trades away the protection against unstated "
+            + "dependencies on system packages. It only increases parallelism "
+            + 'for packages which are not held back by FEATURES="merge-wait" '
+            + 'anyway, so it is most useful with FEATURES="-merge-wait" or '
+            + 'FEATURES="parallel-install".',
+            "choices": ("deep", "system", "toolchain", "none"),
+        },
         "--misspell-suggestions": {
             "help": "enable package name misspell suggestions",
             "choices": ("y", "n"),
@@ -555,11 +569,6 @@ def parse_opts(tmpcmdline, silent=False):
             + "installed, and reinstall them if necessary. Implies --deep.",
             "action": "append",
         },
-        "--binpkg-respect-use": {
-            "help": "discard binary packages if their use flags \
-				don't match the current configuration",
-            "choices": true_y_or_n,
-        },
         "--getbinpkg": {
             "shortopt": "-g",
             "help": "fetch binary packages",
@@ -570,9 +579,24 @@ def parse_opts(tmpcmdline, silent=False):
             "help": "fetch binary packages only",
             "choices": true_y_or_n,
         },
+        "--getbinpkg-exclude": {
+            "help": "A space separated list of package names or slot atoms. "
+            + "Emerge will not fetch matching remote binary packages. ",
+            "action": "append",
+        },
+        "--getbinpkg-include": {
+            "help": "A space separated list of package names or slot atoms. "
+            + "Emerge will not fetch non-matching remote binary packages. ",
+            "action": "append",
+        },
         "--usepkg-exclude": {
             "help": "A space separated list of package names or slot atoms. "
             + "Emerge will ignore matching binary packages. ",
+            "action": "append",
+        },
+        "--usepkg-include": {
+            "help": "A space separated list of package names or slot atoms. "
+            + "Emerge will ignore non-matching binary packages. ",
             "action": "append",
         },
         "--onlydeps-with-ideps": {
@@ -737,6 +761,10 @@ def parse_opts(tmpcmdline, silent=False):
             "help": "verbose output",
             "choices": true_y_or_n,
         },
+        "--verbose-missing-ebuilds": {
+            "help": "verbose missing ebuild output",
+            "choices": true_y_or_n,
+        },
         "--verbose-slot-rebuilds": {
             "help": "verbose slot rebuild output",
             "choices": true_y_or_n,
@@ -832,6 +860,18 @@ def parse_opts(tmpcmdline, silent=False):
         else:
             myoptions.binpkg_changed_deps = "n"
 
+    if myoptions.binpkg_respect_use is not None:
+        if myoptions.binpkg_respect_use in true_y:
+            myoptions.binpkg_respect_use = "y"
+        else:
+            myoptions.binpkg_respect_use = "n"
+
+    if myoptions.binpkg_respect_user_patches is not None:
+        if myoptions.binpkg_respect_user_patches in true_y:
+            myoptions.binpkg_respect_user_patches = "y"
+        else:
+            myoptions.binpkg_respect_user_patches = "n"
+
     if myoptions.buildpkg in true_y:
         myoptions.buildpkg = True
 
@@ -868,12 +908,6 @@ def parse_opts(tmpcmdline, silent=False):
     if myoptions.deselect in true_y:
         myoptions.deselect = True
 
-    if myoptions.binpkg_respect_use is not None:
-        if myoptions.binpkg_respect_use in true_y:
-            myoptions.binpkg_respect_use = "y"
-        else:
-            myoptions.binpkg_respect_use = "n"
-
     if myoptions.complete_graph in true_y:
         myoptions.complete_graph = True
     else:
@@ -884,10 +918,13 @@ def parse_opts(tmpcmdline, silent=False):
 
     candidate_bad_options = (
         (myoptions.exclude, "exclude"),
+        (myoptions.getbinpkg_exclude, "getbinpkg-exclude"),
+        (myoptions.getbinpkg_include, "getbinpkg-include"),
         (myoptions.reinstall_atoms, "reinstall-atoms"),
         (myoptions.rebuild_exclude, "rebuild-exclude"),
         (myoptions.rebuild_ignore, "rebuild-ignore"),
         (myoptions.usepkg_exclude, "usepkg-exclude"),
+        (myoptions.usepkg_include, "usepkg-include"),
         (myoptions.useoldpkg_atoms, "useoldpkg-atoms"),
     )
     bad_options = (
@@ -909,11 +946,15 @@ def parse_opts(tmpcmdline, silent=False):
 
     if myoptions.getbinpkg in true_y:
         myoptions.getbinpkg = True
+    elif myoptions.getbinpkg == "n":
+        myoptions.getbinpkg = False
     else:
         myoptions.getbinpkg = None
 
     if myoptions.getbinpkgonly in true_y:
         myoptions.getbinpkgonly = True
+    elif myoptions.getbinpkgonly == "n":
+        myoptions.getbinpkgonly = False
     else:
         myoptions.getbinpkgonly = None
 
@@ -1014,17 +1055,18 @@ def parse_opts(tmpcmdline, silent=False):
 
     if myoptions.jobs is not None:
         jobs = None
-        if myoptions.jobs == "True":
+        if myoptions.jobs in ("True", "y"):
             jobs = True
+        elif myoptions.jobs == "n":
+            jobs = None
         else:
             try:
                 jobs = int(myoptions.jobs)
             except ValueError:
-                jobs = None
+                if not silent:
+                    parser.error(f"Invalid --jobs parameter: '{myoptions.jobs}'\n")
 
-        if jobs is None and not silent:
-            parser.error(f"Invalid --jobs parameter: '{myoptions.jobs}'\n")
-        elif jobs == 0:
+        if jobs == 0:
             from portage.util.cpuinfo import get_cpu_count
 
             jobs = get_cpu_count()
@@ -1099,11 +1141,15 @@ def parse_opts(tmpcmdline, silent=False):
 
     if myoptions.usepkg in true_y:
         myoptions.usepkg = True
+    elif myoptions.usepkg == "n":
+        myoptions.usepkg = False
     else:
         myoptions.usepkg = None
 
     if myoptions.usepkgonly in true_y:
         myoptions.usepkgonly = True
+    elif myoptions.usepkgonly == "n":
+        myoptions.usepkgonly = False
     else:
         myoptions.usepkgonly = None
 
@@ -1151,8 +1197,10 @@ def parse_opts(tmpcmdline, silent=False):
 
 def profile_check(trees, myaction):
     import textwrap
-    from _emerge.actions import validate_ebuild_environment
+
     from portage.util import writemsg_level
+
+    from _emerge.actions import validate_ebuild_environment
 
     if myaction in ("help", "info", "search", "sync", "version"):
         return os.EX_OK
@@ -1186,22 +1234,21 @@ def emerge_main(args: Optional[list[str]] = None):
     Processes command line arguments (default: sys.argv[1:]) and decides
     what the current run of emerge should by creating `emerge_config`
     """
-    from _emerge.actions import load_emerge_config, run_action
-    from _emerge.emergelog import emergelog
-    from _emerge.help import emerge_help
     from portage.output import xtermTitleReset
     from portage.util import writemsg_level
 
+    from _emerge.actions import load_emerge_config, run_action
+    from _emerge.emergelog import emergelog
+    from _emerge.help import emerge_help
+
     if args is None:
         args = sys.argv[1:]
-
-    args = portage._decode_argv(args)
 
     # Use system locale.
     try:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error as e:
-        writemsg_level(f"setlocale: {e}\n", level=logging.WARN)
+        writemsg_level(f"setlocale: {e}\n", level=logging.WARNING)
 
     # Disable color until we're sure that it should be enabled (after
     # EMERGE_DEFAULT_OPTS has been parsed).
@@ -1244,18 +1291,37 @@ def emerge_main(args: Optional[list[str]] = None):
     if myaction == "moo":
         print(COWSAY_MOO.format(platform.system()))
         return os.EX_OK
+    if myaction == "status":
+        # Report what running emerge processes are currently building.
+        # (For machine-readable output, use `portageq jobs --json`.)
+        from portage.const import EPREFIX
+
+        from _emerge._observability import (
+            format_snapshots,
+            missing_feature_hint,
+            read_snapshots,
+        )
+
+        snapshots = read_snapshots(EPREFIX)
+        hint = missing_feature_hint(snapshots)
+        if hint is not None:
+            sys.stderr.write(hint)
+            return 1
+
+        sys.stdout.write(format_snapshots(snapshots))
+        return os.EX_OK
     if myaction == "sync":
         # need to set this to True now in order for the repository config
         # loading to allow new repos with non-existent directories
         portage._sync_mode = True
 
-    # Verify that /dev/null exists and is a device file as a cheap early
-    # filter for obviously broken /dev/s.
+    # Verify that /dev/null exists and is a character device as a
+    # cheap early filter for obviously broken /dev/s.
     try:
-        if os.stat(os.devnull).st_rdev == 0:
+        if not stat.S_ISCHR(os.stat(os.devnull).st_mode):
             writemsg_level(
                 "Failed to validate a sane '/dev'.\n"
-                "'/dev/null' is not a device file.\n",
+                "'/dev/null' is not a character device.\n",
                 level=logging.ERROR,
                 noiselevel=-1,
             )
@@ -1317,7 +1383,7 @@ def emerge_main(args: Optional[list[str]] = None):
     try:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error as e:
-        writemsg_level(f"setlocale: {e}\n", level=logging.WARN)
+        writemsg_level(f"setlocale: {e}\n", level=logging.WARNING)
 
     tmpcmdline = []
     if "--ignore-default-opts" not in myopts:

@@ -1,8 +1,8 @@
 # Copyright 2014 Gentoo Foundation
 # Distributed under the terms of the GNU General Public License v2
 
+import os
 
-from portage import os, _encodings
 from portage.tests import TestCase
 from portage.tests.resolver.ResolverPlayground import (
     ResolverPlayground,
@@ -99,10 +99,9 @@ class ProfilePackageSetTestCase(TestCase):
                     with open(
                         os.path.join(prof_path, k),
                         mode="w",
-                        encoding=_encodings["repo.content"],
+                        encoding="utf-8",
                     ) as f:
-                        for line in v:
-                            f.write(f"{line}\n")
+                        f.writelines(f"{line}\n" for line in v)
 
             # The config must be reloaded in order to account
             # for the above profile customizations.

@@ -1,18 +1,18 @@
 # Copyright 2005-2023 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import datetime
 import logging
+import os
 import re
 import shlex
 import subprocess
-import datetime
 
 import portage
-from portage import os
+from portage.const import TIMESTAMP_FORMAT
+from portage.output import EOutput, create_color_func
 from portage.util import writemsg_level
 from portage.util.futures import asyncio
-from portage.output import create_color_func, EOutput
-from portage.const import TIMESTAMP_FORMAT
 
 good = create_color_func("GOOD")
 bad = create_color_func("BAD")
@@ -20,8 +20,8 @@ warn = create_color_func("WARN")
 from portage.sync.syncbase import NewBase
 
 try:
-    from gemato.exceptions import GematoException
     import gemato.openpgp
+    from gemato.exceptions import GematoException
 except ImportError:
     gemato = None
 
@@ -58,8 +58,7 @@ class GitSync(NewBase):
             return (1, False)
 
         sync_uri = self.repo.sync_uri
-        if sync_uri.startswith("file://"):
-            sync_uri = sync_uri[7:]
+        sync_uri = sync_uri.removeprefix("file://")
 
         git_cmd_opts = ""
         if self.repo.module_specific_options.get("sync-git-env"):
@@ -239,11 +238,11 @@ class GitSync(NewBase):
                 # shallow one. And do not perform a shallow update if
                 # the target repository is not shallow.
                 is_shallow_cmd = ["git", "rev-parse", "--is-shallow-repository"]
-                is_shallow_res = portage._unicode_decode(
-                    subprocess.check_output(
-                        is_shallow_cmd,
-                        cwd=portage._unicode_encode(self.repo.location),
-                    )
+                is_shallow_res = subprocess.check_output(
+                    is_shallow_cmd,
+                    cwd=self.repo.location,
+                    encoding="utf-8",
+                    errors="replace",
                 ).rstrip("\n")
                 if is_shallow_res == "false":
                     sync_depth = 0
@@ -263,17 +262,17 @@ class GitSync(NewBase):
             )
 
         try:
-            remote_branch = portage._unicode_decode(
-                subprocess.check_output(
-                    [
-                        self.bin_command,
-                        "rev-parse",
-                        "--abbrev-ref",
-                        "--symbolic-full-name",
-                        "@{upstream}",
-                    ],
-                    cwd=portage._unicode_encode(self.repo.location),
-                )
+            remote_branch = subprocess.check_output(
+                [
+                    self.bin_command,
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+                cwd=self.repo.location,
+                encoding="utf-8",
+                errors="replace",
             ).rstrip("\n")
         except subprocess.CalledProcessError as e:
             msg = f"!!! git rev-parse error in {self.repo.location}"
@@ -290,7 +289,7 @@ class GitSync(NewBase):
                 gc_cmd.append("--quiet")
             exitcode = portage.process.spawn(
                 gc_cmd,
-                cwd=portage._unicode_encode(self.repo.location),
+                cwd=self.repo.location,
                 **self.spawn_kwargs,
             )
             if exitcode != os.EX_OK:
@@ -303,11 +302,11 @@ class GitSync(NewBase):
 
         if not self.repo.volatile:
             git_get_remote_url_cmd = ["git", "ls-remote", "--get-url", git_remote]
-            git_remote_url = portage._unicode_decode(
-                subprocess.check_output(
-                    git_get_remote_url_cmd,
-                    cwd=portage._unicode_encode(self.repo.location),
-                )
+            git_remote_url = subprocess.check_output(
+                git_get_remote_url_cmd,
+                cwd=self.repo.location,
+                encoding="utf-8",
+                errors="replace",
             ).strip()
             if git_remote_url != self.repo.sync_uri:
                 git_set_remote_url_cmd = [
@@ -319,7 +318,7 @@ class GitSync(NewBase):
                 ]
                 exitcode = portage.process.spawn(
                     git_set_remote_url_cmd,
-                    cwd=portage._unicode_encode(self.repo.location),
+                    cwd=self.repo.location,
                     **self.spawn_kwargs,
                 )
                 if exitcode != os.EX_OK:
@@ -336,9 +335,7 @@ class GitSync(NewBase):
             writemsg_level(git_cmd + "\n")
 
         rev_cmd = [self.bin_command, "rev-list", "--max-count=1", "HEAD"]
-        previous_rev = subprocess.check_output(
-            rev_cmd, cwd=portage._unicode_encode(self.repo.location)
-        )
+        previous_rev = subprocess.check_output(rev_cmd, cwd=self.repo.location)
 
         exitcode = portage.process.spawn_bash(
             f"cd {shlex.quote(self.repo.location)} ; exec {git_cmd}",
@@ -367,7 +364,7 @@ class GitSync(NewBase):
 
             exitcode = portage.process.spawn(
                 clean_cmd,
-                cwd=portage._unicode_encode(self.repo.location),
+                cwd=self.repo.location,
                 **self.spawn_kwargs,
             )
 
@@ -381,7 +378,7 @@ class GitSync(NewBase):
         is_clean = (
             portage.process.spawn(
                 f"{self.bin_command} diff --quiet",
-                cwd=portage._unicode_encode(self.repo.location),
+                cwd=self.repo.location,
                 **self.spawn_kwargs,
             )
             == 0
@@ -407,7 +404,7 @@ class GitSync(NewBase):
 
         exitcode = portage.process.spawn(
             merge_cmd,
-            cwd=portage._unicode_encode(self.repo.location),
+            cwd=self.repo.location,
             **self.spawn_kwargs,
         )
 
@@ -418,7 +415,7 @@ class GitSync(NewBase):
                 # https://stackoverflow.com/questions/41075972/how-to-update-a-git-shallow-clone/41081908#41081908
                 exitcode = portage.process.spawn(
                     f"{self.bin_command} reset --hard refs/remotes/{remote_branch}",
-                    cwd=portage._unicode_encode(self.repo.location),
+                    cwd=self.repo.location,
                     **self.spawn_kwargs,
                 )
 
@@ -428,9 +425,7 @@ class GitSync(NewBase):
                 writemsg_level(msg + "\n", level=logging.ERROR, noiselevel=-1)
                 return (exitcode, False)
 
-        current_rev = subprocess.check_output(
-            rev_cmd, cwd=portage._unicode_encode(self.repo.location)
-        )
+        current_rev = subprocess.check_output(rev_cmd, cwd=self.repo.location)
 
         return (os.EX_OK, current_rev != previous_rev)
 
@@ -456,11 +451,11 @@ class GitSync(NewBase):
                 f"{revision}:metadata/timestamp.chk",
             ]
             try:
-                timestamp_chk = portage._unicode_decode(
-                    subprocess.check_output(
-                        show_timestamp_chk_file_cmd,
-                        cwd=portage._unicode_encode(self.repo.location),
-                    )
+                timestamp_chk = subprocess.check_output(
+                    show_timestamp_chk_file_cmd,
+                    cwd=self.repo.location,
+                    encoding="utf-8",
+                    errors="replace",
                 ).strip()
             except subprocess.CalledProcessError as e:
                 writemsg_level(
@@ -511,7 +506,9 @@ class GitSync(NewBase):
             env = None
             if openpgp_env is not None and self.repo.sync_openpgp_key_path is not None:
                 try:
-                    out.einfo(f"Using keys from {self.repo.sync_openpgp_key_path}")
+                    if not quiet:
+                        out.einfo(f"Using keys from {self.repo.sync_openpgp_key_path}")
+
                     with open(self.repo.sync_openpgp_key_path, "rb") as f:
                         openpgp_env.import_key(f)
                     self._refresh_keys(openpgp_env)
@@ -536,12 +533,12 @@ class GitSync(NewBase):
                 revision,
             ]
             try:
-                lines = portage._unicode_decode(
-                    subprocess.check_output(
-                        rev_cmd,
-                        cwd=portage._unicode_encode(self.repo.location),
-                        env=env,
-                    )
+                lines = subprocess.check_output(
+                    rev_cmd,
+                    cwd=self.repo.location,
+                    env=env,
+                    encoding="utf-8",
+                    errors="replace",
                 ).splitlines()
             except subprocess.CalledProcessError:
                 return False
@@ -608,10 +605,11 @@ class GitSync(NewBase):
         try:
             ret = (
                 os.EX_OK,
-                portage._unicode_decode(
-                    subprocess.check_output(
-                        rev_cmd, cwd=portage._unicode_encode(self.repo.location)
-                    )
+                subprocess.check_output(
+                    rev_cmd,
+                    cwd=self.repo.location,
+                    encoding="utf-8",
+                    errors="replace",
                 ),
             )
         except subprocess.CalledProcessError:

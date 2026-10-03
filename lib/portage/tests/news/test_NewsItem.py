@@ -2,16 +2,15 @@
 # Copyright 2007-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-from portage.tests import TestCase
-from portage.news import NewsItem, NewsManager
-from portage.dbapi.virtual import fakedbapi
-
+import textwrap
 from dataclasses import dataclass
 from string import Template
 from typing import Optional
 from unittest.mock import MagicMock, mock_open, patch
 
-import textwrap
+from portage.dbapi.virtual import fakedbapi
+from portage.news import NewsItem, NewsManager
+from portage.tests import TestCase
 
 # The specification for news items is GLEP 42 ("Critical News Reporting"):
 # https://www.gentoo.org/glep/glep-0042.html
@@ -30,18 +29,14 @@ class FakeNewsItem(NewsItem):
     display_if_profile: Optional[list[str]] = None
     display_if_keyword: Optional[list[str]] = None
 
-    item_template_header = Template(
-        textwrap.dedent(
-            """
+    item_template_header = Template(textwrap.dedent("""
         Title: ${title}
         Author: ${author}
         Content-Type: ${content_type}
         Posted: ${posted}
         Revision: ${revision}
         News-Item-Format: ${news_item_format}
-        """
-        )
-    )
+        """))
 
     def __post_init__(self):
         super().__init__(path="mocked_news", name=self.title)
@@ -88,8 +83,7 @@ class NewsItemTestCase(TestCase):
         "display_if_installed": [],
         "display_if_profile": [],
         "display_if_keyword": [],
-        "content": textwrap.dedent(
-            """
+        "content": textwrap.dedent("""
     YourSQL databases created using YourSQL version 4.0 are incompatible
     with YourSQL version 4.1 or later. There is no reliable way to
     automate the database format conversion, so action from the system
@@ -109,8 +103,7 @@ class NewsItemTestCase(TestCase):
         revdep-rebuild --library=libyoursqlclient.so.12
 
     The revdep-rebuild tool is provided by app-portage/gentoolkit.
-    """
-        ),
+    """),
     }
 
     def setUp(self) -> None:

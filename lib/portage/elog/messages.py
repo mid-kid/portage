@@ -2,15 +2,11 @@
 # Copyright 2006-2025 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import os
+import sys
 
 from portage.const import EBUILD_PHASES
 from portage.localization import _
-from portage import os
-from portage import _encodings
-from portage import _unicode_encode
-from portage import _unicode_decode
-
-import sys
 
 _log_levels = frozenset(
     [
@@ -47,13 +43,13 @@ def collect_ebuild_messages(path):
                 _("!!! can't process invalid log file: %s\n") % filename, noiselevel=-1
             )
             continue
-        if not msgfunction in logentries:
+        if msgfunction not in logentries:
             logentries[msgfunction] = []
         lastmsgtype = None
         msgcontent = []
         f = open(
-            _unicode_encode(filename, encoding=_encodings["fs"], errors="strict"),
-            encoding=_encodings["repo.content"],
+            filename,
+            encoding="utf-8",
             errors="replace",
         )
         # Use split('\n') since normal line iteration or readlines() will
@@ -121,15 +117,13 @@ def _elog_base(level, msg, phase="other", key=None, color=None, out=None):
     if color is None:
         color = "INFO"
 
-    msg = _unicode_decode(msg, encoding=_encodings["content"], errors="replace")
+    msg = msg
 
     formatted_msg = colorize(color, " * ") + msg + "\n"
 
     # avoid potential UnicodeEncodeError
     if out in (sys.stdout, sys.stderr):
-        formatted_msg = _unicode_encode(
-            formatted_msg, encoding=_encodings["stdio"], errors="backslashreplace"
-        )
+        formatted_msg = formatted_msg.encode("utf-8", "backslashreplace")
         out = out.buffer
 
     out.write(formatted_msg)

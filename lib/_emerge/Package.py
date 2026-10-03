@@ -1,25 +1,45 @@
-# Copyright 1999-2021 Gentoo Authors
+# Copyright 1999-2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
+import sys
 from itertools import chain
-import warnings
 
 import portage
 from portage.cache.mappings import slot_dict_class
 from portage.const import EBUILD_PHASES
 from portage.dep import (
     Atom,
-    check_required_use,
-    use_reduce,
-    paren_enclose,
-    _slot_separator,
     _repo_separator,
+    _slot_separator,
+    check_required_use,
+    paren_enclose,
+    use_reduce,
 )
 from portage.dep.soname.parse import parse_soname_deps
-from portage.versions import _pkg_str, _unknown_repo
 from portage.eapi import _get_eapi_attrs
 from portage.exception import InvalidData, InvalidDependString
+from portage.util import split_interned
+from portage.versions import _pkg_str, _unknown_repo
+
 from _emerge.Task import Task
+
+# Packages hold several frozensets which are derived from metadata that
+# thousands of them have in common, and CPython shares none of them, not even
+# the empty one. The number of distinct values is bounded by the number of
+# distinct IUSE and USE values in the repositories, which is a few thousand.
+#
+# Unlike the caches in portage.dep this one holds strong references, since
+# frozenset does not support weak references.
+_frozensets = {}
+
+
+def _intern_frozenset(value):
+    """
+    Return a canonical frozenset which is equal to the given value.
+    """
+    if type(value) is not frozenset:
+        value = frozenset(value)
+    return _frozensets.setdefault(value, value)
 
 
 class Package(Task):
@@ -41,6 +61,7 @@ class Package(Task):
         "iuse",
         "mtime",
         "pf",
+        "remote",
         "root",
         "slot",
         "sub_slot",
@@ -85,6 +106,7 @@ class Package(Task):
         "SIZE",
         "SLOT",
         "USE",
+        "USER_PATCHES",
         "_mtime_",
     ]
 
@@ -116,6 +138,11 @@ class Package(Task):
                 raise
             db = self.root_config.trees["porttree"].dbapi
 
+        if self.type_name == "binary":
+            self.remote = db.bintree.isremote(self.cpv)
+        else:
+            self.remote = False
+
         self.cpv = _pkg_str(
             self.cpv, metadata=self._metadata, settings=self.root_config.settings, db=db
         )
@@ -135,7 +162,7 @@ class Package(Task):
 
         implicit_match = db._iuse_implicit_cnstr(self.cpv, self._metadata)
         self.iuse = self._iuse(
-            self, self._metadata["IUSE"].split(), implicit_match, self.eapi
+            self, split_interned(self._metadata["IUSE"]), implicit_match, self.eapi
         )
 
         if (self.iuse.enabled or self.iuse.disabled) and not eapi_attrs.iuse_defaults:
@@ -194,15 +221,6 @@ class Package(Task):
     def restrict(self):
         return self._metadata.restrict
 
-    @property
-    def metadata(self):
-        warnings.warn(
-            "_emerge.Package.Package.metadata is deprecated",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return self._metadata
-
     # These are calculated on-demand, so that they are calculated
     # after FakeVartree applies its metadata tweaks.
     @property
@@ -218,6 +236,10 @@ class Package(Task):
         if self._masks is None:
             self._masks = self._eval_masks()
         return self._masks
+
+    @property
+    def user_patches(self):
+        return self._metadata["USER_PATCHES"].lower()
 
     @property
     def visible(self):
@@ -601,11 +623,36 @@ class Package(Task):
         s += ")"
         return s
 
-    class _use_class:
-        __slots__ = ("enabled", "_expand", "_expand_hidden", "_force", "_pkg", "_mask")
+    def syspkg_wanted(self):
+        """Tests whether this is a system package to build a binary package for
+        (buildsyspkg), assuming it isn't already covered by buildpkg."""
+        features = self._get_pkgsettings().features
+        return (
+            "buildsyspkg" in features
+            and "buildpkg" not in features
+            and self.root_config.sets["system"].findAtomForPackage(self)
+        )
 
-        # Share identical frozenset instances when available.
-        _frozensets = {}
+    def binpkg_wanted(self, exclude):
+        """Tests whether this is a package to build a binary package for, taking
+        account of FEATURES, PROPERTIES, and the given excluded set."""
+        # Do not build binary cache for packages from volatile sources.
+        # For volatile sources (eg., git), the PROPERTIES parameter in
+        # the ebuild is set to 'live'.
+        #
+        # The default behavior is to build binary cache for all pkgs.
+        # "buildpkg-live" is a FEATURE that is enabled by default.
+        # To not build binary cache for live pkgs, we disable it by
+        # specifying FEATURES="-buildpkg-live"
+        features = self._get_pkgsettings().features
+        return (
+            ("buildpkg-live" in features or "live" not in self.properties)
+            and not exclude.findAtomForPackage(self)
+            and ("buildpkg" in features or self.syspkg_wanted())
+        )
+
+    class _use_class:
+        __slots__ = ("_expand", "_expand_hidden", "_force", "_mask", "_pkg", "enabled")
 
         def __init__(self, pkg, enabled_flags):
             self._pkg = pkg
@@ -613,7 +660,7 @@ class Package(Task):
             self._expand_hidden = None
             self._force = None
             self._mask = None
-            self.enabled = frozenset(enabled_flags)
+            self.enabled = _intern_frozenset(enabled_flags)
             if pkg.built:
                 # Use IUSE to validate USE settings for built packages,
                 # in case the package manager that built this package
@@ -621,19 +668,20 @@ class Package(Task):
                 # data corruption).
                 missing_iuse = pkg.iuse.get_missing_iuse(self.enabled)
                 if missing_iuse:
-                    self.enabled = self.enabled.difference(missing_iuse)
+                    self.enabled = _intern_frozenset(
+                        self.enabled.difference(missing_iuse)
+                    )
 
         def _init_force_mask(self):
             pkgsettings = self._pkg._get_pkgsettings()
-            frozensets = self._frozensets
-            s = frozenset(pkgsettings.get("USE_EXPAND", "").lower().split())
-            self._expand = frozensets.setdefault(s, s)
-            s = frozenset(pkgsettings.get("USE_EXPAND_HIDDEN", "").lower().split())
-            self._expand_hidden = frozensets.setdefault(s, s)
-            s = pkgsettings.useforce
-            self._force = frozensets.setdefault(s, s)
-            s = pkgsettings.usemask
-            self._mask = frozensets.setdefault(s, s)
+            self._expand = _intern_frozenset(
+                pkgsettings.get("USE_EXPAND", "").lower().split()
+            )
+            self._expand_hidden = _intern_frozenset(
+                pkgsettings.get("USE_EXPAND_HIDDEN", "").lower().split()
+            )
+            self._force = _intern_frozenset(pkgsettings.useforce)
+            self._mask = _intern_frozenset(pkgsettings.usemask)
 
         @property
         def expand(self):
@@ -691,7 +739,7 @@ class Package(Task):
             # inconsistencies in USE dep matching (see bug #453400).
             use_str = self._metadata["USE"]
             is_valid_flag = self.iuse.is_valid_flag
-            enabled_flags = [x for x in use_str.split() if is_valid_flag(x)]
+            enabled_flags = [x for x in split_interned(use_str) if is_valid_flag(x)]
             use_str = " ".join(enabled_flags)
             self._use = self._use_class(self, enabled_flags)
         else:
@@ -703,7 +751,7 @@ class Package(Task):
             if not use_str:
                 use_str = self._get_pkgsettings()["PORTAGE_USE"]
                 calculated_use = True
-            self._use = self._use_class(self, use_str.split())
+            self._use = self._use_class(self, split_interned(use_str))
             # Initialize these now, since USE access has just triggered
             # setcpv, and we want to cache the result of the force/mask
             # calculations that were done.
@@ -720,8 +768,8 @@ class Package(Task):
             "_iuse_implicit_match",
             "_pkg",
             "all",
-            "enabled",
             "disabled",
+            "enabled",
             "tokens",
         )
 
@@ -734,15 +782,18 @@ class Package(Task):
             other = []
             for x in tokens:
                 prefix = x[:1]
+                # Stripping the IUSE default creates a new string, so intern
+                # the result as well. These are the names that USE matching
+                # compares against, so they are worth sharing.
                 if prefix == "+":
-                    enabled.append(x[1:])
+                    enabled.append(sys.intern(x[1:]))
                 elif prefix == "-":
-                    disabled.append(x[1:])
+                    disabled.append(sys.intern(x[1:]))
                 else:
                     other.append(x)
-            self.enabled = frozenset(enabled)
-            self.disabled = frozenset(disabled)
-            self.all = frozenset(chain(enabled, disabled, other))
+            self.enabled = _intern_frozenset(enabled)
+            self.disabled = _intern_frozenset(disabled)
+            self.all = _intern_frozenset(chain(enabled, disabled, other))
 
         def is_valid_flag(self, flags):
             """
@@ -911,7 +962,7 @@ class _PackageMetadataWrapper(_PackageMetadataWrapperBase):
 
     def _set_inherited(self, k, v):
         if isinstance(v, str):
-            v = frozenset(v.split())
+            v = frozenset(split_interned(v))
         self._pkg.inherited = v
 
     def _set_counter(self, k, v):
